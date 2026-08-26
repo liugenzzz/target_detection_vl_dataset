@@ -40,9 +40,12 @@ export VLM_API_URL=http://192.168.78.36:3012/v1/chat/completions
 
 ---
 
-## 三步走
+## 四步走
 
 ```bash
+# 0. 接入新的模型服务后第一个跑这个，别跳过
+python scripts/check_vlm.py
+
 # 1. 先看分布，定阈值（COCO 的阈值不适用于你的数据，必须重跑）
 python scripts/analyze.py
 
@@ -157,6 +160,28 @@ train 或整组进 val。构建报告里的 `split.group_overlap` 必须为 0。
 
 ---
 
+## 接入模型服务
+
+`scripts/check_vlm.py` 三步递进地验证，每一步失败都会指出该改哪里：
+
+| 步骤 | 验证 | 失败通常意味着 |
+|---|---|---|
+| 1 纯文本 | 地址 / 端口 / model 名 / api_key | 401、403 是 key；404 是路径少了 `/v1/chat/completions`；400 提到 model 是模型名对不上 |
+| 2 图片输入 | 这个部署开没开多模态 | 部署没开视觉，或不认 `image_url` 写法 |
+| 3 真实提示词 | 返回能不能解析成 JSON | 改 `prompts/vlm_describe.txt`，不用动代码 |
+
+第 2 步还会报出**单次图片请求耗时**，用它估算并发数 —— 这是定 `vlm.concurrency` 的唯一依据。
+
+接口按 **OpenAI 兼容格式** 调用（`/v1/chat/completions` + `image_url` 传 base64），
+vLLM、Ollama、LM Studio、SGLang 的兼容层都支持。本地常见地址：
+
+```yaml
+vlm:
+  api_url: "http://localhost:11434/v1/chat/completions"   # Ollama
+  api_url: "http://localhost:8000/v1/chat/completions"    # vLLM / SGLang
+  api_url: "http://localhost:1234/v1/chat/completions"    # LM Studio
+```
+
 ## 描述语句
 
 第三轮的描述由 `vlm.api_url` 指向的自建 Qwen 服务生成，**同一次调用还会返回
@@ -207,7 +232,8 @@ prompts/      提示词纯文本，与代码分离
 core/         classes 类别表与易混检测 / coords 坐标换算 / yolo 标注解析
               difficulty 难度分级与配额 / grouping 来源分组 / referring 指代生成
               vlm_client 调 Qwen 服务 / builder 三轮样本组装 / pipeline 编排
-scripts/      analyze.py 分布分析 / build.py 构建 / preview.py 验证图
+scripts/      check_vlm.py 服务自检 / analyze.py 分布分析
+              build.py 构建 / preview.py 验证图
 tests/        回归测试，不依赖外部数据和 VLM 服务
 ```
 
