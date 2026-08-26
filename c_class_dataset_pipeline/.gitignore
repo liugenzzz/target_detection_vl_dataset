@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+# 完整产出的数据集不进仓库（联调一次几 MB，生产十万条会到 GB 级）
+output/
+examples/*.jsonl
+!examples/*.preview.jsonl
