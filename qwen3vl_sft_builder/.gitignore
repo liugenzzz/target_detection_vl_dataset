@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+config/local.yaml     # 服务器上的实际配置，含地址和密钥，不进版本控制
+output/
+*.jsonl
