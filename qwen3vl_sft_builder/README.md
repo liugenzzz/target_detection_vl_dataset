@@ -40,6 +40,26 @@ export VLM_API_URL=http://192.168.78.36:3012/v1/chat/completions
 
 ---
 
+## 测试数据
+
+本项目的测试结果基于两个公开数据集：
+
+| 数据集 | 规模 | 位置 | 作用 |
+|---|---|---|---|
+| **COCO128** | 128 图 / 929 框 / 80 类 | 仓库自带 `vlm-bbox-labeling/coco128/` | 日常稀疏场景，每图均 7.4 个目标 |
+| **VisDrone2019-DET-val** | 548 图 / 38759 框 / 10 类 | `python scripts/get_visdrone.py` 下载 | 无人机航拍、小目标密集，每图均 70 个目标 |
+
+**主要用 VisDrone**：它是航拍视角、小目标（短边中位数仅 18px）、人员车辆密集，
+和业务数据的特征对得上。COCO 每图才 7 个目标，测不出密集场景的问题 ——
+本项目「每图框数上限」那条规则就是错误设计，在 COCO 上完全看不出来，
+换到 VisDrone 才暴露出它会跳过 88% 的图。
+
+VisDrone 覆盖不到的：全是日间彩色图，**测不了夜视/红外场景**。
+
+```bash
+python scripts/get_visdrone.py --out ./data/visdrone   # 约 78MB
+```
+
 ## 四步走
 
 ```bash
@@ -234,6 +254,7 @@ core/         classes 类别表与易混检测 / coords 坐标换算 / yolo 标�
               vlm_client 调 Qwen 服务 / builder 三轮样本组装 / pipeline 编排
 scripts/      check_vlm.py 服务自检 / analyze.py 分布分析
               build.py 构建 / preview.py 验证图
+              get_visdrone.py 下载测试数据集
 tests/        回归测试，不依赖外部数据和 VLM 服务
 ```
 
