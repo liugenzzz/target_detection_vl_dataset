@@ -31,12 +31,17 @@ from pipeline.yolo_gt_adapter import find_image_for_label, parse_yolo_txt  # noq
 BOXES_PER_IMAGE_MAX = 20
 MIN_SHORT_SIDE_PX = 16
 MIN_AREA_RATIO = 0.001
+# 框占整图面积超过这个比例时剔除。实测业务数据里存在占满全图的框
+# （如某标注文件里 99.7% 面积的框），这类框做视觉定位样本毫无意义 ——
+# 「请定位图中的 X」答案是整张图，模型学不到定位，反而被教着输出满图框。
+MAX_AREA_RATIO = 0.5
 SAMPLES_PER_IMAGE_CAP = 8
 TARGET_SAMPLES = 100_000
 
 BOXES_PER_IMAGE_CANDIDATES = (10, 15, 20, 25, 30)
 SHORT_SIDE_CANDIDATES = (8, 12, 16, 24)
 AREA_RATIO_CANDIDATES = (0.0005, 0.001, 0.002, 0.005)
+AREA_MAX_CANDIDATES = (0.3, 0.5, 0.7, 0.9)
 
 
 def pct(values, p):
@@ -105,8 +110,13 @@ def report(images) -> None:
         drop = sum(1 for a in all_areas if a < thr)
         print(f"    面积 <{thr * 100:>5.2f}%     ->  剔除 {drop:>5}/{total_boxes} 框 ({drop / total_boxes * 100:>4.1f}%)")
 
+    print("\n  规则三 · 剔除过大的框（全图框）：")
+    for thr in AREA_MAX_CANDIDATES:
+        drop = sum(1 for a in all_areas if a > thr)
+        print(f"    面积 >{thr * 100:>5.0f}%     ->  剔除 {drop:>5}/{total_boxes} 框 ({drop / total_boxes * 100:>4.1f}%)")
+
     print(f"\n【当前阈值下的留存】 每图≤{BOXES_PER_IMAGE_MAX}框 且 短边≥{MIN_SHORT_SIDE_PX}px "
-          f"且 面积≥{MIN_AREA_RATIO * 100:.2f}%   同图样本上限 {SAMPLES_PER_IMAGE_CAP}")
+          f"且 {MIN_AREA_RATIO * 100:.2f}%≤面积≤{MAX_AREA_RATIO * 100:.0f}%   同图样本上限 {SAMPLES_PER_IMAGE_CAP}")
     kept_images = 0
     kept_samples = 0
     for _, w, h, rows in images:
@@ -114,7 +124,8 @@ def report(images) -> None:
             continue
         good = [
             r for r in rows
-            if short_side_px(r, w, h) >= MIN_SHORT_SIDE_PX and area_ratio(r) >= MIN_AREA_RATIO
+            if short_side_px(r, w, h) >= MIN_SHORT_SIDE_PX
+            and MIN_AREA_RATIO <= area_ratio(r) <= MAX_AREA_RATIO
         ]
         if not good:
             continue
