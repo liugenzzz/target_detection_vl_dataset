@@ -1,0 +1,33 @@
+{
+  "elapsed_sec": 8.83,
+  "request": {
+    "stream": false,
+    "temperature": 0.35,
+    "max_tokens": 3000,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "<base64 image, 37083 chars>"
+            }
+          },
+          {
+            "type": "text",
+            "text": "你是一个专业的图像标注助手。\n\n这张图片的原始分辨率是宽 446 像素、高 640 像素。\n\n以下是完整的类别表（格式为「编号: 名称」）：\n0: person\n1: bicycle\n2: car\n3: motorcycle\n4: airplane\n5: bus\n6: train\n7: truck\n8: boat\n9: traffic light\n10: fire hydrant\n11: stop sign\n12: parking meter\n13: bench\n14: bird\n15: cat\n16: dog\n17: horse\n18: sheep\n19: cow\n20: elephant\n21: bear\n22: zebra\n23: giraffe\n24: backpack\n25: umbrella\n26: handbag\n27: tie\n28: suitcase\n29: frisbee\n30: skis\n31: snowboard\n32: sports ball\n33: kite\n34: baseball bat\n35: baseball glove\n36: skateboard\n37: surfboard\n38: tennis racket\n39: bottle\n40: wine glass\n41: cup\n42: fork\n43: knife\n44: spoon\n45: bowl\n46: banana\n47: apple\n48: sandwich\n49: orange\n50: broccoli\n51: carrot\n52: hot dog\n53: pizza\n54: donut\n55: cake\n56: chair\n57: couch\n58: potted plant\n59: bed\n60: dining table\n61: toilet\n62: tv\n63: laptop\n64: mouse\n65: remote\n66: keyboard\n67: cell phone\n68: microwave\n69: oven\n70: toaster\n71: sink\n72: refrigerator\n73: book\n74: clock\n75: vase\n76: scissors\n77: teddy bear\n78: hair drier\n79: toothbrush\n\n请检测图片中所有属于上述类别表的物体，并以 JSON 数组输出。每个检测到的物体实例为数组中的一个元素，包含以下字段：\n- \"class_id\"：该物体在类别表中的编号（整数）\n- \"class_name\"：该物体在类别表中的名称（必须与编号严格对应，逐字照抄类别表中的名称）\n- \"bbox_2d\"：格式为 [x1, y1, x2, y2] 的边界框，必须是基于这张原图 446x640 像素坐标系的绝对像素坐标，左上角为原点 (0,0)，且满足 x1 < x2、y1 < y2\n\n要求：\n1. 同一个类别如果在图中出现多次，每一个实例都要单独输出一个元素\n2. 只输出类别表中存在的类别，不要自创类别\n3. 边界框要尽量紧密地贴合物体轮廓\n4. 如果图中没有任何属于类别表的物体，输出空数组 []\n5. 只输出 JSON 本身，不要输出任何解释性文字，不要用 ``` 包裹\n\n现在开始检测。"
+          }
+        ]
+      }
+    ],
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "model": "Qwen3.6-27B",
+    "repetition_penalty": 1.05,
+    "logprobs": true,
+    "top_logprobs": 5
+  },
+  "response": "```json\n[\n\t{\"bbox_2d\": [0, 655, 402, 998], \"label\": \"couch\"},\n\t{\"bbox_2d\": [459, 431, 517, 477], \"label\": \"clock\"},\n\t{\"bbox_2d\": [275, 731, 369, 764], \"label\": \"book\"},\n\t{\"bbox_2d\": [343, 835, 459, 872], \"label\": \"book\"},\n\t{\"bbox_2d\": [248, 841, 324, 870], \"label\": \"book\"},\n\t{\"bbox_2d\": [259, 825, 338, 852], \"label\": \"book\"},\n\t{\"bbox_2d\": [350, 803, 438, 838], \"label\": \"book\"},\n\t{\"bbox_2d\": [371, 798, 449, 822], \"label\": \"book\"},\n\t{\"bbox_2d\": [359, 822, 449, 849], \"label\": \"book\"}\n]\n```"
+}

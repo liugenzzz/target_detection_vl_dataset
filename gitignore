@@ -1,0 +1,81 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ===== 虚拟环境 =====
+venv/
+.venv/
+env/
+ENV/
+fast_api_env/
+
+# ===== IDE / 编辑器 =====
+.vscode/
+.idea/
+.cursor/
+.claude/
+*.swp
+*.swo
+*~
+
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ===== 密钥 / 本地配置 =====
+.env
+.env.*
+*.key
+*.pem
+secrets.json
+config.local.*
+
+# ===== 模型权重（超 100MB 会被 GitHub 拒）=====
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.engine
+*.gguf
+*.ckpt
+
+# ===== 训练输出 / 中间产物 =====
+output/
+outputs/
+runs/
+saves/
+checkpoints/
+
+# ===== 日志 / 缓存 / 临时 =====
+*.log
+logs/
+tmp/
+temp/
+.cache/
+nohup.out
+*.pid
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== Node（前端标注界面用到的话）=====
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.next/
+
+# ===== 测试 =====
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/

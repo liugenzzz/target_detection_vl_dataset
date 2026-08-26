@@ -1,0 +1,2 @@
+﻿group,images,gt_boxes,pred_boxes,tp,wrong_class,missed,false_pos,recall,precision,f1
+results,3,51,42,20,1,30,21,0.3922,0.4762,0.4301

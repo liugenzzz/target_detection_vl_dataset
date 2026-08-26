@@ -1,0 +1,33 @@
+{
+  "elapsed_sec": 12.41,
+  "request": {
+    "stream": false,
+    "temperature": 0.35,
+    "max_tokens": 3000,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "<base64 image, 37083 chars>"
+            }
+          },
+          {
+            "type": "text",
+            "text": "你是一个严格的目标检测模型。\n\n图片原始尺寸：宽 446 像素、高 640 像素。\n\n以下是完整的类别表（格式为「编号: 名称」）：\n0: person\n1: bicycle\n2: car\n3: motorcycle\n4: airplane\n5: bus\n6: train\n7: truck\n8: boat\n9: traffic light\n10: fire hydrant\n11: stop sign\n12: parking meter\n13: bench\n14: bird\n15: cat\n16: dog\n17: horse\n18: sheep\n19: cow\n20: elephant\n21: bear\n22: zebra\n23: giraffe\n24: backpack\n25: umbrella\n26: handbag\n27: tie\n28: suitcase\n29: frisbee\n30: skis\n31: snowboard\n32: sports ball\n33: kite\n34: baseball bat\n35: baseball glove\n36: skateboard\n37: surfboard\n38: tennis racket\n39: bottle\n40: wine glass\n41: cup\n42: fork\n43: knife\n44: spoon\n45: bowl\n46: banana\n47: apple\n48: sandwich\n49: orange\n50: broccoli\n51: carrot\n52: hot dog\n53: pizza\n54: donut\n55: cake\n56: chair\n57: couch\n58: potted plant\n59: bed\n60: dining table\n61: toilet\n62: tv\n63: laptop\n64: mouse\n65: remote\n66: keyboard\n67: cell phone\n68: microwave\n69: oven\n70: toaster\n71: sink\n72: refrigerator\n73: book\n74: clock\n75: vase\n76: scissors\n77: teddy bear\n78: hair drier\n79: toothbrush\n\n请检测图片中属于上述类别表的物体，只输出 JSON，格式如下：\n\n{\n  \"bbox_format\": \"pixel_xyxy\",\n  \"objects\": [\n    {\n      \"class_id\": 0,\n      \"class_name\": \"类别名称\",\n      \"bbox_2d\": [x_min, y_min, x_max, y_max]\n    }\n  ]\n}\n\n关于 bbox_format 字段（重要）：\n- 如果你输出的是原图像素坐标，填 \"pixel_xyxy\"\n- 如果你输出的是 0~1000 归一化坐标，填 \"norm_1000\"\n- 如果你输出的是 0~1 归一化坐标，填 \"norm_01\"\n- 必须如实填写你实际使用的坐标系，这个字段会被用来校验坐标\n\n其他要求：\n1. \"class_id\" 和 \"class_name\" 必须严格对应，名称逐字照抄类别表，不要自创类别\n2. 坐标必须是数字，且满足 x_min < x_max、y_min < y_max\n3. 边界框要尽量紧密贴合物体轮廓\n4. 同一类别出现多次时，每个实例单独输出一个元素。但如果画面中存在大量密集重复的同类物体（如人群、成排的座椅），只标注其中清晰可辨的个体，不要机械枚举\n5. 不要臆测不可见的目标\n6. 图中没有任何属于类别表的物体时，objects 返回空数组\n7. 只输出 JSON 本身，不要输出解释性文字，不要用 ``` 包裹\n\n现在开始检测。"
+          }
+        ]
+      }
+    ],
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "model": "Qwen3.6-27B",
+    "repetition_penalty": 1.05,
+    "logprobs": true,
+    "top_logprobs": 5
+  },
+  "response": "```json\n{\n  \"bbox_format\": \"pixel_xyxy\",\n  \"objects\": [\n    {\n      \"class_id\": 57,\n      \"class_name\": \"couch\",\n      \"bbox_2d\": [0, 656, 400, 998]\n    },\n    {\n      \"class_id\": 73,\n      \"class_name\": \"book\",\n      \"bbox_2d\": [280, 733, 366, 764]\n    },\n    {\n      \"class_id\": 73,\n      \"class_name\": \"book\",\n      \"bbox_2d\": [339, 840, 450, 873]\n    },\n    {\n      \"class_id\": 73,\n      \"class_name\": \"book\",\n      \"bbox_2d\": [343, 826, 448, 854]\n    },\n    {\n      \"class_id\": 73,\n      \"class_name\": \"book\",\n      \"bbox_2d\": [252, 847, 327, 870]\n    },\n    {\n      \"class_id\": 74,\n      \"class_name\": \"clock\",\n      \"bbox_2d\": [459, 430, 521, 478]\n    }\n  ]\n}\n```"
+}

@@ -1,0 +1,16 @@
+# 这是格式示例文件，部署时请把你自己的 347 类 yaml 命名为 classes.yaml 放在同目录
+# 支持下面两种写法中的任意一种
+
+# 写法一：字典（推荐，和你现在的格式一致）
+path: ../datasets/example
+train: images/train
+val: images/val
+
+nc: 3
+names:
+  0: "示例类别A"
+  1: "示例类别B"
+  2: "示例类别C"
+
+# 写法二：列表（也支持，索引即编号）
+# names: ["示例类别A", "示例类别B", "示例类别C"]

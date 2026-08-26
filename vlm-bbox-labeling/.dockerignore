@@ -1,0 +1,6 @@
+logs/
+results*/
+images/
+__pycache__/
+*.pyc
+classes.yaml

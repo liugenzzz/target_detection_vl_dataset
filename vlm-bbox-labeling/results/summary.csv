@@ -1,0 +1,4 @@
+﻿image,detections,valid,invalid,flagged,distinct_classes,elapsed_sec,error
+000000000194.jpg,1,1,0,1,1,7.37,
+000000000315.jpg,51,45,6,6,3,84.49,
+000000000384.jpg,6,6,0,0,3,14.97,

@@ -1,0 +1,41 @@
+services:
+  bbox-api:
+    build: .
+    container_name: vlm-bbox-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # 你的类别表 yaml 放在宿主机当前目录，命名为 classes.yaml
+      - ./classes.yaml:/app/classes.yaml:ro
+      # 每次调用的原始请求/响应日志
+      - ./logs:/app/logs
+    environment:
+      # ---- 后端 Qwen 模型服务 ----
+      - QWEN_API_URL=http://192.168.78.36:3012/v1/chat/completions
+      - QWEN_API_KEY=sk-bveYeVn6NAdRRElTWCqhtyJbkTL5XwweedczV9FJ05kDqhqX
+      - QWEN_MODEL=Qwen3.6-27B
+      - QWEN_TIMEOUT=300
+      # 温度别压到 0.1，极低温更容易触发重复生成循环
+      - QWEN_TEMPERATURE=0.35
+      # 难图最坏耗时的决定因素，按单图最多多少目标来定
+      - QWEN_MAX_TOKENS=3000
+      - QWEN_ENABLE_THINKING=false
+      - REPETITION_PENALTY=1.05
+      # ---- 坐标格式（实测 Qwen3.6 返回千分比，别改成 auto）----
+      - COORD_MODE=per_mille
+      # ---- 类别表 ----
+      - CLASSES_YAML_PATH=/app/classes.yaml
+      # ---- 置信度（已实测后端支持）----
+      - ENABLE_LOGPROBS=true
+      - TOP_LOGPROBS=5
+      # ---- 结果过滤 ----
+      - MAX_BOXES_PER_CLASS=60
+      - BIG_BOX_RATIO=0.5
+      # ---- 验证图：false=只画有效框，true=问题框也画出来 ----
+      - DRAW_INVALID=false
+      # ---- 日志 ----
+      - LOG_DIR=/app/logs
+      - SAVE_RAW_LOG=true
+    restart: unless-stopped
+    # 如果容器访问不到 192.168.78.36，去掉上面的 ports，改用下面这行：
+    # network_mode: host
