@@ -1,5 +1,10 @@
 __pycache__/
 *.py[cod]
-config/local.yaml     # 服务器上的实际配置，含地址和密钥，不进版本控制
+
+# 服务器上的实际配置，含路径和模型地址，每台机器不同，不进版本控制。
+# 注意：gitignore 不支持行尾注释，注释必须独占一行，否则整行会被当成字面路径。
+config/local.yaml
+
+# 构建产物
 output/
 *.jsonl

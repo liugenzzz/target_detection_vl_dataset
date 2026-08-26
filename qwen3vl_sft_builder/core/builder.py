@@ -76,6 +76,21 @@ class SampleBuilder:
             "coord_origin": self.origin,
         }
 
+    def vlm_task(self, annotation, box, grade):
+        """构造该目标的 VLM 请求 (image_path, bbox, label, prompt_text)。
+
+        供 pipeline 并发预取用 —— 预取和实际取描述必须走同一套 prompt 渲染，
+        否则两边算出的缓存 key 对不上，预取就白做了。
+        """
+        bbox = self._bbox2d(box, annotation)
+        siblings = ""
+        if grade.same_label_count > 1:
+            siblings = (f"注意：图中还有其他 {grade.same_label_count - 1} 个同为"
+                        f"「{box.label}」的目标，指代短语必须能把本目标与它们区分开。\n")
+        prompt_text = prompts.render("vlm_describe", bbox=bbox, label=box.label,
+                                     siblings_hint=siblings)
+        return annotation.image_path, bbox, box.label, prompt_text
+
     def _resolve_text(self, annotation, box, grade) -> VlmResult:
         """拿到该目标的指代与描述：优先 VLM，失败或未启用时回落模板。"""
         fallback = VlmResult(
@@ -86,15 +101,8 @@ class SampleBuilder:
         if self.vlm is None:
             return fallback
 
-        bbox = self._bbox2d(box, annotation)
-        siblings = ""
-        if grade.same_label_count > 1:
-            siblings = (f"注意：图中还有其他 {grade.same_label_count - 1} 个同为"
-                        f"「{box.label}」的目标，指代短语必须能把本目标与它们区分开。\n")
-        prompt_text = prompts.render("vlm_describe", bbox=bbox, label=box.label,
-                                     siblings_hint=siblings)
-        return self.vlm.describe(annotation.image_path, bbox, box.label,
-                                 prompt_text, fallback)
+        image_path, bbox, label, prompt_text = self.vlm_task(annotation, box, grade)
+        return self.vlm.describe(image_path, bbox, label, prompt_text, fallback)
 
     # -------------------------------------------------------------- 单目标
     def build_single(self, annotation, box, grade) -> Dict[str, Any]:
@@ -147,8 +155,18 @@ class SampleBuilder:
         """
         texts = [self._resolve_text(annotation, b, g) for b, g in zip(boxes, grades)]
         referrings = [t.referring for t in texts]
+
+        # 两道检查，缺一不可：
+        # (a) 被选中的目标之间指代互不相同。
         if len(set(referrings)) != len(referrings):
             return None
+        # (b) 每个指代在【整张图】范围内也唯一。模板指代是「分区+类别」拼出来的，
+        #     两个目标各自在不同分区、但各自分区内都不唯一时，它们的指代互不相同
+        #     却各自都能匹配到图中多个目标 —— 只做 (a) 会放过这种样本。
+        #     VLM 生成的视觉指代无法在此校验，只能信任模型。
+        for text, grade in zip(texts, grades):
+            if text.source == "template" and not grade.unique_in_zone:
+                return None
         bboxes = [self._bbox2d(b, annotation) for b in boxes]
 
         referring = "、".join(t.referring for t in texts)

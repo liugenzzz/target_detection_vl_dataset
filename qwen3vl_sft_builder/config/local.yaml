@@ -1,7 +1,0 @@
-paths:
-  labels_dir: "/tmp/claude-0/-home-user-target-detection-vl-dataset/0a03338e-506d-51e6-88fe-4e3ab765094b/scratchpad/vd_yolo/labels"
-  images_dir: "/tmp/claude-0/-home-user-target-detection-vl-dataset/0a03338e-506d-51e6-88fe-4e3ab765094b/scratchpad/vd_yolo/images"
-  classes_yaml: "/tmp/claude-0/-home-user-target-detection-vl-dataset/0a03338e-506d-51e6-88fe-4e3ab765094b/scratchpad/vd_yolo/classes.yaml"
-  output_dir: "/tmp/claude-0/-home-user-target-detection-vl-dataset/0a03338e-506d-51e6-88fe-4e3ab765094b/scratchpad/vd_out"
-vlm:
-  enabled: false

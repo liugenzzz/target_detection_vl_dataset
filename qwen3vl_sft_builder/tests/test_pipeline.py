@@ -94,6 +94,96 @@ def test_validate_accepts_good_sample():
     assert validate_sample(good) == []
 
 
+# ---------------------------------------------------------------------------
+# 以下是代码审查发现的缺陷的回归测试。每一条都对应一个真实修复。
+# ---------------------------------------------------------------------------
+
+def _client(**over):
+    from config import Config
+    from core.vlm_client import VlmClient
+    cfg = Config({"vlm": dict({"enabled": True, "api_url": "http://x/v1",
+                               "cache_dir": ""}, **over)})
+    return VlmClient(cfg)
+
+
+def test_prefetch_survives_missing_cache_dir():
+    """审查发现 #1：cache_dir 未配置时，预取结果只写磁盘会被全部丢弃 ——
+    白烧一整轮 API，却产出纯模板数据集且不报错。结果必须同时进内存。"""
+    from core.vlm_client import VlmResult
+    c = _client(cache_dir="")            # 故意不配磁盘缓存
+    assert c._cache_path(Path("a.jpg"), [1, 2, 3, 4]) is None
+
+    key = c._key(Path("a.jpg"), [1, 2, 3, 4])
+    c._memory[key] = VlmResult("视觉指代", "视觉描述", "vlm")
+    c._prefetch_done = True
+
+    fallback = VlmResult("模板指代", "模板描述", "template")
+    got = c.describe(Path("a.jpg"), [1, 2, 3, 4], "船", "prompt", fallback)
+    assert got.referring == "视觉指代", "内存里的预取结果必须被取用"
+    assert got.description == "视觉描述"
+
+
+def test_describe_never_requests_after_prefetch():
+    """审查发现的次生问题：预取失败的目标若在串行组装阶段重新发请求，
+    10 万条里 1% 失败就是 1000 次带重试的串行调用，能把整批任务拖垮。"""
+    from core.vlm_client import VlmResult
+    c = _client(cache_dir="")
+    c._prefetch_done = True
+    c._request = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("组装阶段不允许发起网络请求"))
+    fallback = VlmResult("模板指代", "模板描述", "template")
+    assert c.describe(Path("b.jpg"), [1, 2, 3, 4], "船", "p", fallback).source == "template"
+
+
+def test_empty_json_is_not_success():
+    """审查发现 #5：形状不对的 JSON 会解析成两个空串。若当成功，
+    会写入空缓存，之后每次运行都命中它，把该目标永久钉死在模板文本上。"""
+    from core.vlm_client import _parse_vlm_json
+    assert _parse_vlm_json('{"referring":"","description":""}') is None
+    assert _parse_vlm_json('{"ref":"x","desc":"y"}') is None          # 键名写错
+    ok = _parse_vlm_json('{"referring":"","description":"只有描述"}')  # 部分有值仍算成功
+    assert ok is not None and ok.description == "只有描述"
+
+
+def test_multi_rejects_image_wide_ambiguous_referring():
+    """审查发现 #3：两个目标各在不同分区、但各自分区内都不唯一时，
+    它们的指代互不相同、却各自都匹配图中多个目标。只比较被选中的目标不够。"""
+    from core.builder import SampleBuilder
+    from config import load_config
+
+    class FakeGrade:
+        def __init__(self, uniq):
+            self.unique_in_zone = uniq
+            self.same_label_count = 3
+            self.equiv_px = 80.0
+            self.grade = "medium"
+            self.reasons = {}
+            self.box_index = 0
+
+    class FakeBox:
+        def __init__(self, i, cx, cy):
+            self.index, self.cx, self.cy = i, cx, cy
+            self.w = self.h = 0.1
+            self.label, self.class_id = "船", 1
+
+    class FakeAnn:
+        stem = "t"
+        width = height = 640
+        image_path = Path("t.jpg")
+        label_path = Path("t.txt")
+
+    class FakeTable:
+        is_confusable = staticmethod(lambda cid: False)
+        confusable_group = staticmethod(lambda cid: [])
+
+    b = SampleBuilder(load_config(), FakeTable(), None)   # vlm=None -> 走模板
+    boxes = [FakeBox(0, 0.2, 0.2), FakeBox(1, 0.8, 0.8)]  # 不同分区
+    assert b.build_multi(FakeAnn(), boxes, [FakeGrade(False), FakeGrade(False)]) is None, \
+        "分区内不唯一的模板指代必须被拒绝"
+    assert b.build_multi(FakeAnn(), boxes, [FakeGrade(True), FakeGrade(True)]) is not None, \
+        "分区内唯一时应正常生成"
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

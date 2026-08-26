@@ -63,11 +63,22 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     # ---- 阶段二：全局配额，把困难目标压到 hard_quota ----
     selected = balance_hard_quota(candidates, lambda c: c[1].grade, hard_quota, seed)
 
-    # ---- 阶段三：组装样本 ----
+    # ---- 阶段三：并发预取 VLM 描述 ----
+    # 必须在组装之前做完：组装是串行的，逐条调用十万次要 6 天。
+    # 预取把结果灌进缓存，组装时全部命中缓存。已缓存的自动跳过，支持断点续跑。
     rng = random.Random(seed)
     by_image: Dict[str, List] = {}
     for stem, g in selected:
         by_image.setdefault(stem, []).append(g)
+
+    if vlm.enabled:
+        tasks = []
+        for stem, grades in by_image.items():
+            ann, _ = annotations[stem]
+            box_map = {b.index: b for b in ann.boxes}
+            for g in grades:
+                tasks.append(builder.vlm_task(ann, box_map[g.box_index], g))
+        vlm.prefetch(tasks)
 
     # 多目标样本数必须全局算，不能「每图 N% 概率」—— 一张图会出多条单目标样本，
     # 逐图概率会被稀释（实测 VisDrone 上 10% 的逐图概率只得到 2.3% 的多目标占比）。
@@ -80,6 +91,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     rng.shuffle(eligible)
     multi_stems = set(eligible[:n_multi])
 
+    # ---- 阶段四：组装样本（全部命中缓存，不再发请求）----
     samples: List[Dict[str, Any]] = []
     invalid = 0
     multi_rejected = 0
@@ -103,7 +115,11 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                 chosen.append(g)
                 if len(chosen) >= k:
                     break
-            if len(chosen) >= 2:
+            if len(chosen) < 2:
+                # 全图目标都挤在同一分区，凑不出互异指代。必须计数，
+                # 否则密集数据上多目标占比会悄悄塌掉而报告里看不出来。
+                multi_rejected += 1
+            else:
                 s = builder.build_multi(
                     ann, [box_map[g.box_index] for g in chosen], chosen)
                 if s is None:
@@ -128,7 +144,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
             else:
                 samples.append(s)
 
-    # ---- 阶段四：拒答样本 ----
+    # ---- 阶段五：拒答样本 ----
     all_labels = sorted({b.label for ann, _ in annotations.values() for b in ann.boxes})
     n_neg = int(len(samples) * neg_ratio)
     neg_added = 0
@@ -148,7 +164,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                 samples.append(s)
                 neg_added += 1
 
-    # ---- 阶段五：按来源分组划分 train/val ----
+    # ---- 阶段六：按来源分组划分 train/val ----
     train, val = _split_by_source(samples, cfg, seed)
     train_path = output_dir / "train.jsonl"
     val_path = output_dir / "val.jsonl"
@@ -158,6 +174,9 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     stats = _stats(samples, train, val, grade_hist, n_images, n_boxes,
                    len(candidates), invalid, neg_added, vlm.stats, table)
     stats["multi_rejected_ambiguous_referring"] = multi_rejected
+    stats["multi_actual_ratio"] = round(
+        sum(1 for s in samples if s.get("metadata", {}).get("sample_type") == "multi")
+        / max(len(samples), 1), 4)
     stats["output"] = {"train": str(train_path), "val": str(val_path)}
     (output_dir / "build_report.json").write_text(
         json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
