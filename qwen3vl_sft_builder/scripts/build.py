@@ -47,5 +47,19 @@ def main() -> int:
     return 0
 
 
+def _cli(entry):
+    """配置类错误直接打印人话并退出，不甩 Python 堆栈 —— 这类错误是用户改配置就能解决的，
+    堆栈只会淹没真正有用的那句提示。真正的程序 bug 仍然照常抛出。"""
+    import sys
+    try:
+        return entry()
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"\n配置有问题：\n{exc}\n", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\n已中断。已完成的 VLM 结果都在缓存里，重跑会从断点继续。", file=sys.stderr)
+        return 130
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_cli(main))

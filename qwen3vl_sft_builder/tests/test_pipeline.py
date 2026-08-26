@@ -184,6 +184,47 @@ def test_multi_rejects_image_wide_ambiguous_referring():
         "分区内唯一时应正常生成"
 
 
+
+def test_windows_path_yaml_error_is_explained():
+    """Windows 用户把路径写成 "F:\\AI-Haishi\\..." 时，YAML 双引号会把反斜杠
+    当转义符而报 unknown escape character。默认的报错是一堆 yaml 内部堆栈，
+    对用户毫无帮助 —— 必须直接告诉他改成单引号。"""
+    import tempfile
+    from config import _load_yaml
+
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", encoding="utf-8",
+                                     delete=False) as fh:
+        fh.write('paths:\n  labels_dir: "F:\\AI-Haishi\\project\\labels"\n')
+        bad = Path(fh.name)
+    try:
+        _load_yaml(bad)
+        raise AssertionError("非法 YAML 应该报错")
+    except ValueError as exc:
+        text = str(exc)
+        assert "Windows" in text, "报错必须点明是 Windows 路径问题"
+        assert "单引号" in text, "报错必须给出可照做的解法"
+    finally:
+        bad.unlink()
+
+
+def test_windows_path_all_three_styles_parse():
+    """三种推荐写法都必须能正确解析出原始路径。"""
+    import yaml
+    assert yaml.safe_load(r"p: 'F:\AI-Haishi\labels'")["p"] == r"F:\AI-Haishi\labels"
+    assert yaml.safe_load('p: "F:/AI-Haishi/labels"')["p"] == "F:/AI-Haishi/labels"
+    assert yaml.safe_load(r'p: "F:\\AI-Haishi\\labels"')["p"] == r"F:\AI-Haishi\labels"
+
+
+def test_missing_path_error_is_actionable():
+    """路径没填时，报错要指出填哪个文件、也可以用哪个环境变量。"""
+    from config import Config
+    try:
+        Config({"paths": {"labels_dir": ""}}).require("paths.labels_dir")
+        raise AssertionError("应该报错")
+    except ValueError as exc:
+        assert "LABELS_DIR" in str(exc), "应提示可用的环境变量"
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

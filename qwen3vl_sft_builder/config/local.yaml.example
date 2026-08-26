@@ -1,13 +1,20 @@
 # ============================================================================
-# 默认配置。本文件进版本控制，不要在服务器上直接改它。
-# 服务器上复制 local.yaml.example 为 local.yaml 再改，local.yaml 会覆盖本文件。
+# 复制本文件为 config/local.yaml，然后按你的环境改。local.yaml 不进版本控制。
+#
+# Windows 路径注意：YAML 的【双引号】字符串会把反斜杠当转义符，
+#   labels_dir: "F:\AI-Haishi\..."   <- 报 found unknown escape character 'A'
+# 三种写法都可以，推荐第一种：
+#   labels_dir: 'F:\AI-Haishi\智航院\project\labels'      单引号，不处理转义
+#   labels_dir: "F:/AI-Haishi/智航院/project/labels"        正斜杠
+#   labels_dir: "F:\\AI-Haishi\\智航院\\project\\labels"  双反斜杠
 # ============================================================================
 
 paths:
-  labels_dir: ""                      # YOLO 标注目录（*.txt）
-  images_dir: ""                      # 图片目录
-  classes_yaml: ""                    # 类别表 yaml（347 类那份）
-  output_dir: "./output"
+  # 下面四项用单引号，Windows 路径可以直接粘进去，不用改反斜杠
+  labels_dir: ''                      # YOLO 标注目录（*.txt）
+  images_dir: ''                      # 图片目录
+  classes_yaml: ''                    # 类别表 yaml（347 类那份）
+  output_dir: './output' 
 
 # ---------------------------------------------------------------------------
 # 自建 Qwen 服务：用于生成第三轮的描述语句和同类目标的视觉指代

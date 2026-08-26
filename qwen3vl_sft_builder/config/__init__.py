@@ -29,6 +29,28 @@ ENV_OVERRIDES = {
 }
 
 
+def _load_yaml(path: Path) -> Dict[str, Any]:
+    """读一个 yaml。解析失败时给出能直接照做的提示，而不是甩一段 yaml 内部堆栈。
+
+    最常见的失败是 Windows 路径：YAML 双引号字符串把反斜杠当转义符，
+    "F:\AI-Haishi\..." 里的 \A 是非法转义。
+    """
+    text = path.read_text(encoding="utf-8")
+    try:
+        return yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        hint = ""
+        if "unknown escape character" in str(exc):
+            hint = (
+                "\n\n这是 Windows 路径的经典问题：YAML 的【双引号】字符串会把反斜杠"
+                "当成转义符。\n把路径改成下面任意一种写法（推荐第一种）：\n"
+                "    labels_dir: 'F:\\AI-Haishi\\project\\labels'      单引号，不处理转义\n"
+                "    labels_dir: \"F:/AI-Haishi/project/labels\"        正斜杠\n"
+                "    labels_dir: \"F:\\\\AI-Haishi\\\\project\\\\labels\"  双反斜杠"
+            )
+        raise ValueError(f"{path} 不是合法的 YAML：\n{exc}{hint}") from None
+
+
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     merged = copy.deepcopy(base)
     for key, value in (override or {}).items():
@@ -61,21 +83,29 @@ class Config(dict):
     def require(self, dotted: str) -> Any:
         value = self.get_path(dotted)
         if value in (None, ""):
-            raise ValueError(
-                f"配置项 {dotted} 未设置。请在 {LOCAL_PATH} 里填写"
-                f"（可从 local.yaml.example 复制），或用对应的环境变量注入。"
-            )
+            env = next((e for e, (sec, k) in ENV_OVERRIDES.items()
+                        if f"{sec}.{k}" == dotted), None)
+            msg = [f"配置项 {dotted} 未设置。"]
+            if not LOCAL_PATH.exists():
+                msg.append(f"先复制一份配置：\n"
+                           f"    cp {LOCAL_PATH.with_name('local.yaml.example')} {LOCAL_PATH}")
+            else:
+                msg.append(f"请在 {LOCAL_PATH} 里填写它。")
+                msg.append("Windows 路径记得用单引号：labels_dir: 'F:\\xxx\\labels'")
+            if env:
+                msg.append(f"也可以用环境变量注入：{env}=...")
+            raise ValueError("\n".join(msg))
         return value
 
 
 def load_config(extra_path: str | Path | None = None) -> Config:
     """加载配置。extra_path 若给出，优先级最高（低于环境变量）。"""
-    cfg = yaml.safe_load(DEFAULT_PATH.read_text(encoding="utf-8")) or {}
+    cfg = _load_yaml(DEFAULT_PATH)
     if LOCAL_PATH.exists():
-        cfg = _deep_merge(cfg, yaml.safe_load(LOCAL_PATH.read_text(encoding="utf-8")) or {})
+        cfg = _deep_merge(cfg, _load_yaml(LOCAL_PATH))
     if extra_path:
         p = Path(extra_path)
         if not p.exists():
             raise FileNotFoundError(f"找不到配置文件：{p}")
-        cfg = _deep_merge(cfg, yaml.safe_load(p.read_text(encoding="utf-8")) or {})
+        cfg = _deep_merge(cfg, _load_yaml(p))
     return Config(_apply_env(cfg))

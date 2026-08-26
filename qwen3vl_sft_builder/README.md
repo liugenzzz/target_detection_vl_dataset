@@ -16,14 +16,21 @@ cp config/local.yaml.example config/local.yaml
 vim config/local.yaml          # 只改这个文件，不动代码，不动 default.yaml
 ```
 
-`local.yaml` 里至少要填四项路径：
+`local.yaml` 里至少要填四项路径。**Windows 路径用单引号** —— YAML 的双引号
+字符串会把反斜杠当转义符，`"F:\AI-Haishi\..."` 会报 `unknown escape character 'A'`：
 
 ```yaml
 paths:
-  labels_dir:   /mnt/data2/.../dataset_det/labels/train
-  images_dir:   /mnt/data2/.../dataset_det/images/train
-  classes_yaml: /mnt/data2/.../data.yaml        # 347 类那份
-  output_dir:   ./output
+  # Linux
+  labels_dir:   '/mnt/data2/.../dataset_det/labels/train'
+  images_dir:   '/mnt/data2/.../dataset_det/images/train'
+  classes_yaml: '/mnt/data2/.../data.yaml'        # 347 类那份
+  output_dir:   './output'
+
+  # Windows —— 单引号（推荐）、正斜杠、双反斜杠三种都行
+  # labels_dir: 'F:\AI-Haishi\project\labels\train'
+  # labels_dir: "F:/AI-Haishi/project/labels/train"
+  # labels_dir: "F:\\AI-Haishi\\project\\labels\\train"
 ```
 
 密钥不要写进文件，用环境变量注入：
