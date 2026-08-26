@@ -336,6 +336,83 @@ def test_prompt_demands_short_referring():
     assert "反例二" in text, "要给出「太长」的反例，光说字数模型抓不住"
 
 
+
+def test_referring_rejects_category_hint_words():
+    """类别名泄漏的隐蔽形式：字面上没写类别名，但部件名和动作词把答案暴露了。
+
+        「车身银色的那个」          「车身」把答案限定成车辆
+        「一名穿粉衣的人正骑行的那个」 「骑行」限定成自行车/摩托车/三轮车
+
+    指代只该用位置、颜色、与周围物体的相对关系，这三类都不暗示类别。"""
+    from config import load_config
+    from core.referring import implies_category
+
+    words = load_config().get_path("quality.category_hint_words")
+    assert words, "config 里必须有 category_hint_words"
+
+    assert implies_category("车身银色的那个", words) == "车身"
+    assert implies_category("一名穿粉色上衣的人正骑行的那个", words) == "骑行"
+    assert implies_category("停在大石头后方的那个", words) == "停在"
+    # 地标式指代必须放行 —— 用别的东西定位目标，没有暴露目标自己是什么
+    assert implies_category("白色轿车旁边的那个", words) is None
+    assert implies_category("戴红色帽子的人左边的那个", words) is None
+    assert implies_category("画面右下角、银色的那个", words) is None
+
+
+def test_template_referring_never_leaks_the_label():
+    """曾经的严重 bug：模板指代在分区内不唯一时拼「那个{label}」来消歧，
+    生成出「图中上方右侧那个van是什么？」—— 答案就在问题里。
+    更糟的是 leaks_label() 检测到 VLM 指代泄漏后回落的正是这个模板，原地打转。"""
+    from core.referring import template_referring
+
+    for uniq in (True, False):
+        r = template_referring(0.8, 0.2, uniq)
+        assert "van" not in r and "面包车" not in r, f"模板指代不能带类别名：{r}"
+    assert template_referring(0.8, 0.2) == "上方右侧那个"
+
+
+def test_neutral_noun_is_not_annotation_jargon():
+    """「目标」是标注术语，正常人不会问「那个目标是什么」。
+    默认用光杆的「那个」——「画面右下角、银色的那个是什么？」。
+    不用「物体」是因为类别里有人员，把人叫「那个物体」很别扭。"""
+    from config import load_config
+    from core.referring import template_referring
+
+    noun = load_config().get_path("quality.neutral_noun")
+    assert noun and "目标" not in noun
+    assert "目标" not in template_referring(0.5, 0.5)
+
+
+def test_ambiguous_single_sample_is_dropped():
+    """分区内不唯一、VLM 又没给出可用视觉指代时，模板指代会同时匹配多个目标，
+    问题有多个正确答案，是坏数据。此前靠拼类别名消歧，那比歧义更糟。
+    现在整条丢弃。"""
+    from pathlib import Path
+    from config import load_config
+    from core.builder import SampleBuilder
+
+    class G:
+        def __init__(self, uniq): self.unique_in_zone = uniq
+        same_label_count = 3; equiv_px = 80.0; area_ratio = 0.01
+        grade = "medium"; reasons = {}; box_index = 0
+
+    class B:
+        index = 0; cx = cy = 0.5; w = h = 0.1; label = "面包车"; class_id = 4
+
+    class A:
+        stem = "t"; width = height = 640
+        image_path = Path("t.jpg"); label_path = Path("t.txt")
+
+    class T:
+        is_confusable = staticmethod(lambda c: False)
+        confusable_group = staticmethod(lambda c: [])
+
+    b = SampleBuilder(load_config(), T(), None)      # vlm=None -> 全走模板
+    assert b.build_single(A(), B(), G(True)) is not None, "分区内唯一应正常生成"
+    assert b.build_single(A(), B(), G(False)) is None, "分区内不唯一应丢弃"
+    assert b.ambiguous_dropped == 1
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

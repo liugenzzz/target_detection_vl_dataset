@@ -81,14 +81,40 @@ def spatial_phrase(cx: float, cy: float) -> str:
     return f"{vert}{horiz}"
 
 
-def template_referring(cx: float, cy: float, unique_in_zone: bool,
-                       label: Optional[str] = None) -> str:
-    """模板指代。分区内唯一时用纯空间指代；否则带上类别名缩小范围
-    （仍可能有歧义，这种情况应该交给 VLM 生成视觉指代）。"""
-    base = spatial_phrase(cx, cy)
-    if unique_in_zone:
-        return f"{base}那个目标"
-    return f"{base}那个{label}" if label else f"{base}那个目标"
+def template_referring(cx: float, cy: float, unique_in_zone: bool = True,
+                       neutral_noun: str = "那个") -> str:
+    """模板空间指代，例如「中部左侧那个」。
+
+    **绝不能带上类别名。** 这里曾经在分区内不唯一时拼「那个{label}」来缩小范围，
+    结果生成出「图中上方右侧那个van是什么？」—— 答案就写在问题里，
+    而且 leaks_label() 检测到 VLM 指代泄漏后回落的正是这个模板，等于原地打转。
+    分区内不唯一时指代确实会有歧义，但那要靠 VLM 视觉指代解决，或者丢弃该样本，
+    绝不能靠泄漏答案来「解决」。
+
+    unique_in_zone 保留在签名里供调用方判断是否需要丢弃，本函数不再使用它。
+    """
+    return f"{spatial_phrase(cx, cy)}{neutral_noun}"
+
+
+def implies_category(referring: str, hint_words) -> Optional[str]:
+    """指代里有没有暗示目标类别的词。命中则返回那个词，否则 None。
+
+    这是类别名泄漏的隐蔽形式，比字面泄漏更难发现：
+
+        「车身银色的那个」      「车身」把答案限定成车辆，砍掉人员、船舶
+        「一名穿粉衣的人正骑行的那个」  「骑行」限定成自行车/摩托车/三轮车
+        「停在大石头后方的那个」  「停」暗示是可停放的载具
+
+    指代只该用「位置 + 颜色 + 与其他物体的相对关系」，这三类都不暗示类别。
+    词表在 config 的 quality.category_hint_words，按类别体系增删。
+    """
+    ref = (referring or "").strip()
+    if not ref:
+        return None
+    for word in hint_words or ():
+        if word and word in ref:
+            return word
+    return None
 
 
 def template_description(label: str, cx: float, cy: float,

@@ -28,7 +28,8 @@ from typing import Any, Dict, List, Optional, Sequence
 import prompts
 
 from .coords import yolo_to_bbox2d
-from .referring import leaks_label, template_description, template_referring, too_long
+from .referring import (implies_category, leaks_label, template_description,
+                        template_referring, too_long)
 from .vlm_client import VlmResult
 
 IMAGE_TOKEN = "<image>"
@@ -46,7 +47,11 @@ class SampleBuilder:
     def __init__(self, cfg, table, vlm=None):
         self.leaked_referrings = 0     # VLM 指代泄漏类别名而被丢弃的次数
         self.overlong_referrings = 0   # VLM 指代过长而被丢弃的次数
+        self.hinted_referrings = 0     # VLM 指代含类别暗示词而被丢弃的次数
+        self.ambiguous_dropped = 0     # 指代无法唯一锁定、整条样本被丢弃的次数
         self.max_referring_len = int(cfg.get_path("quality.max_referring_len", 20))
+        self.hint_words = cfg.get_path("quality.category_hint_words", []) or []
+        self.neutral_noun = str(cfg.get_path("quality.neutral_noun", "那个"))
         self.cfg = cfg
         self.table = table
         self.vlm = vlm
@@ -97,7 +102,8 @@ class SampleBuilder:
     def _resolve_text(self, annotation, box, grade) -> VlmResult:
         """拿到该目标的指代与描述：优先 VLM，失败或未启用时回落模板。"""
         fallback = VlmResult(
-            referring=template_referring(box.cx, box.cy, grade.unique_in_zone, box.label),
+            referring=template_referring(box.cx, box.cy, grade.unique_in_zone,
+                                         self.neutral_noun),
             description=template_description(box.label, box.cx, box.cy, grade.equiv_px),
             source="template",
         )
@@ -118,11 +124,25 @@ class SampleBuilder:
         elif result.referring and too_long(result.referring, self.max_referring_len):
             self.overlong_referrings += 1
             result = VlmResult(fallback.referring, result.description, result.source)
+        # 类别暗示词是字面泄漏的隐蔽形式：「车身银色的那个」没写类别名，
+        # 但「车身」已经把答案限定成车辆。同样丢弃、回落模板。
+        elif result.referring and implies_category(result.referring, self.hint_words):
+            self.hinted_referrings += 1
+            result = VlmResult(fallback.referring, result.description, result.source)
         return result
 
     # -------------------------------------------------------------- 单目标
-    def build_single(self, annotation, box, grade) -> Dict[str, Any]:
+    def build_single(self, annotation, box, grade) -> Optional[Dict[str, Any]]:
+        """单目标三轮样本。指代无法唯一锁定该目标时返回 None。
+
+        分区内不唯一、而 VLM 又没给出可用视觉指代时，模板指代「中部左侧那个」
+        会同时匹配到好几个目标 —— 问题有多个正确答案，是坏数据。
+        此前是靠拼上类别名来消歧，那等于把答案写进问题，比歧义更糟。
+        """
         text = self._resolve_text(annotation, box, grade)
+        if not grade.unique_in_zone and text.source == "template":
+            self.ambiguous_dropped += 1
+            return None
         bbox = self._bbox2d(box, annotation)
 
         convs = [

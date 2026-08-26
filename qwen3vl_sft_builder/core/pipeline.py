@@ -141,6 +141,8 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
             if g.box_index in used:
                 continue
             s = builder.build_single(ann, box_map[g.box_index], g)
+            if s is None:            # 指代无法唯一锁定，已在 builder 计数
+                continue
             issues = validate_sample(s)
             if issues:
                 invalid += 1
@@ -180,6 +182,8 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     stats["multi_rejected_ambiguous_referring"] = multi_rejected
     stats["vlm_referring_leaked_label"] = builder.leaked_referrings
     stats["vlm_referring_too_long"] = builder.overlong_referrings
+    stats["vlm_referring_category_hint"] = builder.hinted_referrings
+    stats["dropped_ambiguous_referring"] = builder.ambiguous_dropped
     stats["multi_actual_ratio"] = round(
         sum(1 for s in samples if s.get("metadata", {}).get("sample_type") == "multi")
         / max(len(samples), 1), 4)
