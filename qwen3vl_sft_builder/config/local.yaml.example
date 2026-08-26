@@ -1,20 +1,13 @@
 # ============================================================================
-# 复制本文件为 config/local.yaml，然后按你的环境改。local.yaml 不进版本控制。
-#
-# Windows 路径注意：YAML 的【双引号】字符串会把反斜杠当转义符，
-#   labels_dir: "F:\AI-Haishi\..."   <- 报 found unknown escape character 'A'
-# 三种写法都可以，推荐第一种：
-#   labels_dir: 'F:\AI-Haishi\智航院\project\labels'      单引号，不处理转义
-#   labels_dir: "F:/AI-Haishi/智航院/project/labels"        正斜杠
-#   labels_dir: "F:\\AI-Haishi\\智航院\\project\\labels"  双反斜杠
+# 默认配置。本文件进版本控制，不要在服务器上直接改它。
+# 服务器上复制 local.yaml.example 为 local.yaml 再改，local.yaml 会覆盖本文件。
 # ============================================================================
 
 paths:
-  # 下面四项用单引号，Windows 路径可以直接粘进去，不用改反斜杠
-  labels_dir: ''                      # YOLO 标注目录（*.txt）
-  images_dir: ''                      # 图片目录
-  classes_yaml: ''                    # 类别表 yaml（347 类那份）
-  output_dir: './output' 
+  labels_dir: ""                      # YOLO 标注目录（*.txt）
+  images_dir: ""                      # 图片目录
+  classes_yaml: ""                    # 类别表 yaml（347 类那份）
+  output_dir: "./output"
 
 # ---------------------------------------------------------------------------
 # 自建 Qwen 服务：用于生成第三轮的描述语句和同类目标的视觉指代
@@ -46,6 +39,10 @@ quality:
   min_area_ratio: 0.001               # 低于此判定太小，看不清
   max_area_ratio: 0.5                 # 高于此判定为全图框，做定位样本无意义
   min_short_side_px: 16               # 辅助条件：原图上本身就糊的目标
+  # VLM 指代短语的字数上限。指代只需唯一锁定目标，堆特征会让问题读不下去
+  # （实测模型会写出「画面中上部，停在白色轿车和黑色轿车之间，靠近一棵绿树的
+  # 那个目标」这种 30 字三从句）。超限就丢弃，回落模板空间指代。
+  max_referring_len: 20
   sanity_max_boxes: 1000              # 超过必然是标注文件损坏，不是真有这么多目标
 
 # ---------------------------------------------------------------------------

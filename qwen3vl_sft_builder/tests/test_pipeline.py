@@ -298,6 +298,44 @@ def test_prompt_forbids_naming_the_category():
     assert "反例" in text and "正例" in text, "要给出正反例，光讲规则模型抓不住"
 
 
+
+def test_overlong_referring_is_rejected():
+    """指代的职责只是唯一锁定目标，能区分就够了。模型倾向把看到的特征全堆上去，
+    实测会写出「画面中上部，停在白色轿车和黑色轿车之间，靠近一棵绿树的那个目标」
+    这种三从句 30 字指代 —— 它是问题的主语，堆满定语让问题读不下去，
+    多目标样本三个拼起来接近 80 字。"""
+    from core.referring import too_long
+
+    assert too_long("画面中上部，停在白色轿车和黑色轿车之间，靠近一棵绿树的那个目标")
+    assert too_long("画面右下角、靠近充气水池边缘、带有浅色顶棚的那个目标")
+    # 一到两个特征的合格指代不能被误杀
+    assert not too_long("车身银色的那个目标")
+    assert not too_long("顶部有绿色遮篷的那个目标")
+    assert not too_long("停在白色轿车后方、车身银色的那个目标")
+    assert not too_long("") and not too_long(None)
+
+
+def test_referring_limit_is_configurable():
+    """上限要能在 config 里调，不能写死在代码里。"""
+    from config import load_config
+    from core.referring import too_long
+
+    limit = load_config().get_path("quality.max_referring_len")
+    assert isinstance(limit, int) and limit > 0, "config 里必须有这一项"
+    assert too_long("一" * (limit + 1), limit)
+    assert not too_long("一" * limit, limit)
+
+
+def test_prompt_demands_short_referring():
+    """提示词必须要求指代尽量短并给出「太长」的反例 ——
+    只给字数上限不够，模型会正好写满上限。"""
+    import prompts
+
+    text = prompts.load("vlm_describe")
+    assert "越短越好" in text
+    assert "反例二" in text, "要给出「太长」的反例，光说字数模型抓不住"
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

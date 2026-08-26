@@ -104,11 +104,15 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         used: set = set()
         if stem in multi_stems:
             k = min(rng.randint(2, multi_max), len(grades))
-            # 优先挑空间分区互不相同的目标，这样模板指代天然互异。
-            # 同分区的目标只有在 VLM 给出互异视觉指代时才可用，
-            # 最终由 build_multi 校验并在重复时拒绝。
+            # 两条选取偏好：
+            # (a) 优先挑【显眼、好描述】的目标 —— easy 档是大、孤立、分区内唯一的
+            #     目标，VLM 一两个特征就能锁定，指代自然就短。多目标样本要把
+            #     两三个指代拼成一句问题，用难描述的目标会拼出读不下去的长句。
+            # (b) 空间分区互不相同，这样模板指代天然互异；同分区的目标只有在
+            #     VLM 给出互异视觉指代时才可用，最终由 build_multi 校验。
+            _rank = {"easy": 0, "medium": 1, "hard": 2}
             chosen, seen_zones = [], set()
-            for g in grades:
+            for g in sorted(grades, key=lambda x: _rank.get(x.grade, 3)):
                 if g.zone in seen_zones:
                     continue
                 seen_zones.add(g.zone)
@@ -175,6 +179,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                    len(candidates), invalid, neg_added, vlm.stats, table)
     stats["multi_rejected_ambiguous_referring"] = multi_rejected
     stats["vlm_referring_leaked_label"] = builder.leaked_referrings
+    stats["vlm_referring_too_long"] = builder.overlong_referrings
     stats["multi_actual_ratio"] = round(
         sum(1 for s in samples if s.get("metadata", {}).get("sample_type") == "multi")
         / max(len(samples), 1), 4)

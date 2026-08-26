@@ -52,6 +52,23 @@ def leaks_label(referring: str, label: str) -> bool:
     return False
 
 
+def too_long(referring: str, limit: int = 20) -> bool:
+    """指代短语是不是太长了。
+
+    指代的唯一职责是把这个目标从图中锁定出来，能区分就够了。模型倾向于把
+    看到的特征全堆上去，实测会写出
+
+        「画面中上部，停在白色轿车和黑色轿车之间，靠近一棵绿树的那个目标」
+
+    这种三从句 30 字的指代。它会变成问题的主语，堆满定语让问题读不下去，
+    训练时也容易把真正的信号淹没在定语里。多目标样本更糟 —— 三个长指代
+    拼起来接近 80 字。
+
+    和类别名泄漏一样，提示词里已经写了上限，但提示词管不住模型，代码兜底。
+    """
+    return len((referring or "").strip()) > limit
+
+
 def _is_cjk(text: str) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in text)
 

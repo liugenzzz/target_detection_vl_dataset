@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import prompts
 
 from .coords import yolo_to_bbox2d
-from .referring import leaks_label, template_description, template_referring
+from .referring import leaks_label, template_description, template_referring, too_long
 from .vlm_client import VlmResult
 
 IMAGE_TOKEN = "<image>"
@@ -45,6 +45,8 @@ def _turn(role: str, text: str) -> Dict[str, str]:
 class SampleBuilder:
     def __init__(self, cfg, table, vlm=None):
         self.leaked_referrings = 0     # VLM 指代泄漏类别名而被丢弃的次数
+        self.overlong_referrings = 0   # VLM 指代过长而被丢弃的次数
+        self.max_referring_len = int(cfg.get_path("quality.max_referring_len", 20))
         self.cfg = cfg
         self.table = table
         self.vlm = vlm
@@ -111,6 +113,11 @@ class SampleBuilder:
         if result.referring and leaks_label(result.referring, box.label):
             self.leaked_referrings += 1
             result = VlmResult(fallback.referring, result.description, result.source)
+        # 同样的道理：指代过长就丢弃，回落模板 —— 模板指代虽短但足够锁定，
+        # 强过一个读不下去的三从句长句。
+        elif result.referring and too_long(result.referring, self.max_referring_len):
+            self.overlong_referrings += 1
+            result = VlmResult(fallback.referring, result.description, result.source)
         return result
 
     # -------------------------------------------------------------- 单目标
@@ -176,6 +183,10 @@ class SampleBuilder:
         for text, grade in zip(texts, grades):
             if text.source == "template" and not grade.unique_in_zone:
                 return None
+        # (c) 拼起来的问题不能太长。单条指代各自合格，三条拼一起仍可能到七八十字，
+        #     读不下去。超了就不出这条多目标样本，这些目标各自出单目标样本即可。
+        if sum(len(r) for r in referrings) > self.max_referring_len * len(referrings):
+            return None
         bboxes = [self._bbox2d(b, annotation) for b in boxes]
 
         referring = "、".join(t.referring for t in texts)
