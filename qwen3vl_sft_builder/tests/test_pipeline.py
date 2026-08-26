@@ -255,6 +255,49 @@ def test_fatal_error_carries_message():
     assert str(FatalVlmError("认证失败")) == "认证失败"
 
 
+
+def test_referring_must_not_leak_the_label():
+    """实战发现的严重缺陷：VLM 生成的指代短语里带了类别名，例如
+        问：图中靠近树木的那辆【三轮车】是什么？   答：是tricycle。
+    等于把答案写进了问题里，模型学不到识别能力，只学会把中文类别名翻译成英文。
+    提示词里已明令禁止，但提示词管不住模型，代码这一层必须兜底。"""
+    from core.referring import leaks_label
+
+    # 类别名整体出现
+    assert leaks_label("靠近树木的那辆三轮车", "三轮车")
+    assert leaks_label("白色轿车左侧的银色面包车", "面包车")
+    # 两字以上尾缀出现
+    assert leaks_label("穿红色上衣的那个人员", "军事人员")
+    # 单字尾缀出现在结尾
+    assert leaks_label("画面中部那艘船", "其它辅助船")
+    assert leaks_label("岸边那艘战舰", "主力战舰")
+
+
+def test_referring_leak_check_avoids_false_positives():
+    """单字尾缀只认结尾，否则「车」「船」这类高频字会大量误判 ——
+    「车头朝左」并没有泄漏「卡车」，这类合格指代不能被误杀。"""
+    from core.referring import leaks_label
+
+    assert not leaks_label("停在斜坡上、车头朝左的那个目标", "卡车")
+    assert not leaks_label("停在白色轿车左侧、车身银色的那个目标", "其它辅助船")
+    assert not leaks_label("广场上被一个人骑着的那个目标", "自行车")
+    assert not leaks_label("水面上行驶、拖着白色尾迹的那个目标", "两栖战舰")
+    # 英文类别名无法与中文指代比对，不做判断（返回 False 而不是误杀）
+    assert not leaks_label("parked next to the white car", "van")
+    # 空值不该崩
+    assert not leaks_label("", "卡车") and not leaks_label("那个目标", "")
+
+
+def test_prompt_forbids_naming_the_category():
+    """提示词必须明确禁止在指代里出现类别名，并给出正反例 ——
+    只写「优先用外观特征」是不够的，模型会照样用类别名。"""
+    import prompts
+
+    text = prompts.load("vlm_describe")
+    assert "绝对不能出现" in text, "必须是硬禁止，不能只是「优先」"
+    assert "反例" in text and "正例" in text, "要给出正反例，光讲规则模型抓不住"
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

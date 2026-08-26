@@ -174,6 +174,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     stats = _stats(samples, train, val, grade_hist, n_images, n_boxes,
                    len(candidates), invalid, neg_added, vlm.stats, table)
     stats["multi_rejected_ambiguous_referring"] = multi_rejected
+    stats["vlm_referring_leaked_label"] = builder.leaked_referrings
     stats["multi_actual_ratio"] = round(
         sum(1 for s in samples if s.get("metadata", {}).get("sample_type") == "multi")
         / max(len(samples), 1), 4)

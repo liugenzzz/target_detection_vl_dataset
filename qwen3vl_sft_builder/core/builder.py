@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import prompts
 
 from .coords import yolo_to_bbox2d
-from .referring import template_description, template_referring
+from .referring import leaks_label, template_description, template_referring
 from .vlm_client import VlmResult
 
 IMAGE_TOKEN = "<image>"
@@ -44,6 +44,7 @@ def _turn(role: str, text: str) -> Dict[str, str]:
 
 class SampleBuilder:
     def __init__(self, cfg, table, vlm=None):
+        self.leaked_referrings = 0     # VLM 指代泄漏类别名而被丢弃的次数
         self.cfg = cfg
         self.table = table
         self.vlm = vlm
@@ -102,7 +103,15 @@ class SampleBuilder:
             return fallback
 
         image_path, bbox, label, prompt_text = self.vlm_task(annotation, box, grade)
-        return self.vlm.describe(image_path, bbox, label, prompt_text, fallback)
+        result = self.vlm.describe(image_path, bbox, label, prompt_text, fallback)
+
+        # 兜底：VLM 的指代短语若把类别名说了出来，这条指代不能用 ——
+        # 第一轮问「图中{referring}是什么」，指代里带类别名就等于把答案写进了问题。
+        # 丢掉它回落模板空间指代，宁可指代弱一点，也不能泄漏答案。
+        if result.referring and leaks_label(result.referring, box.label):
+            self.leaked_referrings += 1
+            result = VlmResult(fallback.referring, result.description, result.source)
+        return result
 
     # -------------------------------------------------------------- 单目标
     def build_single(self, annotation, box, grade) -> Dict[str, Any]:
