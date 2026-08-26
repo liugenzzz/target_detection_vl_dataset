@@ -136,8 +136,19 @@ class SampleBuilder:
         return sample
 
     # -------------------------------------------------------------- 多目标
-    def build_multi(self, annotation, boxes: Sequence, grades: Sequence) -> Dict[str, Any]:
+    def build_multi(self, annotation, boxes: Sequence, grades: Sequence
+                    ) -> Optional[Dict[str, Any]]:
+        """多目标样本。各目标的指代短语必须互不相同 —— 否则「中部左侧那个目标」
+        出现两次，模型无法区分问的是哪一个。凑不出互异指代时返回 None，
+        这张图退回只出单目标样本。
+
+        VLM 开启时同分区的目标也可能有互异的视觉指代（「白色那艘」/「深色那艘」），
+        所以这里校验的是最终指代文本，而不是简单按空间分区排除。
+        """
         texts = [self._resolve_text(annotation, b, g) for b, g in zip(boxes, grades)]
+        referrings = [t.referring for t in texts]
+        if len(set(referrings)) != len(referrings):
+            return None
         bboxes = [self._bbox2d(b, annotation) for b in boxes]
 
         referring = "、".join(t.referring for t in texts)

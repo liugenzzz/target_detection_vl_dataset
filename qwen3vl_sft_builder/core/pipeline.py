@@ -82,6 +82,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
 
     samples: List[Dict[str, Any]] = []
     invalid = 0
+    multi_rejected = 0
     for stem, grades in by_image.items():
         ann, grade_map = annotations[stem]
         box_map = {b.index: b for b in ann.boxes}
@@ -91,15 +92,30 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         used: set = set()
         if stem in multi_stems:
             k = min(rng.randint(2, multi_max), len(grades))
-            chosen = grades[:k]
-            used = {g.box_index for g in chosen}
-            s = builder.build_multi(ann, [box_map[g.box_index] for g in chosen], chosen)
-            issues = validate_sample(s)
-            if issues:
-                invalid += 1
-                logger.warning("样本 %s 校验失败：%s", s.get("id"), issues)
-            else:
-                samples.append(s)
+            # 优先挑空间分区互不相同的目标，这样模板指代天然互异。
+            # 同分区的目标只有在 VLM 给出互异视觉指代时才可用，
+            # 最终由 build_multi 校验并在重复时拒绝。
+            chosen, seen_zones = [], set()
+            for g in grades:
+                if g.zone in seen_zones:
+                    continue
+                seen_zones.add(g.zone)
+                chosen.append(g)
+                if len(chosen) >= k:
+                    break
+            if len(chosen) >= 2:
+                s = builder.build_multi(
+                    ann, [box_map[g.box_index] for g in chosen], chosen)
+                if s is None:
+                    multi_rejected += 1          # 指代无法互异，退回单目标
+                else:
+                    issues = validate_sample(s)
+                    if issues:
+                        invalid += 1
+                        logger.warning("样本 %s 校验失败：%s", s.get("id"), issues)
+                    else:
+                        used = {g.box_index for g in chosen}
+                        samples.append(s)
 
         for g in grades:
             if g.box_index in used:
@@ -141,6 +157,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
 
     stats = _stats(samples, train, val, grade_hist, n_images, n_boxes,
                    len(candidates), invalid, neg_added, vlm.stats, table)
+    stats["multi_rejected_ambiguous_referring"] = multi_rejected
     stats["output"] = {"train": str(train_path), "val": str(val_path)}
     (output_dir / "build_report.json").write_text(
         json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
