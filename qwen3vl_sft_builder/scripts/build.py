@@ -47,12 +47,20 @@ def main() -> int:
     return 0
 
 
+from core.vlm_client import FatalVlmError  # noqa: E402
+
+
 def _cli(entry):
     """配置类错误直接打印人话并退出，不甩 Python 堆栈 —— 这类错误是用户改配置就能解决的，
     堆栈只会淹没真正有用的那句提示。真正的程序 bug 仍然照常抛出。"""
     import sys
     try:
         return entry()
+    except FatalVlmError as exc:
+        print(f"\n模型服务配置有问题，已中止（重试也不会成功）：\n\n    {exc}\n\n"
+              f"改好后先跑 python scripts/check_vlm.py 确认三步都通过。\n",
+              file=sys.stderr)
+        return 1
     except (ValueError, FileNotFoundError) as exc:
         print(f"\n配置有问题：\n{exc}\n", file=sys.stderr)
         return 1

@@ -28,6 +28,15 @@ from typing import Dict, List, Optional, Sequence, Tuple
 logger = logging.getLogger(__name__)
 
 
+class FatalVlmError(RuntimeError):
+    """配置层面的错误（认证失败、模型名不对、路径不对）。
+
+    这类错误重试多少次都不会成功，而且必然对【所有】请求成立 ——
+    十万条任务全都会失败。所以一旦出现就立即中止整批，别让几十万次
+    注定失败的请求砸向服务。
+    """
+
+
 @dataclass
 class VlmResult:
     referring: str
@@ -62,6 +71,7 @@ class VlmClient:
         # 白烧一整轮 API 却产出纯模板数据集。
         self._memory: Dict[str, VlmResult] = {}
         self._cancel = threading.Event()
+        self._fatal: Optional[str] = None      # 命中配置错误后记在这里，供 prefetch 中止
 
     # ------------------------------------------------------------ 缓存
     @staticmethod
@@ -128,7 +138,8 @@ class VlmClient:
 
         def work(task):
             image_path, bbox, _label, prompt_text = task
-            if self._cancel.is_set():          # 已请求中断，尚未启动的任务直接跳过
+            # 已请求中断，或已命中配置错误 —— 尚未启动的任务直接跳过
+            if self._cancel.is_set() or self._fatal:
                 return None
             result = self._request(image_path, prompt_text)
             if result is None:
@@ -154,6 +165,10 @@ class VlmClient:
                     ok = False
                 with self._lock:
                     self.stats["prefetched" if ok else "failed"] += 1
+                if self._fatal:
+                    self._cancel.set()
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise FatalVlmError(self._fatal)
                 if done % progress_every == 0 or done == len(todo):
                     elapsed = time.time() - started
                     rate = done / elapsed if elapsed else 0
@@ -251,16 +266,50 @@ class VlmClient:
             try:
                 resp = requests.post(self.api_url, json=payload,
                                      headers=headers, timeout=self.timeout)
-                if resp.status_code != 200:
-                    logger.warning("VLM 返回 HTTP %s（第 %s 次）", resp.status_code, attempt)
-                    time.sleep(min(2 ** attempt, 10))
-                    continue
-                text = resp.json()["choices"][0]["message"]["content"]
-                return _parse_vlm_json(text)
+                if resp.status_code == 200:
+                    return _parse_vlm_json(
+                        resp.json()["choices"][0]["message"]["content"])
+
+                # 4xx 里除了 429（限流）都是配置问题，重试没有意义 ——
+                # 请求本身就不对，再发一百次还是同样的错。
+                hint = _diagnose(resp.status_code, resp.text)
+                if hint:
+                    with self._lock:
+                        if self._fatal is None:
+                            self._fatal = hint
+                    return None
+
+                logger.warning("VLM 返回 HTTP %s（第 %s 次）", resp.status_code, attempt)
             except Exception as exc:                     # noqa: BLE001
                 logger.warning("调用 VLM 失败（第 %s 次）：%s", attempt, exc)
+            if attempt < self.max_retries:
                 time.sleep(min(2 ** attempt, 10))
         return None
+
+
+def _diagnose(status: int, body: str) -> Optional[str]:
+    """判断这个 HTTP 状态码是不是「重试也没用」的配置错误。
+
+    是则返回一句能直接照做的提示，否则返回 None（表示可以重试）。
+    429 限流和 5xx 属于临时故障，要重试。
+    """
+    if status in (429,) or status >= 500:
+        return None
+    snippet = (body or "")[:200]
+    if status == 401:
+        return ("HTTP 401 认证失败：api_key 没设置或不对。\n"
+                "    PowerShell:  $env:VLM_API_KEY=\"sk-...\"\n"
+                "    Linux/Mac :  export VLM_API_KEY=sk-...\n"
+                "    或写进 config/local.yaml 的 vlm.api_key")
+    if status == 403:
+        return "HTTP 403 无权访问：api_key 对但没有这个模型的权限，找服务方确认。"
+    if status == 404:
+        return ("HTTP 404 路径不对：vlm.api_url 必须带完整路径，"
+                "形如 http://主机:端口/v1/chat/completions")
+    if status in (400, 422):
+        return (f"HTTP {status} 请求被拒：多半是 vlm.model 的模型名和服务上的对不上，"
+                f"或该部署不支持图片输入。\n    服务返回：{snippet}")
+    return f"HTTP {status}：{snippet}"
 
 
 def _parse_vlm_json(text: str) -> Optional[VlmResult]:

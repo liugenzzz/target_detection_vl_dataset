@@ -225,6 +225,36 @@ def test_missing_path_error_is_actionable():
         assert "LABELS_DIR" in str(exc), "应提示可用的环境变量"
 
 
+
+def test_config_errors_are_not_retried():
+    """审查/实战发现：401 被重试了 3 次。认证失败重试永远不会成功 ——
+    十万条任务会变成三十万次注定失败的请求砸向服务，还要加上指数退避的等待。
+    4xx 里只有 429 限流该重试，其余都是配置问题。"""
+    from core.vlm_client import _diagnose
+
+    for code in (400, 401, 403, 404, 422):
+        assert _diagnose(code, "") is not None, f"HTTP {code} 是配置问题，不该重试"
+    for code in (429, 500, 502, 503):
+        assert _diagnose(code, "") is None, f"HTTP {code} 是临时故障，应该重试"
+
+
+def test_config_error_messages_are_actionable():
+    """每种配置错误都要给出能直接照做的解法，而不只是报个状态码。"""
+    from core.vlm_client import _diagnose
+
+    assert "VLM_API_KEY" in _diagnose(401, ""), "401 要告诉用户怎么设 key"
+    assert "/v1/chat/completions" in _diagnose(404, ""), "404 要给出完整路径示例"
+    assert "vlm.model" in _diagnose(400, ""), "400 要指向模型名配置"
+
+
+def test_fatal_error_carries_message():
+    """FatalVlmError 必须能带消息 —— 曾因 @dataclass 误装饰到它头上而
+    退化成不接受参数，抛错时反而盖掉了真正的提示。"""
+    from core.vlm_client import FatalVlmError
+
+    assert str(FatalVlmError("认证失败")) == "认证失败"
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

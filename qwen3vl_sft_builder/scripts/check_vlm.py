@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import prompts                                   # noqa: E402
 from config import load_config                   # noqa: E402
-from core.vlm_client import _parse_vlm_json      # noqa: E402
+from core.vlm_client import FatalVlmError, _parse_vlm_json      # noqa: E402
 from core.yolo import IMAGE_EXTS                 # noqa: E402
 
 OK, BAD = "  [通过]", "  [失败]"
@@ -155,6 +155,11 @@ def _cli(entry):
     import sys
     try:
         return entry()
+    except FatalVlmError as exc:
+        print(f"\n模型服务配置有问题，已中止（重试也不会成功）：\n\n    {exc}\n\n"
+              f"改好后先跑 python scripts/check_vlm.py 确认三步都通过。\n",
+              file=sys.stderr)
+        return 1
     except (ValueError, FileNotFoundError) as exc:
         print(f"\n配置有问题：\n{exc}\n", file=sys.stderr)
         return 1
