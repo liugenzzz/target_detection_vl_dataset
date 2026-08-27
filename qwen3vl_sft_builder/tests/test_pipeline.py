@@ -483,6 +483,39 @@ def test_skeleton_bare_strips_trailing_naga():
     assert Skeleton("extreme", "最左边那个").bare == "最左边"
 
 
+
+def test_verify_iou_and_parsing():
+    """反向验证的三块基础件：IoU、从模型回复里抠框、框规范化。"""
+    from core.refer_verify import iou, normalize, parse_box
+
+    assert iou([100, 100, 200, 200], [100, 100, 200, 200]) == 1.0
+    assert iou([100, 100, 200, 200], [300, 300, 400, 400]) == 0.0
+    assert abs(iou([0, 0, 100, 100], [50, 0, 150, 100]) - 1 / 3) < 1e-6
+
+    # 模型回复的三种常见形态都要能抠出框
+    assert parse_box('{"bbox_2d": [12,34,56,78]}') == [12, 34, 56, 78]
+    assert parse_box('```json\n{"bbox_2d":[1,2,3,4]}\n```') == [1, 2, 3, 4]
+    assert parse_box("好的，框是 [10, 20, 30, 40]") == [10, 20, 30, 40]
+    assert parse_box("我找不到") is None
+    assert parse_box("") is None
+
+    # 模型给反了坐标顺序、或者超出范围，都要能救回来
+    assert normalize([200, 300, 100, 50]) == [100, 50, 200, 300]
+    assert normalize([-10, 0, 2000, 500]) == [0, 0, 1000, 500]
+
+
+def test_verify_threshold_keeps_good_drops_bad():
+    """阈值语义：IoU 达标的留下，不达标的丢掉。
+    这是 ReferItGame「点对了才收录」的自动化版本。"""
+    from core.refer_verify import iou
+
+    gt = [100, 100, 300, 300]
+    good = [110, 110, 305, 295]      # 基本重合
+    bad = [600, 600, 800, 800]       # 指到别处去了
+    assert iou(good, gt) >= 0.5, "指对了的应当留下"
+    assert iou(bad, gt) < 0.5, "指错了的应当丢掉"
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

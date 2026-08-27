@@ -319,6 +319,84 @@ class VlmClient:
                 time.sleep(min(2 ** attempt, 10))
         return None
 
+    def prefetch_text(self, tasks, progress_every: int = 200) -> None:
+        """并发跑一批【纯文本】调用（口语化改写不需要图片，省掉 base64 传输）。
+
+        tasks 每项为 (key, prompt_text)，结果按 key 存进内存与磁盘缓存，
+        取用时用 text_result(key)。
+        """
+        if not self.enabled or not tasks:
+            return
+        todo = [t for t in tasks
+                if self._key(Path(t[0]), []) not in self._memory
+                and not self._read_cache(self._cache_path(Path(t[0]), []))]
+        if not todo:
+            logger.info("改写全部命中缓存")
+            return
+        logger.info("并发改写：%d 条，并发 %d 路", len(todo), self.concurrency)
+
+        def work(task):
+            key_src, prompt_text = task
+            if self._cancel.is_set() or self._fatal:
+                return None
+            raw = self._post({
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt_text}],
+                "temperature": self.temperature_select,
+                "max_tokens": 128,
+            })
+            if raw is None:
+                return None
+            k = self._key(Path(key_src), [])
+            with self._lock:
+                self._memory[k] = raw
+            self._write_cache(self._cache_path(Path(key_src), []), VlmResult("", raw, "vlm"))
+            return k
+
+        pool = ThreadPoolExecutor(max_workers=self.concurrency)
+        done = 0
+        try:
+            futures = [pool.submit(work, t) for t in todo]
+            for fut in as_completed(futures):
+                done += 1
+                try:
+                    ok = fut.result() is not None
+                except Exception as exc:                 # noqa: BLE001
+                    logger.warning("改写任务异常：%s", exc)
+                    ok = False
+                with self._lock:
+                    self.stats["prefetched" if ok else "failed"] += 1
+                if self._fatal:
+                    self._cancel.set()
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise FatalVlmError(self._fatal)
+                if done % progress_every == 0 or done == len(todo):
+                    logger.info("改写 %d/%d", done, len(todo))
+        except KeyboardInterrupt:
+            self._cancel.set()
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
+
+    def text_result(self, key_src: str) -> Optional[str]:
+        """取一条纯文本调用的结果。"""
+        k = self._key(Path(key_src), [])
+        raw = self._memory.get(k)
+        if raw is None:
+            cached = self._read_cache(self._cache_path(Path(key_src), []))
+            raw = cached.description if cached else None
+        return raw
+
+    def raw_result(self, image_path: Path, key) -> Optional[str]:
+        """取一条图片调用的原始返回。"""
+        k = self._key(image_path, key)
+        raw = self._memory.get(k)
+        if raw is None:
+            cached = self._read_cache(self._cache_path(image_path, key))
+            raw = cached.description if cached else None
+        return raw
+
     def _request_raw(self, image_path: Path, prompt_text: str,
                      temperature: Optional[float] = None) -> Optional[str]:
         """发一次请求，返回模型输出的原始文本（不解析）。"""
