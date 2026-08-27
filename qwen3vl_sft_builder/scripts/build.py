@@ -38,12 +38,28 @@ def main() -> int:
     stats = build(cfg, limit=args.limit)
     print(json.dumps(stats, ensure_ascii=False, indent=2))
 
+    from core.tasks import MAIN_LINE, TASKS
+
+    print("\n按任务类型分布（metadata.task_type，可据此筛选）：")
+    total = stats["samples_total"] or 1
+    for name in TASKS:
+        n = stats["by_task_type"].get(name, 0)
+        mark = " ←主线" if name in MAIN_LINE else ""
+        bar = "█" * round(n / total * 40)
+        print(f"  {name:<18} {n:>5}  {n / total * 100:>5.1f}%  {bar}{mark}")
+    print(f"\n  主线合计 {stats['main_line_ratio'] * 100:.1f}%"
+          f"    短答案 {stats['short_answer_ratio_actual'] * 100:.1f}%")
+
+    if stats["task_unavailable"]:
+        print("\n因条件不满足而跳过的（该图上出不了这个任务）：")
+        for k, v in sorted(stats["task_unavailable"].items(), key=lambda x: -x[1]):
+            print(f"  {k:<18} {v:>5} 次")
+
     split = stats["split"]
     if split["group_overlap"]:
         print(f"\n[警告] train/val 有 {split['group_overlap']} 个来源分组重叠，会造成泄漏！")
     else:
         print(f"\ntrain {split['train']} 条 / val {split['val']} 条，来源分组无重叠 ✓")
-    print(f"困难目标占比 {stats['hard_ratio_in_single'] * 100:.1f}%")
     return 0
 
 

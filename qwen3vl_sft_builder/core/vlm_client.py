@@ -124,7 +124,9 @@ class VlmClient:
             return
         self._prefetch_done = True
 
-        todo = [t for t in tasks if not self._read_cache(self._cache_path(t[0], t[1]))]
+        todo = [t for t in tasks
+                if self._key(t[0], t[1]) not in self._memory
+                and not self._read_cache(self._cache_path(t[0], t[1]))]
         hit = len(tasks) - len(todo)
         if hit:
             logger.info("VLM 缓存命中 %d 条，需要新调用 %d 条", hit, len(todo))
@@ -141,13 +143,14 @@ class VlmClient:
             # 已请求中断，或已命中配置错误 —— 尚未启动的任务直接跳过
             if self._cancel.is_set() or self._fatal:
                 return None
-            result = self._request(image_path, prompt_text)
-            if result is None:
+            raw = self._request_raw(image_path, prompt_text)
+            if raw is None:
                 return None
             key = self._key(image_path, bbox)
             with self._lock:
-                self._memory[key] = result     # 内存优先，磁盘只是跨进程复用
-            self._write_cache(self._cache_path(image_path, bbox), result)
+                self._memory[key] = raw        # 内存优先，磁盘只是跨进程复用
+            self._write_cache(self._cache_path(image_path, bbox),
+                              VlmResult("", raw, "vlm"))
             return key
 
         # 不用 with：ThreadPoolExecutor 的 __exit__ 是 shutdown(wait=True)，
@@ -191,6 +194,26 @@ class VlmClient:
                                "需要调整，建议先排查再全量跑。", failed)
 
     # ------------------------------------------------------------ 调用
+    def scene_info(self, image_path: Path, key: Sequence[int],
+                   valid_indices) -> Dict[int, Dict[str, str]]:
+        """取该图「挑对象」调用的结果。未启用 / 未命中 / 解析失败时返回空 dict，
+        依赖它的任务（ground_attribute、attribute_qa、image_caption）
+        会因条件不满足而跳过，不影响其余任务。
+
+        只保留仍在 valid_indices 里的编号 —— 模型可能返回被质量过滤掉的框，
+        或者干脆编一个不存在的编号。
+        """
+        raw = self._memory.get(self._key(image_path, key))
+        if raw is None:
+            cached = self._read_cache(self._cache_path(image_path, key))
+            raw = cached.description if cached else None
+        if not raw:
+            return {}
+        parsed = _parse_scene_json(raw) if isinstance(raw, str) else raw
+        if not isinstance(parsed, dict):
+            return {}
+        return {i: v for i, v in parsed.items() if i in valid_indices}
+
     def describe(self, image_path: Path, bbox: Sequence[int], label: str,
                  prompt_text: str, fallback: VlmResult) -> VlmResult:
         """给一个目标生成指代与描述。任何失败都回落 fallback，不抛异常。"""
@@ -234,21 +257,22 @@ class VlmClient:
             source=result.source,
         )
 
-    def _request(self, image_path: Path, prompt_text: str) -> Optional[VlmResult]:
-        try:
-            import requests
-        except ImportError:
-            logger.error("未安装 requests，无法调用 VLM 服务")
+    def _request_raw(self, image_path: Path, prompt_text: str) -> Optional[str]:
+        """发一次请求，返回模型输出的原始文本（不解析）。"""
+        payload = self._payload(image_path, prompt_text)
+        if payload is None:
             return None
+        return self._post(payload)
 
+    def _payload(self, image_path: Path, prompt_text: str) -> Optional[dict]:
+        """构造 OpenAI 兼容的多模态请求体。图片以 base64 data URI 传入。"""
         try:
             b64 = base64.b64encode(image_path.read_bytes()).decode()
         except OSError as exc:
             logger.warning("读图失败 %s：%s", image_path, exc)
             return None
-
         mime = "png" if image_path.suffix.lower() == ".png" else "jpeg"
-        payload = {
+        return {
             "model": self.model,
             "messages": [{"role": "user", "content": [
                 {"type": "image_url",
@@ -258,6 +282,15 @@ class VlmClient:
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
+
+    def _post(self, payload: dict) -> Optional[str]:
+        """发请求并返回模型输出的原始文本。配置类错误记入 _fatal 并立即放弃重试。"""
+        try:
+            import requests
+        except ImportError:
+            logger.error("未安装 requests，无法调用 VLM 服务")
+            return None
+
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -267,9 +300,7 @@ class VlmClient:
                 resp = requests.post(self.api_url, json=payload,
                                      headers=headers, timeout=self.timeout)
                 if resp.status_code == 200:
-                    return _parse_vlm_json(
-                        resp.json()["choices"][0]["message"]["content"])
-
+                    return resp.json()["choices"][0]["message"]["content"]
                 # 4xx 里除了 429（限流）都是配置问题，重试没有意义 ——
                 # 请求本身就不对，再发一百次还是同样的错。
                 hint = _diagnose(resp.status_code, resp.text)
@@ -278,13 +309,21 @@ class VlmClient:
                         if self._fatal is None:
                             self._fatal = hint
                     return None
-
                 logger.warning("VLM 返回 HTTP %s（第 %s 次）", resp.status_code, attempt)
             except Exception as exc:                     # noqa: BLE001
                 logger.warning("调用 VLM 失败（第 %s 次）：%s", attempt, exc)
             if attempt < self.max_retries:
                 time.sleep(min(2 ** attempt, 10))
         return None
+
+    def _request_raw(self, image_path: Path, prompt_text: str) -> Optional[str]:
+        """发一次请求，返回模型输出的原始文本（不解析）。"""
+        payload = self._payload(image_path, prompt_text)
+        return self._post(payload) if payload else None
+
+    def _request(self, image_path: Path, prompt_text: str) -> Optional[VlmResult]:
+        raw = self._request_raw(image_path, prompt_text)
+        return _parse_vlm_json(raw) if raw else None
 
 
 def _diagnose(status: int, body: str) -> Optional[str]:
@@ -310,6 +349,40 @@ def _diagnose(status: int, body: str) -> Optional[str]:
         return (f"HTTP {status} 请求被拒：多半是 vlm.model 的模型名和服务上的对不上，"
                 f"或该部署不支持图片输入。\n    服务返回：{snippet}")
     return f"HTTP {status}：{snippet}"
+
+
+def _parse_scene_json(text: str) -> Optional[Dict[int, Dict[str, str]]]:
+    """解析「挑对象」调用的返回：{"picked":[{"id":0,"attribute":..,"color":..,"description":..}]}
+
+    返回 {box_index: {attribute, color, description}}。解析不出返回 None。
+    """
+    if not text:
+        return None
+    cleaned = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+    m = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+    picked = data.get("picked") if isinstance(data, dict) else None
+    if not isinstance(picked, list):
+        return None
+    out: Dict[int, Dict[str, str]] = {}
+    for item in picked:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        out[idx] = {
+            "attribute": str(item.get("attribute") or "").strip(),
+            "color": str(item.get("color") or "").strip(),
+            "description": str(item.get("description") or "").strip(),
+        }
+    return out or None
 
 
 def _parse_vlm_json(text: str) -> Optional[VlmResult]:
