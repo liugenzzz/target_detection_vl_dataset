@@ -184,15 +184,21 @@ def detect_class(ctx: Ctx):
 
     否则漏掉被质量过滤的框，等于在教模型漏检。
     """
-    cand = [l for l in ctx.clean_labels if len(_same_label(ctx, l)) >= 2]
+    # 该类的框只要有一个已被别的样本用过，就不再出「定位所有该类」——
+    # 这个任务的答案是该类的全部框，同一张图同一个类别只可能有一种答案，
+    # 再出一条只是换了问法，属于近重复数据（实测同一答案出现过 6 次）。
+    cand = [l for l in ctx.clean_labels
+            if len(_same_label(ctx, l)) >= 2
+            and all(b.index not in ctx.used for b in _same_label(ctx, l))]
     if not cand:
         return None
     label = ctx.rng.choice(sorted(cand))
     boxes = _same_label(ctx, label)
     return {"conversations": _turns(
-                (_ask(ctx, prompts.render("detect_class", label=label), "detect_class"),
+                (_ask(ctx, prompts.render_choice("detect_class", ctx.rng, label=label),
+                      "detect_class"),
                  _j([_box_of(ctx, b) for b in boxes]))),
-            "focus": [b.index for b in boxes], "label": label}
+            "focus": [b.index for b in boxes], "label": label, "n_boxes": len(boxes)}
 
 
 def attribute_qa(ctx: Ctx):
@@ -303,21 +309,6 @@ def region_identify(ctx: Ctx):
             "focus": [b.index], "label": b.label}
 
 
-def image_caption(ctx: Ctx):
-    """描述一下这张图片。—— 由各目标的 VLM 描述拼合，不再单独调用。"""
-    seen, descs = set(), []
-    for b in ctx.boxes:
-        d = _describe(ctx, b)
-        if d and d not in seen:          # 去重：多个目标拿到同一句描述时只留一句
-            seen.add(d)
-            descs.append(d)
-    if len(descs) < 2:                   # 只有一句（或没有）拼不成整图描述
-        return None
-    return {"conversations": _turns(
-                (prompts.load("image_caption"), "".join(descs[:4]))),
-            "focus": [b.index for b in ctx.boxes], "label": None}
-
-
 TASKS: Dict[str, Callable[[Ctx], Optional[Dict[str, Any]]]] = {
     "ground_unique": ground_unique,
     "ground_spatial": ground_spatial,
@@ -328,7 +319,6 @@ TASKS: Dict[str, Callable[[Ctx], Optional[Dict[str, Any]]]] = {
     "count": count,
     "exist_negative": exist_negative,
     "region_identify": region_identify,
-    "image_caption": image_caption,
 }
 
 MAIN_LINE = ("ground_unique", "ground_spatial", "ground_attribute")

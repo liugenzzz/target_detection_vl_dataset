@@ -189,7 +189,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                     "n_turns": len(out["conversations"]) // 2,
                     **{k: v for k, v in out.items()
                        if k in ("attribute", "relation", "count", "polarity",
-                                "question_source")},
+                                "question_source", "n_boxes")},
                 },
             }
             issues = validate_sample(sample)
