@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import prompts
 
+from .refer_strategy import ASKABLE
 from .referring import is_vacuous_description
 
 # 属性问答目前只问颜色。VLM 返回的 attribute 是「用于指认的最显眼特征」，
@@ -48,6 +49,7 @@ class Ctx:
     measure_words: Dict[str, str] = field(default_factory=dict)
     require_desc: bool = True            # 主线是否强制三段齐全
     min_desc_len: int = 18               # 描述短于此判为空话
+    skeletons: Dict[int, Any] = field(default_factory=dict)   # box_index -> Skeleton
     # 本张图已经被出过样本的框。同一个目标出多条样本时，答案 bbox 完全相同，
     # 只是问法不同，属于近重复数据 —— 实测同一个框曾在一张图里被出了 4 次。
     used: set = field(default_factory=set)
@@ -136,19 +138,46 @@ def _main_line(ctx: Ctx, b, question: str, extra=None):
     return out
 
 
-def ground_spatial(ctx: Ctx):
-    """定位图中左侧那个人员。—— 空间指代，纯模板，零成本。
+def refer_locate(ctx: Ctx):
+    """策略化指代定位 —— 主线。三轮：指代问是什么 -> 框出来 -> 描述。
 
-    要求该目标在 3x3 分区内同类唯一，否则指代锁不住。
+    做法参照 RefCOCO 的采集机制 ReferItGame：一个人写指代、另一个人照着点，
+    点对了才收录。人指认目标是有优先级的，不是见谁都套一句方位：
+
+        同类唯一        直接说类别（交给 ground_unique，这里跳过）
+        同类两三个      极值：「最左边那个」
+        同类很多        极值 + 粗方位：「下面最左边那个」
+        旁有唯一异类    锚点：「卡车旁边那个」
+        贴着画面边缘    「贴着左边缘那个」
+        以上都不成立    没法用语言指认，丢弃
+
+    策略判定见 core/refer_strategy.py，全部由 YOLO 标注算出，零 VLM 成本。
+
+    骨架不含目标自身的类别名，所以第一轮问「这是什么」不会泄漏答案 ——
+    锚点里出现的是【别的】类别（「卡车旁边那个」），不构成泄漏。
     """
-    cand = ctx.unused([b for b in ctx.boxes
-                       if ctx.grades[b.index].unique_in_zone
-                       and len(_same_label(ctx, b.label)) > 1])
+    cand = [b for b in ctx.unused(ctx.boxes)
+            if b.index in ctx.skeletons
+            and ctx.skeletons[b.index].strategy in ASKABLE]
     if not cand:
         return None
     b = ctx.rng.choice(cand)
-    return _main_line(ctx, b, prompts.render(
-        "ground_spatial", spatial=ctx.spatial(b), mw=ctx.mw(b.label), label=b.label))
+    sk = ctx.skeletons[b.index]
+
+    desc = _describe(ctx, b)
+    if ctx.require_desc and not desc:
+        return None
+
+    pairs = [
+        (prompts.render_choice("refer_ask_what", ctx.rng, skel=sk.phrase, bare=sk.bare),
+         prompts.render_choice("refer_answer_what", ctx.rng,
+                               label=b.label, mw=ctx.mw(b.label))),
+        (prompts.render_choice("refer_ask_box", ctx.rng), _j(_box_of(ctx, b))),
+    ]
+    if desc:
+        pairs.append((prompts.render_choice("refer_ask_desc", ctx.rng), desc))
+    return {"conversations": _turns(*pairs), "focus": [b.index], "label": b.label,
+            "refer_strategy": sk.strategy, "skeleton": sk.phrase}
 
 
 def ground_attribute(ctx: Ctx):
@@ -311,7 +340,7 @@ def region_identify(ctx: Ctx):
 
 TASKS: Dict[str, Callable[[Ctx], Optional[Dict[str, Any]]]] = {
     "ground_unique": ground_unique,
-    "ground_spatial": ground_spatial,
+    "refer_locate": refer_locate,
     "ground_attribute": ground_attribute,
     "detect_class": detect_class,
     "attribute_qa": attribute_qa,
@@ -321,4 +350,4 @@ TASKS: Dict[str, Callable[[Ctx], Optional[Dict[str, Any]]]] = {
     "region_identify": region_identify,
 }
 
-MAIN_LINE = ("ground_unique", "ground_spatial", "ground_attribute")
+MAIN_LINE = ("ground_unique", "refer_locate", "ground_attribute")

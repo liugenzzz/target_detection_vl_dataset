@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import collections
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -16,6 +17,7 @@ from .classes import load_class_table
 from .coords import yolo_to_bbox2d
 from .difficulty import REJECT, Grader
 from .grouping import source_group_key
+from .refer_strategy import decide_all
 from .referring import spatial_phrase
 from .tasks import MAIN_LINE, TASKS, Ctx
 
@@ -139,6 +141,9 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         vlm_info = vlm.scene_info(ann.image_path, [ann.width, ann.height],
                                  {b.index for b in kept})
         used: set = set()          # 本图已出过样本的框，避免同一目标反复出样本
+        # 指代骨架按图算一次：全图唯一性校验需要看到该图全部目标
+        label_counts = collections.Counter(b.label for b in kept)
+        skeletons = decide_all(kept, label_counts)
         n_want = min(cap, max(1, len(kept)))
         for _ in range(n_want):
             # 一个槽位最多试 MAX_TRY 个任务：某个任务在这张图上条件不满足时
@@ -154,7 +159,8 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                           bbox2d=b2d, spatial=lambda b: spatial_phrase(b.cx, b.cy),
                           rng=rng, short_answer=rng.random() < short_ratio,
                           measure_words=measure_words, require_desc=require_desc,
-                          used=used, min_desc_len=min_desc_len)
+                          used=used, min_desc_len=min_desc_len,
+                          skeletons=skeletons)
                 try:
                     out = TASKS[name](ctx)
                 except Exception as exc:                   # noqa: BLE001
@@ -189,7 +195,8 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                     "n_turns": len(out["conversations"]) // 2,
                     **{k: v for k, v in out.items()
                        if k in ("attribute", "relation", "count", "polarity",
-                                "question_source", "n_boxes")},
+                                "question_source", "n_boxes",
+                                "refer_strategy", "skeleton")},
                 },
             }
             issues = validate_sample(sample)

@@ -1,0 +1,7 @@
+# 第一轮答案的句式库。{label} 是类别名。答案侧也要口语，不能全是「该目标为 XX」。
+是{label}。
+{label}。
+是一{mw}{label}。
+那是{label}。
+应该是{label}。
+看着是{label}。

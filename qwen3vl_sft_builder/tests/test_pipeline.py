@@ -413,6 +413,76 @@ def test_ambiguous_single_sample_is_dropped():
     assert b.ambiguous_dropped == 1
 
 
+
+class _B:
+    """测试用的框，只需要 index/label/cx/cy。"""
+    def __init__(self, i, label, cx, cy):
+        self.index, self.label, self.cx, self.cy = i, label, cx, cy
+
+
+def _counts(boxes):
+    import collections
+    return collections.Counter(b.label for b in boxes)
+
+
+def test_extreme_is_computed_over_all_boxes_not_per_class():
+    """指代骨架刻意不带类别名（这样才能问「这是什么」而不泄漏答案），
+    因此「最左边那个」在人看来指的是【全图】最左的目标，不是「最左的那辆三轮车」。
+    按同类算会产出「最左边那个」却给出一个偏右的框 —— 实测 29% 的样本自相矛盾。"""
+    from core.refer_strategy import decide
+
+    boxes = [_B(0, "卡车", 0.1, 0.5), _B(1, "三轮车", 0.6, 0.5), _B(2, "三轮车", 0.9, 0.5)]
+    # 三轮车里最左的是 index 1，但全图最左的是那辆卡车 -> 1 不该拿到「最左边那个」
+    sk = decide(boxes[1], boxes, _counts(boxes))
+    assert sk is None or "最左" not in sk.phrase, f"不该说最左：{sk and sk.phrase}"
+    # 全图最左的确实拿得到
+    sk0 = decide(boxes[0], boxes, _counts(boxes))
+    assert sk0 is not None and sk0.strategy == "unique"   # 卡车同类唯一，走 unique
+
+
+def test_skeletons_are_unique_within_image():
+    """骨架不带类别名，跨类别就容易重名 —— 人员的「最左边那个」和三轮车的
+    「最左边那个」是两句一模一样的话却指向不同目标。必须全图查重。"""
+    from core.refer_strategy import decide_all
+
+    boxes = [_B(i, "人员" if i < 3 else "三轮车", 0.1 + i * 0.2, 0.5) for i in range(6)]
+    got = decide_all(boxes, _counts(boxes))
+    phrases = [sk.phrase for sk in got.values()]
+    assert len(phrases) == len(set(phrases)), f"骨架重名：{phrases}"
+
+
+def test_no_redundant_zone_and_extreme_on_same_axis():
+    """极值词已经交代了一个轴时，粗方位要用另一个轴，
+    否则会拼出「左边最左边那个」这种废话。"""
+    from core.refer_strategy import decide_all
+
+    boxes = [_B(i, "三轮车", 0.1 + i * 0.15, 0.2 + (i % 2) * 0.6) for i in range(6)]
+    for sk in decide_all(boxes, _counts(boxes)).values():
+        for axis_pair in (("左边", "最左"), ("右边", "最右"), ("上面", "最上"), ("下面", "最下")):
+            zone, ext = axis_pair
+            assert not sk.phrase.startswith(zone + ext), f"同轴冗余：{sk.phrase}"
+
+
+def test_anchor_requires_exclusive_proximity():
+    """「卡车旁边那个」里的卡车必须唯一，而且本目标要是那辆卡车旁边唯一的目标，
+    否则两个目标都会拿到同一句指代。"""
+    from core.refer_strategy import decide
+
+    # 卡车旁边同时有人员和三轮车 -> 两者都不能用锚点
+    boxes = [_B(0, "卡车", 0.5, 0.5), _B(1, "人员", 0.53, 0.52), _B(2, "三轮车", 0.55, 0.5)]
+    for b in boxes[1:]:
+        sk = decide(b, boxes, _counts(boxes))
+        assert sk is None or sk.strategy != "anchor", f"不该用锚点：{sk and sk.phrase}"
+
+
+def test_skeleton_bare_strips_trailing_naga():
+    """句式模板自己要接名词时用 bare，否则拼出「卡车旁边那个那玩意儿」。"""
+    from core.refer_strategy import Skeleton
+
+    assert Skeleton("anchor", "卡车旁边那个").bare == "卡车旁边"
+    assert Skeleton("extreme", "最左边那个").bare == "最左边"
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):
