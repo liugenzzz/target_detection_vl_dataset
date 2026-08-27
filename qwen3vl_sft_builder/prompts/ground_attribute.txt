@@ -1,1 +1,1 @@
-定位图中{attribute}的那{mw}{label}。
+框出图中{attribute}的{label}。

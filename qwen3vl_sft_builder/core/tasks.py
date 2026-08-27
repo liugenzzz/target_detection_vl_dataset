@@ -86,6 +86,12 @@ def _ask(ctx: Ctx, text: str, task: str = "") -> str:
     return text
 
 
+def _clean_attr(attr: str) -> str:
+    """去掉属性词尾部的「的」。模板与 VLM 问句都写成「{attribute}的{label}」，
+    模型返回「蹲着的」时会拼出「蹲着的的行人」。"""
+    return (attr or "").strip().rstrip("的") or (attr or "").strip()
+
+
 def _same_label(ctx: Ctx, label: str) -> List:
     return [b for b in ctx.boxes if b.label == label]
 
@@ -151,9 +157,9 @@ def ground_attribute(ctx: Ctx):
         return None
     b = ctx.rng.choice(cand)
     info = ctx.vlm[b.index]
-    attr = info["attribute"]
+    attr = _clean_attr(info["attribute"])
 
-    questions = info.get("questions") or []
+    questions = [q.replace("的的", "的") for q in (info.get("questions") or []) if q]
     if questions:
         question = ctx.rng.choice(questions)
         source = "vlm"
