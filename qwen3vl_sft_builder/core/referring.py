@@ -52,6 +52,35 @@ def leaks_label(referring: str, label: str) -> bool:
     return False
 
 
+# 放到哪张图上都成立的空话。描述里只有这些、没有具体参照物时，
+# 等于没描述 —— 拿着它在图上根本找不到目标。
+_VACUOUS = (
+    "一处目标", "一个目标", "轮廓清晰", "位于道路旁", "在道路旁",
+    "画面中一处", "位于画面中", "清晰可见", "较为明显",
+)
+
+
+def is_vacuous_description(desc: str, min_len: int = 18) -> bool:
+    """描述是不是空话。
+
+    实测模型会写出「画面中一处目标，轮廓清晰，位于道路旁。」——
+    三个分句全是套话，放到任何一张图任何一个目标上都成立，照着找不到东西。
+
+    两条判据：太短，或者通篇只有套话短语、没有任何具体参照物。
+    """
+    d = (desc or "").strip()
+    if not d:
+        return True
+    if len(d) < min_len:
+        return True
+    # 去掉套话短语后还剩多少实质内容
+    rest = d
+    for w in _VACUOUS:
+        rest = rest.replace(w, "")
+    rest = rest.strip("，。、,. 　")
+    return len(rest) < min_len // 2
+
+
 def too_long(referring: str, limit: int = 20) -> bool:
     """指代短语是不是太长了。
 

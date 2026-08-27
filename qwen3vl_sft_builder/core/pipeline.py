@@ -81,6 +81,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     weights = cfg.get_path("tasks", {}) or {}
     measure_words = _load_measure_words(cfg)
     require_desc = bool(cfg.get_path("main_line_requires_description", True))
+    min_desc_len = int(cfg.get_path("min_description_len", 18))
     all_labels = sorted(table.id2name.values())
 
     rng = random.Random(seed)
@@ -153,7 +154,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                           bbox2d=b2d, spatial=lambda b: spatial_phrase(b.cx, b.cy),
                           rng=rng, short_answer=rng.random() < short_ratio,
                           measure_words=measure_words, require_desc=require_desc,
-                          used=used)
+                          used=used, min_desc_len=min_desc_len)
                 try:
                     out = TASKS[name](ctx)
                 except Exception as exc:                   # noqa: BLE001

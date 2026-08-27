@@ -25,6 +25,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 import prompts
 
+from .referring import is_vacuous_description
+
 # 属性问答目前只问颜色。VLM 返回的 attribute 是「用于指认的最显眼特征」，
 # 可能是朝向、形状，不一定是颜色，所以两者分开存。
 ATTR_QUESTIONS = {"color": "颜色"}
@@ -45,6 +47,7 @@ class Ctx:
     short_answer: bool = False
     measure_words: Dict[str, str] = field(default_factory=dict)
     require_desc: bool = True            # 主线是否强制三段齐全
+    min_desc_len: int = 18               # 描述短于此判为空话
     # 本张图已经被出过样本的框。同一个目标出多条样本时，答案 bbox 完全相同，
     # 只是问法不同，属于近重复数据 —— 实测同一个框曾在一张图里被出了 4 次。
     used: set = field(default_factory=set)
@@ -97,8 +100,12 @@ def _same_label(ctx: Ctx, label: str) -> List:
 
 
 def _describe(ctx: Ctx, b) -> Optional[str]:
+    """取该目标的描述。空话描述当作没有 —— 主线要求三段齐全时会因此跳过该目标，
+    宁可少一条样本，也不要「画面中一处目标，轮廓清晰」这种照着找不到的描述。"""
     d = (ctx.vlm.get(b.index) or {}).get("description")
-    return d or None
+    if not d or is_vacuous_description(d, ctx.min_desc_len):
+        return None
+    return d
 
 
 # --------------------------------------------------------------- 主线三种
