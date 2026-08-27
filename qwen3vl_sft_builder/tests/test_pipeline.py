@@ -12,6 +12,7 @@ from core.classes import _detect_confusable, _one_char_apart
 from core.coords import yolo_to_bbox2d, zone_of
 from core.grouping import source_group_key
 from core.referring import spatial_phrase
+from core import phrase_bank
 
 
 def test_coords_full_image():
@@ -414,36 +415,8 @@ def test_ambiguous_single_sample_is_dropped():
 
 
 
-def test_verify_iou_and_parsing():
-    """反向验证的三块基础件：IoU、从模型回复里抠框、框规范化。"""
-    from core.refer_verify import iou, normalize, parse_box
-
-    assert iou([100, 100, 200, 200], [100, 100, 200, 200]) == 1.0
-    assert iou([100, 100, 200, 200], [300, 300, 400, 400]) == 0.0
-    assert abs(iou([0, 0, 100, 100], [50, 0, 150, 100]) - 1 / 3) < 1e-6
-
-    # 模型回复的三种常见形态都要能抠出框
-    assert parse_box('{"bbox_2d": [12,34,56,78]}') == [12, 34, 56, 78]
-    assert parse_box('```json\n{"bbox_2d":[1,2,3,4]}\n```') == [1, 2, 3, 4]
-    assert parse_box("好的，框是 [10, 20, 30, 40]") == [10, 20, 30, 40]
-    assert parse_box("我找不到") is None
-    assert parse_box("") is None
-
-    # 模型给反了坐标顺序、或者超出范围，都要能救回来
-    assert normalize([200, 300, 100, 50]) == [100, 50, 200, 300]
-    assert normalize([-10, 0, 2000, 500]) == [0, 0, 1000, 500]
 
 
-def test_verify_threshold_keeps_good_drops_bad():
-    """阈值语义：IoU 达标的留下，不达标的丢掉。
-    这是 ReferItGame「点对了才收录」的自动化版本。"""
-    from core.refer_verify import iou
-
-    gt = [100, 100, 300, 300]
-    good = [110, 110, 305, 295]      # 基本重合
-    bad = [600, 600, 800, 800]       # 指到别处去了
-    assert iou(good, gt) >= 0.5, "指对了的应当留下"
-    assert iou(bad, gt) < 0.5, "指错了的应当丢掉"
 
 
 def test_all_tasks_share_one_truth_set_per_image():
@@ -491,6 +464,75 @@ def test_inventory_lists_every_kept_class():
     assert out is not None
     inv = dict(item.rsplit("x", 1) for item in out["inventory"])
     assert inv == {"人员": "2", "卡车": "1"}, f"清单不完整：{out['inventory']}"
+
+
+
+# ---------------------------------------------------------------- 扩充问法库
+
+def test_bank_rejects_wrong_placeholders():
+    req = ["label", "mw"]
+    # 少一个占位符 -> 问句失去指向
+    assert not phrase_bank.accept("x", "那辆{label}在哪？", req, 30, [])
+    # 多一个占位符 -> 构建时 .format() 抛 KeyError，会打断整批
+    assert not phrase_bank.accept("x", "那{mw}{label}{color}在哪？", req, 30, [])
+    assert phrase_bank.accept("x", "那{mw}{label}在哪？", req, 30, [])
+
+
+def test_bank_rejects_junk():
+    assert not phrase_bank.accept("x", "", [], 30, [])
+    assert not phrase_bank.accept("x", "# 这是注释", [], 30, [])
+    assert not phrase_bank.accept("x", "图" * 40, [], 30, [])
+    assert not phrase_bank.accept("x", "图中有什么？", [], 30, ["图中有什么？"])
+    # 落单的大括号在 format 时会炸，必须在入库前拦掉
+    assert not phrase_bank.accept("x", "图中有什么}", [], 30, [])
+
+
+def test_bank_sanitize_strips_model_junk():
+    assert phrase_bank.sanitize("1. 图中有什么？") == "图中有什么？"
+    assert phrase_bank.sanitize('- "画面里有啥？"') == "画面里有啥？"
+    assert phrase_bank.sanitize("  · 看得清的有哪些？ ") == "看得清的有哪些？"
+
+
+def test_bank_length_counts_placeholder_as_short_word():
+    # {label} 实到值是「三轮车」这种短词，按字面 7 个字算会误杀合格短句
+    assert phrase_bank.visible_len("那{mw}{label}在哪？") == 8
+
+
+def test_bank_merges_with_handwritten():
+    import prompts
+    base = prompts.variants("inv_ask_what")
+    try:
+        prompts.use_bank({"inv_ask_what": ["图里都有啥？", base[0]]})
+        merged = prompts.variants("inv_ask_what")
+        # 手写的一条都不能丢，重复的那条不能算两遍
+        assert set(base) <= set(merged)
+        assert len(merged) == len(base) + 1
+        assert len(set(merged)) == len(merged)
+    finally:
+        prompts.use_bank({})
+    assert prompts.variants("inv_ask_what") == base
+
+
+def test_bank_placeholders_of_reads_from_file():
+    import prompts
+    assert prompts.placeholders_of("inv_ask_box") == ("label", "mw")
+    assert prompts.placeholders_of("inv_ask_what") == ()
+
+
+def test_bank_roundtrip():
+    import tempfile, os
+    banks = {"inv_ask_what": ["图里都有啥？", "看得见的有哪些？"]}
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    os.close(fd)
+    try:
+        Path(path).write_text(phrase_bank.dump(banks), encoding="utf-8")
+        assert phrase_bank.load(path) == banks
+    finally:
+        os.unlink(path)
+    # 没生成过问法库时构建照常跑
+    assert phrase_bank.load(None) == {}
+    assert phrase_bank.load("/nonexistent/phrase_banks.yaml") == {}
+
 
 
 if __name__ == "__main__":

@@ -5,10 +5,16 @@
 
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from pathlib import Path
+from typing import Dict, Sequence, Tuple
 
 PROMPT_DIR = Path(__file__).resolve().parent
+
+# 扩充问法库：{池名: (说法, ...)}。由 scripts/build_phrase_banks.py 一次性生成，
+# 构建时由 use_bank() 灌进来。空的时候一切照旧，只用 .txt 里手写的那几句。
+_BANK: Dict[str, Tuple[str, ...]] = {}
 
 
 @lru_cache(maxsize=None)
@@ -36,9 +42,52 @@ def load_variants(name: str) -> tuple:
     return variants
 
 
+def comment_of(name: str) -> str:
+    """取一个问法文件开头的 # 注释块，去掉 # 后拼成一段话。
+
+    每个问法池的注释都写明了这个池子在对话里干什么用（「第一轮：问图中有什么」），
+    生成扩充问法时要把这段话给模型，否则它不知道该保持什么意思不变。
+    """
+    out = []
+    for ln in load(name).splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        if not ln.startswith("#"):
+            break
+        out.append(ln.lstrip("#").strip())
+    return " ".join(out)
+
+
+def placeholders_of(name: str) -> Tuple[str, ...]:
+    """一个问法池用到的占位符集合，例如 inv_ask_box 是 (label, mw)。"""
+    found = set()
+    for v in load_variants(name):
+        found.update(re.findall(r"\{(\w+)\}", v))
+    return tuple(sorted(found))
+
+
+def use_bank(bank: Dict[str, Sequence[str]]) -> None:
+    """装载扩充问法库。可重复调用，后一次覆盖前一次。"""
+    _BANK.clear()
+    for name, phrases in (bank or {}).items():
+        cleaned = tuple(dict.fromkeys(str(p).strip() for p in phrases if str(p).strip()))
+        if cleaned:
+            _BANK[name] = cleaned
+
+
+def variants(name: str) -> Tuple[str, ...]:
+    """该问法池实际可用的全部说法 = 手写的 + 扩充库里的，按顺序去重。
+
+    手写的那几句是校准过的基准，不因为有了扩充库就丢掉；两边合并取样，
+    问法总数从个位数涨到几十条，同一句话在整个数据集里的复现率随之降一个量级。
+    """
+    return tuple(dict.fromkeys(load_variants(name) + _BANK.get(name, ())))
+
+
 def render_choice(name: str, rng, **kwargs) -> str:
-    """从多问法文件里随机取一句并填充占位符。"""
-    return rng.choice(load_variants(name)).format(**kwargs)
+    """从多问法池里随机取一句并填充占位符。"""
+    return rng.choice(variants(name)).format(**kwargs)
 
 
 def render(name: str, **kwargs) -> str:

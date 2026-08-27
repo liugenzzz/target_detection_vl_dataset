@@ -36,6 +36,7 @@ def _load_measure_words(cfg) -> Dict[str, str]:
         return {}
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return {str(k): str(v) for k, v in (data.get("measure_words") or {}).items()}
+from . import phrase_bank
 from .vlm_client import VlmClient
 from .yolo import iter_annotations
 
@@ -81,6 +82,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     max_pick = int(cfg.get_path("sampling.vlm_max_pick", 6))
     weights = cfg.get_path("tasks", {}) or {}
     measure_words = _load_measure_words(cfg)
+    n_phrases = phrase_bank.install(cfg)
     require_desc = bool(cfg.get_path("main_line_requires_description", True))
     min_desc_len = int(cfg.get_path("min_description_len", 18))
     all_labels = sorted(table.id2name.values())
@@ -218,6 +220,10 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         "task_unavailable": {k: v for k, v in failed.items() if v},
         "invalid_dropped": invalid,
         "vlm_calls": dict(vlm.stats),
+        "phrase_bank_loaded": n_phrases,
+        # 问句去重率：不同问法 / 问句总数。这个数掉下来就说明问法在复读，
+        # 模型会把问句当固定口令背下来而不是听懂要框什么。
+        "question_variety": _question_variety(samples),
         "split": _split_stats(train, val),
         "classes_total": table.count,
     }
@@ -226,6 +232,20 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     stats["output"] = {"train": str(output_dir / "train.jsonl"),
                        "val": str(output_dir / "val.jsonl")}
     return stats
+
+
+
+def _question_variety(samples) -> Dict[str, Any]:
+    """统计人类问句的重复情况：去重后的问法数 / 问句总数，外加复现最多的那句。"""
+    asked = [t["value"].replace("<image>\n", "")
+             for s in samples for t in s["conversations"] if t["from"] == "human"]
+    if not asked:
+        return {}
+    counts = Counter(asked)
+    top, n = counts.most_common(1)[0]
+    return {"distinct": len(counts), "total": len(asked),
+            "ratio": round(len(counts) / len(asked), 4),
+            "most_repeated": {"text": top[:40], "times": n}}
 
 
 def _split_by_source(samples, cfg, seed) -> Tuple[List, List]:

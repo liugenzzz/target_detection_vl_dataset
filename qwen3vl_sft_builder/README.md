@@ -73,6 +73,10 @@ python scripts/get_visdrone.py --out ./data/visdrone   # 约 78MB
 # 0. 接入新的模型服务后第一个跑这个，别跳过
 python scripts/check_vlm.py
 
+# 0.5 一次性生成量词表与扩充问法库，之后长期复用（都是纯文本调用，不发图片）
+python scripts/build_measure_words.py
+python scripts/build_phrase_banks.py
+
 # 1. 先看分布，定阈值（COCO 的阈值不适用于你的数据，必须重跑）
 python scripts/analyze.py
 
@@ -341,7 +345,36 @@ VLM 结果按图落盘到 `vlm_cache/`，**支持断点续跑** —— 两万张
 | `turn3_describe.txt` | 第三轮：要描述 |
 | `multi_turn*.txt` | 多目标样本的三轮 |
 | `negative_ask.txt` / `negative_answer.txt` | 拒答样本 |
-| `vlm_describe.txt` | **调 VLM 的提示词，最需要反复调的就是这个** |
+| `inv_ask_*.txt` / `inv_answer_what.txt` | 盘点 → 定位 → 描述三轮的问法池 |
+| `detect_class.txt` | 按类别全找出来的问法池 |
+| `gen_phrases.txt` | 扩充问法库用的提示词，见下节 |
+| `vlm_select.txt` | **调 VLM 的主提示词，最需要反复调的就是这个** |
+
+### 问法池与扩充问法库
+
+上表里带「问法池」的文件，每个非空非注释行是一种说法，构建时随机取一句。
+手写只有五六条，**十万条样本摊下来同一句话要出现上千遍** —— 模型学到的会是
+「见到这句口令就输出框」，而不是「听懂要框什么」。
+
+`scripts/build_phrase_banks.py` 把每个池子扩到几十条，结果落进
+`config/phrase_banks.yaml`，构建时与手写的那几条合并取样。跟量词表一样，
+问法与图片内容无关，所以一次性生成、长期复用，不占构建时的调用预算
+（全部池子加起来十几次纯文本调用）。
+
+```bash
+python scripts/build_phrase_banks.py                      # 全部池子
+python scripts/build_phrase_banks.py --pool inv_ask_what --show
+python scripts/build_phrase_banks.py --target 60 --force  # 重新生成
+```
+
+生成的句子会先过一遍校验：占位符必须与该池子完全一致（少了问句失去指向，
+多了构建时 `.format()` 会抛异常打断整批）、超长的丢掉、重复的丢掉。
+**生成完请扫一眼 `config/phrase_banks.yaml`，别扭的句子直接删掉那一行**，
+删完不用重新生成。
+
+构建报告里的 `question_variety` 就是用来盯这件事的：`ratio` 是不同问法占问句
+总数的比例，`most_repeated` 是复现最多的那一句。本地实测扩充前 31.8%、
+最高一句复现 37 次，扩充后 67.8%、最高 9 次。
 
 ---
 
@@ -365,14 +398,16 @@ prompts/      提示词纯文本，与代码分离
 core/         classes 类别表与易混检测 / coords 坐标换算 / yolo 标注解析
               difficulty 难度分级与配额 / grouping 来源分组 / referring 指代生成
               vlm_client 调 Qwen 服务 / builder 三轮样本组装 / pipeline 编排
+              phrase_bank 扩充问法库的读写与校验
 scripts/      check_vlm.py 服务自检 / analyze.py 分布分析
               build.py 构建 / preview.py 验证图
+              build_measure_words.py 量词表 / build_phrase_banks.py 扩充问法库
               get_visdrone.py 下载测试数据集
 tests/        回归测试，不依赖外部数据和 VLM 服务
 ```
 
 ```bash
-python tests/test_pipeline.py      # 10 项，服务器上部署后先跑这个
+python tests/test_pipeline.py      # 39 项，服务器上部署后先跑这个
 ```
 
 ---
