@@ -414,76 +414,6 @@ def test_ambiguous_single_sample_is_dropped():
 
 
 
-class _B:
-    """测试用的框，只需要 index/label/cx/cy。"""
-    def __init__(self, i, label, cx, cy):
-        self.index, self.label, self.cx, self.cy = i, label, cx, cy
-
-
-def _counts(boxes):
-    import collections
-    return collections.Counter(b.label for b in boxes)
-
-
-def test_extreme_is_computed_over_all_boxes_not_per_class():
-    """指代骨架刻意不带类别名（这样才能问「这是什么」而不泄漏答案），
-    因此「最左边那个」在人看来指的是【全图】最左的目标，不是「最左的那辆三轮车」。
-    按同类算会产出「最左边那个」却给出一个偏右的框 —— 实测 29% 的样本自相矛盾。"""
-    from core.refer_strategy import decide
-
-    boxes = [_B(0, "卡车", 0.1, 0.5), _B(1, "三轮车", 0.6, 0.5), _B(2, "三轮车", 0.9, 0.5)]
-    # 三轮车里最左的是 index 1，但全图最左的是那辆卡车 -> 1 不该拿到「最左边那个」
-    sk = decide(boxes[1], boxes, _counts(boxes))
-    assert sk is None or "最左" not in sk.phrase, f"不该说最左：{sk and sk.phrase}"
-    # 全图最左的确实拿得到
-    sk0 = decide(boxes[0], boxes, _counts(boxes))
-    assert sk0 is not None and sk0.strategy == "unique"   # 卡车同类唯一，走 unique
-
-
-def test_skeletons_are_unique_within_image():
-    """骨架不带类别名，跨类别就容易重名 —— 人员的「最左边那个」和三轮车的
-    「最左边那个」是两句一模一样的话却指向不同目标。必须全图查重。"""
-    from core.refer_strategy import decide_all
-
-    boxes = [_B(i, "人员" if i < 3 else "三轮车", 0.1 + i * 0.2, 0.5) for i in range(6)]
-    got = decide_all(boxes, _counts(boxes))
-    phrases = [sk.phrase for sk in got.values()]
-    assert len(phrases) == len(set(phrases)), f"骨架重名：{phrases}"
-
-
-def test_no_redundant_zone_and_extreme_on_same_axis():
-    """极值词已经交代了一个轴时，粗方位要用另一个轴，
-    否则会拼出「左边最左边那个」这种废话。"""
-    from core.refer_strategy import decide_all
-
-    boxes = [_B(i, "三轮车", 0.1 + i * 0.15, 0.2 + (i % 2) * 0.6) for i in range(6)]
-    for sk in decide_all(boxes, _counts(boxes)).values():
-        for axis_pair in (("左边", "最左"), ("右边", "最右"), ("上面", "最上"), ("下面", "最下")):
-            zone, ext = axis_pair
-            assert not sk.phrase.startswith(zone + ext), f"同轴冗余：{sk.phrase}"
-
-
-def test_anchor_requires_exclusive_proximity():
-    """「卡车旁边那个」里的卡车必须唯一，而且本目标要是那辆卡车旁边唯一的目标，
-    否则两个目标都会拿到同一句指代。"""
-    from core.refer_strategy import decide
-
-    # 卡车旁边同时有人员和三轮车 -> 两者都不能用锚点
-    boxes = [_B(0, "卡车", 0.5, 0.5), _B(1, "人员", 0.53, 0.52), _B(2, "三轮车", 0.55, 0.5)]
-    for b in boxes[1:]:
-        sk = decide(b, boxes, _counts(boxes))
-        assert sk is None or sk.strategy != "anchor", f"不该用锚点：{sk and sk.phrase}"
-
-
-def test_skeleton_bare_strips_trailing_naga():
-    """句式模板自己要接名词时用 bare，否则拼出「卡车旁边那个那玩意儿」。"""
-    from core.refer_strategy import Skeleton
-
-    assert Skeleton("anchor", "卡车旁边那个").bare == "卡车旁边"
-    assert Skeleton("extreme", "最左边那个").bare == "最左边"
-
-
-
 def test_verify_iou_and_parsing():
     """反向验证的三块基础件：IoU、从模型回复里抠框、框规范化。"""
     from core.refer_verify import iou, normalize, parse_box
@@ -514,6 +444,53 @@ def test_verify_threshold_keeps_good_drops_bad():
     bad = [600, 600, 800, 800]       # 指到别处去了
     assert iou(good, gt) >= 0.5, "指对了的应当留下"
     assert iou(bad, gt) < 0.5, "指错了的应当丢掉"
+
+
+def test_all_tasks_share_one_truth_set_per_image():
+    """同一张图上，所有任务必须基于同一个目标集合。
+
+    过滤后的框【就是】这张图的真值。曾经用「该类全部框都合格」来决定能否出
+    盘点/检测类任务，结果同一张图上一个样本说「有 2 辆卡车」（人员整类因有框
+    被过滤而不进清单），另一个样本又去定位人员 —— 上下文自相矛盾。
+    Ctx 里不该再有 clean_labels 这类会让部分类别时隐时现的字段。
+    """
+    import dataclasses
+    from core.tasks import Ctx
+
+    fields = {f.name for f in dataclasses.fields(Ctx)}
+    assert "clean_labels" not in fields, "不能再按类别可见性分叉，会造成同图矛盾"
+    assert "boxes" in fields, "所有任务共用 boxes 这一个集合"
+
+
+def test_inventory_lists_every_kept_class():
+    """盘点清单必须覆盖过滤后剩下的每一个类别，不能漏。
+    漏一个类别，同一张图上别的任务去定位它时就会与清单打架。"""
+    from pathlib import Path
+    from config import load_config
+    from core.tasks import Ctx, inventory_locate
+    import random
+
+    class _Box:
+        def __init__(self, i, label):
+            self.index, self.label = i, label
+            self.cx = self.cy = 0.5
+            self.w = self.h = 0.1
+
+    class _Ann:
+        stem = "t"; width = height = 640
+        image_path = Path("t.jpg"); label_path = Path("t.txt")
+
+    boxes = [_Box(0, "人员"), _Box(1, "人员"), _Box(2, "卡车")]
+    ctx = Ctx(annotation=_Ann(), boxes=boxes, grades={}, 
+              vlm={i: {"description": "位于画面左下角，一辆白色卡车停在路边，旁边有树。"}
+                   for i in range(3)},
+              all_labels=["人员", "卡车", "船"],
+              bbox2d=lambda b: [1, 2, 3, 4], spatial=lambda b: "中间",
+              rng=random.Random(0), measure_words={"人员": "名", "卡车": "辆"})
+    out = inventory_locate(ctx)
+    assert out is not None
+    inv = dict(item.rsplit("x", 1) for item in out["inventory"])
+    assert inv == {"人员": "2", "卡车": "1"}, f"清单不完整：{out['inventory']}"
 
 
 if __name__ == "__main__":

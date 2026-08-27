@@ -22,6 +22,10 @@ vlm:
   # 「挑对象 + 生成问句」那次调用单用一个更高的温度 —— 要它写出三种明显不同的
   # 说法，温度低了三句会写得几乎一样，问法就不丰富了。
   temperature_select: 0.85
+  # 口语化改写单用一个【低】温度。它和上面那次调用的目标相反：
+  # 挑对象要多样性（三句问法要明显不同），改写要保真（不能改变指向哪个目标）。
+  # 共用 0.85 等于让它自由发挥，指向漂移的风险高。
+  temperature_rewrite: 0.3
   max_tokens: 1024
   concurrency: 4                      # 并发请求数，先小后大，看服务承载
   max_retries: 3
@@ -124,11 +128,10 @@ difficulty:
 tasks:
   ground_attribute:  100    # 属性指代定位（主线）。问句由 VLM 生成，不套模板
   ground_unique:       0    # 原 12  定位图中的卡车（该类仅一个实例）
-  refer_locate:        0    # 原 20  策略化指代定位：指代->是什么->框->描述
+  inventory_locate:    0    # 原 20  盘点->定位->描述（count 已并入第一轮）
   detect_class:        0    # 原 12  定位图中所有的人员（需该类全部框合格）
   attribute_qa:        0    # 原  8  [框] 这个目标是什么颜色
   spatial_relation:    0    # 原  6  卡车在人员的哪一侧（纯坐标，零成本）
-  count:               0    # 原  6  图中有几个人员（需该类全部框合格）
   exist_negative:      0    # 原 10  图中有没有直升机 / 拒答
   region_identify:     0    # 原 10  [框] 这个位置的是什么（REG）
 # image_caption 已移除：描述性内容在主线第二轮已经有了，整图描述靠拼接

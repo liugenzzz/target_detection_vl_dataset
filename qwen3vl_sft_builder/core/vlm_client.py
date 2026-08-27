@@ -58,6 +58,8 @@ class VlmClient:
         self.concurrency = max(1, int(v.get("concurrency", 4)))
         # 挑对象那次调用要顺带生成多样的问句，温度低了三句会写得几乎一样。
         self.temperature_select = float(v.get("temperature_select", 0.85))
+        # 改写要保真不要发挥，用低温
+        self.temperature_rewrite = float(v.get("temperature_rewrite", 0.3))
         cache = v.get("cache_dir") or ""
         self.cache_dir = Path(cache) if cache else None
         if self.cache_dir:
@@ -342,7 +344,7 @@ class VlmClient:
             raw = self._post({
                 "model": self.model,
                 "messages": [{"role": "user", "content": prompt_text}],
-                "temperature": self.temperature_select,
+                "temperature": self.temperature_rewrite,
                 "max_tokens": 128,
             })
             if raw is None:

@@ -25,7 +25,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 import prompts
 
-from .refer_strategy import ASKABLE
 from .referring import is_vacuous_description
 
 # 属性问答目前只问颜色。VLM 返回的 attribute 是「用于指认的最显眼特征」，
@@ -40,7 +39,10 @@ class Ctx:
     boxes: List[Any]                     # 通过质量过滤的框
     grades: Dict[int, Any]               # box_index -> Grade
     vlm: Dict[int, Dict[str, str]]       # box_index -> {attribute,color,description}
-    clean_labels: set                    # 该图中「全部框都合格」的类别，可出 detect/count
+    # 过滤后的框【就是】这张图的真值：所有任务都基于同一个集合，
+    # 这样「图中有 3 名人员」和「定位所有人员 -> 3 个框」不会自相矛盾。
+    # 曾经用「该类全部框都合格」来决定能否出盘点/检测类任务，结果同一张图上
+    # 一个样本说没有人员、另一个样本又去定位人员，上下文打架。
     all_labels: List[str]                # 全类别表，用于挑不存在的类别做拒答
     bbox2d: Callable                     # box -> [x1,y1,x2,y2]
     spatial: Callable                    # box -> 「下方左侧」
@@ -138,46 +140,56 @@ def _main_line(ctx: Ctx, b, question: str, extra=None):
     return out
 
 
-def refer_locate(ctx: Ctx):
-    """策略化指代定位 —— 主线。三轮：指代问是什么 -> 框出来 -> 描述。
+def inventory_locate(ctx: Ctx):
+    """盘点 -> 定位 -> 描述，三轮递进 —— 主线。
 
-    做法参照 RefCOCO 的采集机制 ReferItGame：一个人写指代、另一个人照着点，
-    点对了才收录。人指认目标是有优先级的，不是见谁都套一句方位：
+        用户 │ 图中有哪些清晰可见的目标？
+        模型 │ 有 3 名人员、2 辆卡车和 1 艘船。
+        用户 │ 那艘船在哪？
+        模型 │ {"bbox_2d": [...], "label": "其它辅助船"}
+        用户 │ 描述一下这艘船。
+        模型 │ ...
 
-        同类唯一        直接说类别（交给 ground_unique，这里跳过）
-        同类两三个      极值：「最左边那个」
-        同类很多        极值 + 粗方位：「下面最左边那个」
-        旁有唯一异类    锚点：「卡车旁边那个」
-        贴着画面边缘    「贴着左边缘那个」
-        以上都不成立    没法用语言指认，丢弃
+    每一轮都承接上一轮，是一段真对话，不是拼起来的问答对。计数信息在第一轮
+    自然带出，所以不再单独出「图中有几个 X」的任务。
 
-    策略判定见 core/refer_strategy.py，全部由 YOLO 标注算出，零 VLM 成本。
+    第一轮的问法刻意限定为【清晰可见的】目标：实测只有 3.5% 的图片全部标注框
+    都能通过质量过滤，其余图片都有被剔除的小目标。不加这个限定就等于给出一份
+    不完整的清单，是在教模型漏报。加了限定则与整套质量过滤的立场自洽 ——
+    小目标本来就不进训练集。
 
-    骨架不含目标自身的类别名，所以第一轮问「这是什么」不会泄漏答案 ——
-    锚点里出现的是【别的】类别（「卡车旁边那个」），不构成泄漏。
+    第二轮要挑一个【该类只有一个干净实例】的目标，这样「那艘船」无歧义。
     """
-    cand = [b for b in ctx.unused(ctx.boxes)
-            if b.index in ctx.skeletons
-            and ctx.skeletons[b.index].strategy in ASKABLE]
-    if not cand:
+    # 只列全部框都合格的类别，被过滤掉框的类别一律不进清单
+    labels = sorted({b.label for b in ctx.boxes})
+    inventory = [(l, len(_same_label(ctx, l))) for l in labels]
+    if not inventory:
         return None
-    b = ctx.rng.choice(cand)
-    sk = ctx.skeletons[b.index]
 
-    desc = _describe(ctx, b)
+    # 第二轮的目标：该类恰好一个实例，且本图还没用过
+    picks = [l for l, n in inventory
+             if n == 1 and _same_label(ctx, l)[0].index not in ctx.used]
+    if not picks:
+        return None
+    label = ctx.rng.choice(picks)
+    box = _same_label(ctx, label)[0]
+
+    desc = _describe(ctx, box)
     if ctx.require_desc and not desc:
         return None
 
+    listing = "、".join(f"{n}{ctx.mw(l)}{l}" for l, n in inventory)
     pairs = [
-        (prompts.render_choice("refer_ask_what", ctx.rng, skel=sk.phrase, bare=sk.bare),
-         prompts.render_choice("refer_answer_what", ctx.rng,
-                               label=b.label, mw=ctx.mw(b.label))),
-        (prompts.render_choice("refer_ask_box", ctx.rng), _j(_box_of(ctx, b))),
+        (prompts.render_choice("inv_ask_what", ctx.rng),
+         prompts.render_choice("inv_answer_what", ctx.rng, listing=listing)),
+        (prompts.render_choice("inv_ask_box", ctx.rng, mw=ctx.mw(label), label=label),
+         _j(_box_of(ctx, box))),
     ]
     if desc:
-        pairs.append((prompts.render_choice("refer_ask_desc", ctx.rng), desc))
-    return {"conversations": _turns(*pairs), "focus": [b.index], "label": b.label,
-            "refer_strategy": sk.strategy, "skeleton": sk.phrase}
+        pairs.append((prompts.render_choice("inv_ask_desc", ctx.rng,
+                                            mw=ctx.mw(label), label=label), desc))
+    return {"conversations": _turns(*pairs), "focus": [box.index], "label": label,
+            "inventory": [f"{l}x{n}" for l, n in inventory]}
 
 
 def ground_attribute(ctx: Ctx):
@@ -216,7 +228,7 @@ def detect_class(ctx: Ctx):
     # 该类的框只要有一个已被别的样本用过，就不再出「定位所有该类」——
     # 这个任务的答案是该类的全部框，同一张图同一个类别只可能有一种答案，
     # 再出一条只是换了问法，属于近重复数据（实测同一答案出现过 6 次）。
-    cand = [l for l in ctx.clean_labels
+    cand = [l for l in {b.label for b in ctx.boxes}
             if len(_same_label(ctx, l)) >= 2
             and all(b.index not in ctx.used for b in _same_label(ctx, l))]
     if not cand:
@@ -284,19 +296,6 @@ def spatial_relation(ctx: Ctx):
             "focus": [a.index, b.index], "label": a.label, "relation": rel}
 
 
-def count(ctx: Ctx):
-    """图中有几个人员？—— 同样只在该类全部框合格时才出，否则数字是错的。"""
-    if not ctx.clean_labels:
-        return None
-    label = ctx.rng.choice(sorted(ctx.clean_labels))
-    n = len(_same_label(ctx, label))
-    return {"conversations": _turns(
-                (_ask(ctx, prompts.render("count", label=label)),
-                 str(n) if ctx.short_answer
-                 else prompts.render("count_answer", n=n, mw=ctx.mw(label)))),
-            "focus": [], "label": label, "count": n}
-
-
 def exist_negative(ctx: Ctx):
     """图中有没有直升机？—— 不可省。没有这类样本，模型会学到「被问就一定有」，
     推理时凭空编框。Ferret 有 95K hard negative（8.6%），Osprey 有 64K（8.8%）。
@@ -340,14 +339,13 @@ def region_identify(ctx: Ctx):
 
 TASKS: Dict[str, Callable[[Ctx], Optional[Dict[str, Any]]]] = {
     "ground_unique": ground_unique,
-    "refer_locate": refer_locate,
+    "inventory_locate": inventory_locate,
     "ground_attribute": ground_attribute,
     "detect_class": detect_class,
     "attribute_qa": attribute_qa,
     "spatial_relation": spatial_relation,
-    "count": count,
     "exist_negative": exist_negative,
     "region_identify": region_identify,
 }
 
-MAIN_LINE = ("ground_unique", "refer_locate", "ground_attribute")
+MAIN_LINE = ("ground_unique", "inventory_locate", "ground_attribute")

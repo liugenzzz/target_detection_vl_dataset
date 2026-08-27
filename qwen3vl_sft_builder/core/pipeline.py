@@ -17,8 +17,6 @@ from .classes import load_class_table
 from .coords import yolo_to_bbox2d
 from .difficulty import REJECT, Grader
 from .grouping import source_group_key
-from .refer_strategy import ASKABLE, decide_all
-from .refer_verify import iou, normalize, parse_box
 from .referring import spatial_phrase
 from .tasks import MAIN_LINE, TASKS, Ctx
 
@@ -101,13 +99,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         kept = [b for b in ann.boxes if gmap[b.index].grade != REJECT]
         if not kept:
             continue
-        # 「该类全部框都合格」的类别才能出 detect_class / count ——
-        # 否则答案漏掉被过滤的框，等于教模型漏检、报错误的数量。
-        by_label: Dict[str, List[bool]] = {}
-        for b in ann.boxes:
-            by_label.setdefault(b.label, []).append(gmap[b.index].grade != REJECT)
-        clean = {l for l, oks in by_label.items() if all(oks)}
-        scenes.append({"ann": ann, "kept": kept, "gmap": gmap, "clean": clean})
+        scenes.append({"ann": ann, "kept": kept, "gmap": gmap})
         if limit and len(scenes) >= limit:
             break
 
@@ -129,12 +121,6 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
             tasks.append((ann.image_path, [ann.width, ann.height], "scene", text))
         vlm.prefetch(tasks)
 
-    # ---- 阶段二·五：refer_locate 的口语化改写与反向验证 ----
-    rl_cfg = cfg.get_path("refer_locate", {}) or {}
-    rewritten, verified = _refine_skeletons(
-        scenes, vlm, rl_cfg, scale, origin,
-        bool(rl_cfg.get("rewrite", False)), bool(rl_cfg.get("verify", False)))
-
     # ---- 阶段三：按配比生成 ----
     samples: List[Dict[str, Any]] = []
     made = Counter()
@@ -150,14 +136,6 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         used: set = set()          # 本图已出过样本的框，避免同一目标反复出样本
         # 指代骨架按图算一次：全图唯一性校验需要看到该图全部目标
         label_counts = collections.Counter(b.label for b in kept)
-        skeletons = decide_all(kept, label_counts)
-        # 改写后的口语句与验证结果按 (图, 框) 挂回去
-        for idx in list(skeletons):
-            key = (ann.stem, idx)
-            if key in rewritten:
-                skeletons[idx].phrase = rewritten[key]
-            if verified and key not in verified:
-                skeletons.pop(idx, None)      # 反向验证没过，丢弃该目标
         n_want = min(cap, max(1, len(kept)))
         for _ in range(n_want):
             # 一个槽位最多试 MAX_TRY 个任务：某个任务在这张图上条件不满足时
@@ -169,12 +147,11 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                 name = task_pool[cursor % len(task_pool)]
                 cursor += 1
                 ctx = Ctx(annotation=ann, boxes=kept, grades=gmap, vlm=vlm_info,
-                          clean_labels=sc["clean"], all_labels=all_labels,
+                          all_labels=all_labels,
                           bbox2d=b2d, spatial=lambda b: spatial_phrase(b.cx, b.cy),
                           rng=rng, short_answer=rng.random() < short_ratio,
                           measure_words=measure_words, require_desc=require_desc,
-                          used=used, min_desc_len=min_desc_len,
-                          skeletons=skeletons)
+                          used=used, min_desc_len=min_desc_len)
                 try:
                     out = TASKS[name](ctx)
                 except Exception as exc:                   # noqa: BLE001
@@ -210,7 +187,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                     **{k: v for k, v in out.items()
                        if k in ("attribute", "relation", "count", "polarity",
                                 "question_source", "n_boxes",
-                                "refer_strategy", "skeleton")},
+                                "inventory")},
                 },
             }
             issues = validate_sample(sample)
@@ -249,71 +226,6 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     stats["output"] = {"train": str(output_dir / "train.jsonl"),
                        "val": str(output_dir / "val.jsonl")}
     return stats
-
-
-def _refine_skeletons(scenes, vlm, rl_cfg, scale, origin, do_rewrite, do_verify):
-    """refer_locate 第 3、4 步。返回 (改写结果, 通过验证的集合)。
-
-    两步都关闭时直接返回空，骨架保持规则原样。
-    """
-    rewritten: Dict[Tuple[str, int], str] = {}
-    verified: Optional[set] = None
-    if not vlm.enabled or not (do_rewrite or do_verify):
-        return rewritten, verified
-
-    # 收集所有 refer_locate 会用到的骨架
-    items = []          # (stem, idx, image_path, phrase, 真值框)
-    for sc in scenes:
-        ann, kept = sc["ann"], sc["kept"]
-        counts = collections.Counter(b.label for b in kept)
-        for idx, sk in decide_all(kept, counts).items():
-            if sk.strategy not in ASKABLE:
-                continue
-            box = next(b for b in kept if b.index == idx)
-            gt = yolo_to_bbox2d(box.cx, box.cy, box.w, box.h,
-                                ann.width, ann.height, scale, origin)
-            items.append((ann.stem, idx, ann.image_path, sk.phrase, gt))
-    if not items:
-        return rewritten, verified
-
-    # 第 3 步：口语化改写（纯文本，不发图、不给坐标）
-    if do_rewrite:
-        tasks = [(f"rw::{stem}::{idx}",
-                  prompts.render("refer_rewrite", sentence=phrase))
-                 for stem, idx, _, phrase, _ in items]
-        vlm.prefetch_text(tasks)
-        for (stem, idx, _, phrase, _), (key, _) in zip(items, tasks):
-            got = (vlm.text_result(key) or "").strip().strip('"「」')
-            # 改写太长或为空就退回骨架 —— 骨架至少语义是对的
-            if got and len(got) <= 30:
-                rewritten[(stem, idx)] = got
-        logger.info("口语化改写：%d/%d 条采用", len(rewritten), len(items))
-
-    # 第 4 步：反向验证（指代 + 原图 -> 框，与真值算 IoU）
-    if do_verify:
-        thr = float(rl_cfg.get("verify_iou_threshold", 0.5))
-        tasks = []
-        for stem, idx, img, phrase, _ in items:
-            referring = rewritten.get((stem, idx), phrase)
-            tasks.append((img, ["verify", idx], "verify",
-                          prompts.render("refer_verify", referring=referring)))
-        vlm.prefetch(tasks)
-        verified = set()
-        scores = []
-        for (stem, idx, img, _, gt), task in zip(items, tasks):
-            raw = vlm.raw_result(img, task[1])
-            box = parse_box(raw) if raw else None
-            if box is None:
-                continue
-            score = iou(normalize(box, scale), gt)
-            scores.append(score)
-            if score >= thr:
-                verified.add((stem, idx))
-        kept_n = len(verified)
-        med = sorted(scores)[len(scores) // 2] if scores else 0
-        logger.info("反向验证：%d/%d 条通过（IoU>=%.2f，中位 %.3f）",
-                    kept_n, len(items), thr, med)
-    return rewritten, verified
 
 
 def _split_by_source(samples, cfg, seed) -> Tuple[List, List]:
