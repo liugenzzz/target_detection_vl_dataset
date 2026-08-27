@@ -19,6 +19,9 @@ vlm:
   model: "Qwen3.6-27B"
   timeout: 300
   temperature: 0.35
+  # 「挑对象 + 生成问句」那次调用单用一个更高的温度 —— 要它写出三种明显不同的
+  # 说法，温度低了三句会写得几乎一样，问法就不丰富了。
+  temperature_select: 0.85
   max_tokens: 1024
   concurrency: 4                      # 并发请求数，先小后大，看服务承载
   max_retries: 3
@@ -116,17 +119,19 @@ difficulty:
 # 每条样本的 metadata.task_type 会写明类型，方便你按类型筛掉不要的。
 # 把某个任务的比例设为 0 即可关闭它。比例会自动归一化，不必凑满 100。
 # ---------------------------------------------------------------------------
+# 当前处于单任务打磨阶段：只开 ground_attribute，其余全部关闭（权重 0）。
+# 逐个任务调好后再把权重恢复，注释里是原定配比。
 tasks:
-  ground_unique:      12    # 定位图中的卡车（该类仅一个实例，无需修饰）
-  ground_spatial:     20    # 定位图中左侧那个人员（空间指代，模板）
-  ground_attribute:   13    # 定位图中白色的那艘其它辅助船（属性指代，需 VLM）
-  detect_class:       12    # 定位图中所有的人员（需该类全部框合格）
-  attribute_qa:        8    # [框] 这个目标是什么颜色（需 VLM）
-  spatial_relation:    6    # 卡车在人员的哪一侧（纯坐标计算，零成本）
-  count:               6    # 图中有几个人员（需该类全部框合格）
-  exist_negative:     10    # 图中有没有直升机 / 定位不存在的类别
-  region_identify:    10    # [框] 这个位置的是什么（REG，坐标->类别）
-  image_caption:       3    # 描述整张图片（需 VLM）
+  ground_attribute:  100    # 属性指代定位（主线）。问句由 VLM 生成，不套模板
+  ground_unique:       0    # 原 12  定位图中的卡车（该类仅一个实例）
+  ground_spatial:      0    # 原 20  定位图中左侧那个人员（空间指代，模板）
+  detect_class:        0    # 原 12  定位图中所有的人员（需该类全部框合格）
+  attribute_qa:        0    # 原  8  [框] 这个目标是什么颜色
+  spatial_relation:    0    # 原  6  卡车在人员的哪一侧（纯坐标，零成本）
+  count:               0    # 原  6  图中有几个人员（需该类全部框合格）
+  exist_negative:      0    # 原 10  图中有没有直升机 / 拒答
+  region_identify:     0    # 原 10  [框] 这个位置的是什么（REG）
+  image_caption:       0    # 原  3  描述整张图片
 
 # 答案格式维度，与任务类型正交 —— 同一个问题可以要详细答案也可以要一个词。
 # Osprey-724K 用了 14% 的「短答案」样本来增强回答格式的灵活性。

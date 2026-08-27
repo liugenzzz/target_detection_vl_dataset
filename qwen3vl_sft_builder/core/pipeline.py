@@ -137,6 +137,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         b2d = bbox2d_for(ann)
         vlm_info = vlm.scene_info(ann.image_path, [ann.width, ann.height],
                                  {b.index for b in kept})
+        used: set = set()          # 本图已出过样本的框，避免同一目标反复出样本
         n_want = min(cap, max(1, len(kept)))
         for _ in range(n_want):
             # 一个槽位最多试 MAX_TRY 个任务：某个任务在这张图上条件不满足时
@@ -151,7 +152,8 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                           clean_labels=sc["clean"], all_labels=all_labels,
                           bbox2d=b2d, spatial=lambda b: spatial_phrase(b.cx, b.cy),
                           rng=rng, short_answer=rng.random() < short_ratio,
-                          measure_words=measure_words, require_desc=require_desc)
+                          measure_words=measure_words, require_desc=require_desc,
+                          used=used)
                 try:
                     out = TASKS[name](ctx)
                 except Exception as exc:                   # noqa: BLE001
@@ -185,7 +187,8 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                     "focus_box_indices": out.get("focus", []),
                     "n_turns": len(out["conversations"]) // 2,
                     **{k: v for k, v in out.items()
-                       if k in ("attribute", "relation", "count", "polarity")},
+                       if k in ("attribute", "relation", "count", "polarity",
+                                "question_source")},
                 },
             }
             issues = validate_sample(sample)
@@ -194,6 +197,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                 logger.warning("样本 %s 校验失败：%s", sample["id"], issues)
                 continue
             made[name] += 1
+            used.update(out.get("focus", []))
             samples.append(sample)
 
     # ---- 阶段四：按来源分组划分 ----

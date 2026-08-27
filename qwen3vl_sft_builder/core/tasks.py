@@ -45,6 +45,13 @@ class Ctx:
     short_answer: bool = False
     measure_words: Dict[str, str] = field(default_factory=dict)
     require_desc: bool = True            # 主线是否强制三段齐全
+    # 本张图已经被出过样本的框。同一个目标出多条样本时，答案 bbox 完全相同，
+    # 只是问法不同，属于近重复数据 —— 实测同一个框曾在一张图里被出了 4 次。
+    used: set = field(default_factory=set)
+
+    def unused(self, boxes):
+        """过滤掉本图已用过的框；全都用过时返回空列表，任务据此跳过。"""
+        return [b for b in boxes if b.index not in self.used]
 
     def mw(self, label: str) -> str:
         """该类别的量词。船「艘」、车「辆」、人「名」；查不到退回「个」。"""
@@ -91,7 +98,7 @@ def _describe(ctx: Ctx, b) -> Optional[str]:
 # --------------------------------------------------------------- 主线三种
 def ground_unique(ctx: Ctx):
     """定位图中的卡车。—— 该类在图中仅一个实例，类别名本身就唯一，无需任何修饰。"""
-    singles = [b for b in ctx.boxes if len(_same_label(ctx, b.label)) == 1]
+    singles = ctx.unused([b for b in ctx.boxes if len(_same_label(ctx, b.label)) == 1])
     if not singles:
         return None
     b = ctx.rng.choice(singles)
@@ -121,8 +128,9 @@ def ground_spatial(ctx: Ctx):
 
     要求该目标在 3x3 分区内同类唯一，否则指代锁不住。
     """
-    cand = [b for b in ctx.boxes
-            if ctx.grades[b.index].unique_in_zone and len(_same_label(ctx, b.label)) > 1]
+    cand = ctx.unused([b for b in ctx.boxes
+                       if ctx.grades[b.index].unique_in_zone
+                       and len(_same_label(ctx, b.label)) > 1])
     if not cand:
         return None
     b = ctx.rng.choice(cand)
@@ -131,15 +139,30 @@ def ground_spatial(ctx: Ctx):
 
 
 def ground_attribute(ctx: Ctx):
-    """定位图中白色的那艘其它辅助船。—— 属性指代，需要 VLM 给出可区分的外观特征。"""
-    cand = [b for b in ctx.boxes if (ctx.vlm.get(b.index) or {}).get("attribute")]
+    """属性指代定位 —— 主线。问句由 VLM 生成，不套模板。
+
+    模板问句「定位图中{attribute}的那{mw}{label}。」写死后所有样本一个腔调，
+    十万条同一句式，既不像真人说话，也让模型只学到那一个句式。改由 VLM 为每个
+    目标生成三种说法，这里随机取一句；VLM 没给问句时才退回模板。
+    """
+    cand = ctx.unused([b for b in ctx.boxes
+                       if (ctx.vlm.get(b.index) or {}).get("attribute")])
     if not cand:
         return None
     b = ctx.rng.choice(cand)
-    attr = ctx.vlm[b.index]["attribute"]
-    return _main_line(ctx, b, prompts.render(
-        "ground_attribute", attribute=attr, mw=ctx.mw(b.label), label=b.label),
-        {"attribute": attr})
+    info = ctx.vlm[b.index]
+    attr = info["attribute"]
+
+    questions = info.get("questions") or []
+    if questions:
+        question = ctx.rng.choice(questions)
+        source = "vlm"
+    else:
+        question = prompts.render("ground_attribute", attribute=attr,
+                                  mw=ctx.mw(b.label), label=b.label)
+        source = "template"
+    return _main_line(ctx, b, question,
+                      {"attribute": attr, "question_source": source})
 
 
 # --------------------------------------------------------------- 其余七种
@@ -161,7 +184,7 @@ def detect_class(ctx: Ctx):
 
 def attribute_qa(ctx: Ctx):
     """图中 [框] 这个目标是什么颜色？—— Osprey-724K 里属性是最大一类（29%）。"""
-    cand = [b for b in ctx.boxes if (ctx.vlm.get(b.index) or {}).get("color")]
+    cand = ctx.unused([b for b in ctx.boxes if (ctx.vlm.get(b.index) or {}).get("color")])
     if not cand:
         return None
     b = ctx.rng.choice(cand)
@@ -257,9 +280,10 @@ def region_identify(ctx: Ctx):
 
     没有文字指代，因此不存在任何「把答案写进问题」的可能。
     """
-    if not ctx.boxes:
+    cand = ctx.unused(ctx.boxes)
+    if not cand:
         return None
-    b = ctx.rng.choice(ctx.boxes)
+    b = ctx.rng.choice(cand)
     a = b.label if ctx.short_answer else prompts.render("region_identify_answer", label=b.label)
     return {"conversations": _turns(
                 (_ask(ctx, prompts.render("region_identify", bbox=_j(ctx.bbox2d(b)))), a)),

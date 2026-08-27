@@ -56,6 +56,8 @@ class VlmClient:
         self.max_tokens = int(v.get("max_tokens", 1024))
         self.max_retries = int(v.get("max_retries", 3))
         self.concurrency = max(1, int(v.get("concurrency", 4)))
+        # 挑对象那次调用要顺带生成多样的问句，温度低了三句会写得几乎一样。
+        self.temperature_select = float(v.get("temperature_select", 0.85))
         cache = v.get("cache_dir") or ""
         self.cache_dir = Path(cache) if cache else None
         if self.cache_dir:
@@ -143,7 +145,7 @@ class VlmClient:
             # 已请求中断，或已命中配置错误 —— 尚未启动的任务直接跳过
             if self._cancel.is_set() or self._fatal:
                 return None
-            raw = self._request_raw(image_path, prompt_text)
+            raw = self._request_raw(image_path, prompt_text, self.temperature_select)
             if raw is None:
                 return None
             key = self._key(image_path, bbox)
@@ -264,7 +266,8 @@ class VlmClient:
             return None
         return self._post(payload)
 
-    def _payload(self, image_path: Path, prompt_text: str) -> Optional[dict]:
+    def _payload(self, image_path: Path, prompt_text: str,
+                 temperature: Optional[float] = None) -> Optional[dict]:
         """构造 OpenAI 兼容的多模态请求体。图片以 base64 data URI 传入。"""
         try:
             b64 = base64.b64encode(image_path.read_bytes()).decode()
@@ -279,7 +282,7 @@ class VlmClient:
                  "image_url": {"url": f"data:image/{mime};base64,{b64}"}},
                 {"type": "text", "text": prompt_text},
             ]}],
-            "temperature": self.temperature,
+            "temperature": self.temperature if temperature is None else temperature,
             "max_tokens": self.max_tokens,
         }
 
@@ -316,9 +319,10 @@ class VlmClient:
                 time.sleep(min(2 ** attempt, 10))
         return None
 
-    def _request_raw(self, image_path: Path, prompt_text: str) -> Optional[str]:
+    def _request_raw(self, image_path: Path, prompt_text: str,
+                     temperature: Optional[float] = None) -> Optional[str]:
         """发一次请求，返回模型输出的原始文本（不解析）。"""
-        payload = self._payload(image_path, prompt_text)
+        payload = self._payload(image_path, prompt_text, temperature)
         return self._post(payload) if payload else None
 
     def _request(self, image_path: Path, prompt_text: str) -> Optional[VlmResult]:
@@ -377,10 +381,13 @@ def _parse_scene_json(text: str) -> Optional[Dict[int, Dict[str, str]]]:
             idx = int(item.get("id"))
         except (TypeError, ValueError):
             continue
+        qs = item.get("questions")
+        questions = [str(q).strip() for q in qs if str(q).strip()] if isinstance(qs, list) else []
         out[idx] = {
             "attribute": str(item.get("attribute") or "").strip(),
             "color": str(item.get("color") or "").strip(),
             "description": str(item.get("description") or "").strip(),
+            "questions": questions,
         }
     return out or None
 
