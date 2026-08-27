@@ -82,7 +82,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     max_pick = int(cfg.get_path("sampling.vlm_max_pick", 6))
     weights = cfg.get_path("tasks", {}) or {}
     measure_words = _load_measure_words(cfg)
-    n_phrases = phrase_bank.install(cfg)
+    bank_stats = phrase_bank.install(cfg)
     require_desc = bool(cfg.get_path("main_line_requires_description", True))
     min_desc_len = int(cfg.get_path("min_description_len", 18))
     all_labels = sorted(table.id2name.values())
@@ -220,7 +220,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         "task_unavailable": {k: v for k, v in failed.items() if v},
         "invalid_dropped": invalid,
         "vlm_calls": dict(vlm.stats),
-        "phrase_bank_loaded": n_phrases,
+        "phrase_bank": bank_stats,
         # 问句去重率：不同问法 / 问句总数。这个数掉下来就说明问法在复读，
         # 模型会把问句当固定口令背下来而不是听懂要框什么。
         "question_variety": _question_variety(samples),

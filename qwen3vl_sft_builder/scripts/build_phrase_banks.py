@@ -38,11 +38,20 @@ def _placeholder_rule(required) -> str:
             f"  它们在真正使用时会被替换成具体的词，你只管把它们摆在通顺的位置上。\n")
 
 
+def _forbid_rule(forbidden) -> str:
+    if not forbidden:
+        return ""
+    return ("- 这几个词一个都不能出现："
+            + "、".join(forbidden)
+            + "。\n  它们属于别的问法池，混进来会让这一轮问非所答。\n")
+
+
 def expand(client: VlmClient, name: str, target: int, batch: int,
            max_len: int, temperature: float, verbose: bool) -> list[str]:
     """扩充一个池子，返回新增的说法（不含 .txt 里手写的）。"""
     seeds = list(prompts.load_variants(name))
     required = prompts.placeholders_of(name)
+    forbidden = prompts.forbidden_of(name)
     purpose = prompts.comment_of(name) or f"图片问答对话里的一句话（{name}）"
     seen = list(seeds)
     fresh: list[str] = []
@@ -58,6 +67,7 @@ def expand(client: VlmClient, name: str, target: int, batch: int,
             seeds="\n".join(seen[-30:]),      # 只给最近的，太长模型会开始抄前面
             n=want + 5,                       # 多要几条，抵掉被丢掉的
             placeholder_rule=_placeholder_rule(required),
+            forbid_rule=_forbid_rule(forbidden),
         )
         raw = client._post({
             "model": client.model,
@@ -71,7 +81,7 @@ def expand(client: VlmClient, name: str, target: int, batch: int,
         got = 0
         for line in raw.splitlines():
             line = phrase_bank.sanitize(line)
-            if phrase_bank.accept(name, line, required, max_len, seen):
+            if phrase_bank.accept(name, line, required, max_len, seen, forbidden):
                 seen.append(line)
                 fresh.append(line)
                 got += 1

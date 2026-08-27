@@ -10,6 +10,7 @@ prompts/ 下每个「多问法」文件手写只有五六条。十万条样本�
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
@@ -17,6 +18,8 @@ from typing import Dict, Iterable, List, Sequence
 import yaml
 
 import prompts
+
+logger = logging.getLogger(__name__)
 
 # 生成的句子里允许出现的前缀垃圾：序号、项目符号、引号
 _JUNK = re.compile(r'^\s*(?:[-*·•]|\d+[.、)）]|\(\d+\)|["“”\'‘’])+\s*')
@@ -36,14 +39,26 @@ def visible_len(line: str) -> int:
 
 
 def accept(name: str, line: str, required: Sequence[str], max_len: int,
-           seen: Iterable[str]) -> bool:
+           seen: Iterable[str], forbidden: Sequence[str] = (),
+           optional_refer: bool = False) -> bool:
     """一条生成结果是否收得下。不合格的直接丢，不做修补 ——
-    问法池是要进十万条训练数据的，宁可少几条也不能混进坏句子。"""
+    问法池是要进十万条训练数据的，宁可少几条也不能混进坏句子。
+
+    optional_refer：这一轮的指代能由上文承接（「它周围是什么情况？」紧跟在
+    刚给出框的那一轮后面，不带类别名也说得通），此时允许整句不带占位符。
+    但**不允许只带一半** —— 只剩「这{mw}」或量词对不上的「这三轮车」，
+    比干脆不提还糟。
+    """
     if not line or line.startswith("#"):
+        return False
+    if any(w in line for w in forbidden):
+        # 语义跑偏：往「描述」池里塞了「在哪」。结构上完全合法，只能靠禁用词拦。
         return False
     if visible_len(line) > max_len:
         return False
-    if set(_PLACEHOLDER.findall(line)) != set(required):
+    found = set(_PLACEHOLDER.findall(line))
+    ok = {frozenset(required)} | ({frozenset()} if optional_refer else set())
+    if frozenset(found) not in ok:
         # 占位符对不上：少了会让问句失去指向（「那辆在哪？」），
         # 多了会在 .format() 时抛 KeyError 把整批构建打断。
         return False
@@ -88,8 +103,41 @@ def dump(banks: Dict[str, List[str]]) -> str:
     return header + body
 
 
-def install(cfg) -> int:
-    """按 config 把问法库装进 prompts。返回装载的说法总条数。"""
+def install(cfg) -> Dict[str, int]:
+    """按 config 把问法库装进 prompts，装之前重新校验一遍。
+
+    这个文件是给人手改的（生成完要扫一眼删掉别扭的句子），也可能是旧版本
+    留下的 —— 手一抖删掉半个占位符，构建时 .format() 直接抛异常打断整批；
+    往「描述」池里粘一句「在哪」，则会静默产出问非所答的样本。
+    所以入库前按当前 .txt 的占位符与禁用词再过一遍，不合格的丢掉并报出来。
+    """
     banks = load(cfg.get_path("phrase_banks.path", ""))
-    prompts.use_bank(banks)
-    return sum(len(v) for v in banks.values())
+    max_len = int(cfg.get_path("phrase_banks.max_len", 30))
+    kept: Dict[str, List[str]] = {}
+    dropped: Dict[str, int] = {}
+    for name, phrases in banks.items():
+        try:
+            required = prompts.placeholders_of(name)
+            forbidden = prompts.forbidden_of(name)
+            optional = prompts.has_flag(name, "optional-refer")
+        except FileNotFoundError:
+            # 池子对应的 .txt 已经删了（任务下线），整组跳过
+            dropped[name] = len(phrases)
+            continue
+        good: List[str] = []
+        for line in phrases:
+            line = sanitize(line)
+            if accept(name, line, required, max_len, good, forbidden, optional):
+                good.append(line)
+        if good:
+            kept[name] = good
+        if len(good) < len(phrases):
+            dropped[name] = len(phrases) - len(good)
+    prompts.use_bank(kept)
+    if dropped:
+        logger.warning("问法库有 %d 条不合格已丢弃：%s。"
+                       "多半是手改时动坏了占位符，或句子跑到别的池子的意思上去了。",
+                       sum(dropped.values()),
+                       "、".join(f"{k} {v} 条" for k, v in sorted(dropped.items())))
+    return {"loaded": sum(len(v) for v in kept.values()),
+            "dropped": sum(dropped.values())}

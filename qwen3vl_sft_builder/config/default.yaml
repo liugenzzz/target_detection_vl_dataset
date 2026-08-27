@@ -48,7 +48,8 @@ phrase_banks:
     - inv_ask_what
     - inv_answer_what
     - inv_ask_box
-    - inv_ask_desc
+    - ask_describe
+    - ground_unique
     - detect_class
 
 # ---------------------------------------------------------------------------

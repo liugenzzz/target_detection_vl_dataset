@@ -4,9 +4,9 @@
 出不了这个任务（条件不满足）。注册在 TASKS 里，配比由 config 的 tasks 段控制，
 把某个任务的权重设为 0 即可关闭它。
 
-主线是 ground_unique / ground_spatial / ground_attribute 三个，合计 45%，
+主线是 ground_unique / inventory_locate / ground_attribute 三个，合计 54%，
 即「指代物体 -> 框 -> 描述语句」。拆成三个是为了能分别筛选、分别核算成本 ——
-前两个纯模板零成本，第三个要调 VLM 拿属性。
+前两个的问句走模板池，第三个的问句由 VLM 按图生成。三个都要 VLM 出描述。
 
 任务体系参考了几个公开数据集的实际拆分：
   RefCOCO/+/g   指代理解（REC），指代带类别名是正确的，答案是框不是类别
@@ -83,12 +83,16 @@ def _turns(*pairs) -> List[Dict[str, str]]:
 
 # 答案是 bbox JSON 的任务。「用一个词回答」对它们没有意义 ——
 # 实测会生成出「定位图中银灰色的那辆遮阳三轮车。用一个词回答。」而答案是一段 JSON。
-_BOX_ANSWER_TASKS = {"ground_unique", "ground_spatial", "ground_attribute", "detect_class"}
 
 
-def _ask(ctx: Ctx, text: str, task: str = "") -> str:
-    """需要短答案时，在问题后追加格式要求。只对文本答案的任务生效。"""
-    if ctx.short_answer and task not in _BOX_ANSWER_TASKS:
+def _ask(ctx: Ctx, text: str, box_answer: bool = False) -> str:
+    """需要短答案时，在问题后追加格式要求。
+
+    box_answer=True 的问句答案是一串 JSON 坐标，给它接一句「用一个词回答」
+    自相矛盾 —— 曾经真的产出过「定位图中银灰色的那辆三轮车。用一个词回答。」
+    配一个 bbox_2d 的样本。
+    """
+    if ctx.short_answer and not box_answer:
         return f"{text}{prompts.load('short_answer_suffix')}"
     return text
 
@@ -119,7 +123,8 @@ def ground_unique(ctx: Ctx):
     if not singles:
         return None
     b = ctx.rng.choice(singles)
-    return _main_line(ctx, b, prompts.render("ground_unique", label=b.label))
+    return _main_line(ctx, b, prompts.render_choice("ground_unique", ctx.rng,
+                                                    label=b.label))
 
 
 def _main_line(ctx: Ctx, b, question: str, extra=None):
@@ -131,9 +136,10 @@ def _main_line(ctx: Ctx, b, question: str, extra=None):
     desc = _describe(ctx, b)
     if ctx.require_desc and not desc:
         return None
-    pairs = [(_ask(ctx, question, "ground_unique"), _j(_box_of(ctx, b)))]
+    pairs = [(_ask(ctx, question, box_answer=True), _j(_box_of(ctx, b)))]
     if desc:
-        pairs.append((prompts.load("describe_target"), desc))
+        pairs.append((prompts.render_choice("ask_describe", ctx.rng,
+                                            mw=ctx.mw(b.label), label=b.label), desc))
     out = {"conversations": _turns(*pairs), "focus": [b.index], "label": b.label}
     if extra:
         out.update(extra)
@@ -186,7 +192,7 @@ def inventory_locate(ctx: Ctx):
          _j(_box_of(ctx, box))),
     ]
     if desc:
-        pairs.append((prompts.render_choice("inv_ask_desc", ctx.rng,
+        pairs.append((prompts.render_choice("ask_describe", ctx.rng,
                                             mw=ctx.mw(label), label=label), desc))
     return {"conversations": _turns(*pairs), "focus": [box.index], "label": label,
             "inventory": [f"{l}x{n}" for l, n in inventory]}
@@ -237,7 +243,7 @@ def detect_class(ctx: Ctx):
     boxes = _same_label(ctx, label)
     return {"conversations": _turns(
                 (_ask(ctx, prompts.render_choice("detect_class", ctx.rng, label=label),
-                      "detect_class"),
+                      box_answer=True),
                  _j([_box_of(ctx, b) for b in boxes]))),
             "focus": [b.index for b in boxes], "label": label, "n_boxes": len(boxes)}
 

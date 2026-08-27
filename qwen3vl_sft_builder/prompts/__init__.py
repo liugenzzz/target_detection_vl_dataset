@@ -59,6 +59,28 @@ def comment_of(name: str) -> str:
     return " ".join(out)
 
 
+def forbidden_of(name: str) -> Tuple[str, ...]:
+    """取一个问法池的禁用词，写在文件里形如：
+
+        #! forbid: 在哪 位置 坐标 框
+
+    占位符校验只管结构，管不了语义 —— 「描述一下这辆车」和「这辆车在哪」
+    占位符完全一样，混进去主线第二轮就问非所答，且构建报告里看不出来。
+    禁用词是这道语义闸，既用来过滤生成结果，也会写进生成提示词里先说清楚。
+    """
+    words: list = []
+    for ln in load(name).splitlines():
+        ln = ln.strip()
+        if ln.startswith("#!") and "forbid:" in ln:
+            words += ln.split("forbid:", 1)[1].split()
+    return tuple(dict.fromkeys(words))
+
+
+def has_flag(name: str, flag: str) -> bool:
+    """问法池文件里是否有 `#! <flag>` 这一行。"""
+    return any(ln.strip() == f"#! {flag}" for ln in load(name).splitlines())
+
+
 def placeholders_of(name: str) -> Tuple[str, ...]:
     """一个问法池用到的占位符集合，例如 inv_ask_box 是 (label, mw)。"""
     found = set()

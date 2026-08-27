@@ -535,6 +535,70 @@ def test_bank_roundtrip():
 
 
 
+
+def test_bank_forbid_words_block_semantic_drift():
+    # 占位符完全合法，但意思跑到「问位置」上去了 —— 只能靠禁用词拦
+    req, forbid = ["label", "mw"], ["在哪", "坐标"]
+    assert not phrase_bank.accept("x", "那{mw}{label}在哪？", req, 30, [], forbid)
+    assert not phrase_bank.accept("x", "那{mw}{label}的坐标是多少？", req, 30, [], forbid)
+    assert phrase_bank.accept("x", "具体说说这{mw}{label}。", req, 30, [], forbid)
+
+
+def test_every_pool_passes_its_own_rules():
+    """每个问法池手写的那几条，必须过得了它自己的占位符与禁用词校验。
+    否则规则和种子互相打架，生成时会把模型往一个空集合里赶。"""
+    import prompts, yaml
+    cfg = yaml.safe_load((Path(__file__).resolve().parents[1]
+                          / "config" / "default.yaml").read_text(encoding="utf-8"))
+    pools = cfg["phrase_banks"]["pools"]
+    assert pools, "config 里一个问法池都没登记"
+    for name in pools:
+        required = prompts.placeholders_of(name)
+        forbidden = prompts.forbidden_of(name)
+        optional = prompts.has_flag(name, "optional-refer")
+        seeds = prompts.load_variants(name)
+        assert forbidden, f"{name} 没写 #! forbid，语义闸是空的"
+        for v in seeds:
+            assert phrase_bank.accept(name, v, required, 30, [], forbidden, optional), \
+                f"{name} 自己的种子 {v!r} 过不了自己的规则"
+
+
+
+
+def test_bank_optional_refer_is_all_or_nothing():
+    req = ["label", "mw"]
+    # 承接上文，整句不带占位符 —— 允许
+    assert phrase_bank.accept("x", "它周围是什么情况？", req, 30, [], (), True)
+    # 只带一半：剩下「这{mw}」或量词丢了的「这三轮车」，比不提还糟
+    assert not phrase_bank.accept("x", "说说这{mw}。", req, 30, [], (), True)
+    assert not phrase_bank.accept("x", "说说这{label}。", req, 30, [], (), True)
+    # 没声明 optional-refer 的池子，一个都不能少
+    assert not phrase_bank.accept("x", "它在哪？", req, 30, [], (), False)
+
+
+def test_bank_install_drops_bad_lines(tmp_path=None):
+    """问法库是给人手改的，改坏了不能带着跑 —— install 会再校验一遍。"""
+    import tempfile, os, prompts
+    from config import Config
+    banks = {"ask_describe": [
+        "具体说说这{mw}{label}。",          # 好
+        "那{mw}{label}在哪？",              # 禁用词：跑到「问位置」上去了
+        "描述一下这{label}。",              # 占位符掉了一半
+        "具体说说这{mw}{label}。",          # 重复
+    ]}
+    fd, path = tempfile.mkstemp(suffix=".yaml"); os.close(fd)
+    try:
+        Path(path).write_text(phrase_bank.dump(banks), encoding="utf-8")
+        cfg = Config({"phrase_banks": {"path": path, "max_len": 30}})
+        stats = phrase_bank.install(cfg)
+        assert stats == {"loaded": 1, "dropped": 3}, stats
+        assert "具体说说这{mw}{label}。" in prompts.variants("ask_describe")
+        assert "那{mw}{label}在哪？" not in prompts.variants("ask_describe")
+    finally:
+        os.unlink(path); prompts.use_bank({})
+
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):
