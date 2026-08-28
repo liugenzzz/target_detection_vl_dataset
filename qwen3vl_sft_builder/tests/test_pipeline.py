@@ -801,6 +801,56 @@ def test_consistency_catches_contradictions():
 
 
 
+
+# --------------------------------------------------------------- 模型池
+
+def test_endpoint_pool_parsing_and_compat():
+    from config import Config
+    from core.vlm_client import VlmClient
+    # 老写法：平铺的 api_url/model，等价于只有一路
+    one = VlmClient(Config({"vlm": {"api_url": "http://a/v1/c", "model": "m1",
+                                    "concurrency": 4}}))
+    assert len(one.endpoints) == 1 and one.concurrency == 4
+    # 池子：总并发是各路之和，api_key 不写就继承外层
+    pool = VlmClient(Config({"vlm": {"api_key": "k", "endpoints": [
+        {"api_url": "http://a/v1/c", "model": "m1", "concurrency": 8},
+        {"api_url": "http://b/v1/c", "model": "m2", "concurrency": 4, "name": "备用"}]}}))
+    assert pool.concurrency == 12
+    assert [e.model for e in pool.endpoints] == ["m1", "m2"]
+    assert all(e.api_key == "k" for e in pool.endpoints)
+    assert pool.endpoints[1].name == "备用"
+
+
+def test_endpoint_pool_round_robin_skips_dead():
+    """一路配错（401）只摘除那一路，其余照跑 —— 否则一路配错停掉整批。"""
+    from config import Config
+    from core.vlm_client import VlmClient
+    pool = VlmClient(Config({"vlm": {"endpoints": [
+        {"api_url": "http://a/v1/c", "model": "m1", "name": "a"},
+        {"api_url": "http://b/v1/c", "model": "m2", "name": "b"}]}}))
+    assert {pool._pick().name for _ in range(8)} == {"a", "b"}
+    pool.endpoints[0].fatal = "HTTP 401 认证失败"
+    assert {pool._pick().name for _ in range(4)} == {"b"}
+    pool.endpoints[1].fatal = "HTTP 404 路径不对"
+    assert pool._pick() is None
+
+
+
+
+def test_endpoint_pool_weights_by_concurrency():
+    """一路写 8、一路写 3，说明前者扛得住的量是后者的两倍多。
+    均分会把慢的那路压垮、快的那路闲着。"""
+    from collections import Counter
+    from config import Config
+    from core.vlm_client import VlmClient
+    pool = VlmClient(Config({"vlm": {"endpoints": [
+        {"api_url": "http://a/v1/c", "model": "m1", "concurrency": 8, "name": "快"},
+        {"api_url": "http://b/v1/c", "model": "m2", "concurrency": 2, "name": "慢"}]}}))
+    got = Counter(pool._pick().name for _ in range(100))
+    assert got["快"] == 80 and got["慢"] == 20, got
+
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

@@ -38,6 +38,44 @@ class FatalVlmError(RuntimeError):
 
 
 @dataclass
+class Endpoint:
+    """模型池里的一路。多路的意义有两个：吞吐（十万条样本要跑几小时）
+    和容错（一路挂了整批不必停）。"""
+    name: str
+    api_url: str
+    api_key: str
+    model: str
+    concurrency: int
+    fatal: Optional[str] = None     # 该路的配置错误（401、模型名不对……）
+
+    @property
+    def healthy(self) -> bool:
+        return self.fatal is None
+
+
+def _endpoints_from(v: dict) -> List[Endpoint]:
+    """解析模型池配置。写了 vlm.endpoints 就用池子，没写就把平铺的
+    api_url/model 当成只有一路的池子 —— 老配置不用改。"""
+    raw = v.get("endpoints") or []
+    if not raw:
+        raw = [{"api_url": v.get("api_url", ""), "api_key": v.get("api_key", ""),
+                "model": v.get("model", ""), "concurrency": v.get("concurrency", 4)}]
+    out = []
+    for i, e in enumerate(raw):
+        if not isinstance(e, dict):
+            raise ValueError(f"vlm.endpoints[{i}] 必须是字典，实为 {type(e).__name__}")
+        out.append(Endpoint(
+            name=str(e.get("name") or f"{e.get('model') or '?'}@{e.get('api_url', '')[:40]}"),
+            api_url=str(e.get("api_url") or v.get("api_url", "")),
+            api_key=str(e.get("api_key") if e.get("api_key") is not None
+                        else v.get("api_key", "")),
+            model=str(e.get("model") or v.get("model", "")),
+            concurrency=max(1, int(e.get("concurrency", v.get("concurrency", 4)))),
+        ))
+    return out
+
+
+@dataclass
 class VlmResult:
     referring: str
     description: str
@@ -55,7 +93,13 @@ class VlmClient:
         self.temperature = float(v.get("temperature", 0.35))
         self.max_tokens = int(v.get("max_tokens", 1024))
         self.max_retries = int(v.get("max_retries", 3))
-        self.concurrency = max(1, int(v.get("concurrency", 4)))
+        # 模型池。总并发是各路之和 —— 每一路自己的 concurrency 是它扛得住的量，
+        # 加起来才是这台机器能同时压出去的请求数。
+        self.endpoints = _endpoints_from(v)
+        self.concurrency = sum(e.concurrency for e in self.endpoints)
+        self._rr = 0                      # 轮转游标，_lock 保护
+        # 加权轮转表：concurrency=8 的那路在表里出现 8 次
+        self._rotation = [e for e in self.endpoints for _ in range(e.concurrency)]
         # 挑对象那次调用要顺带生成多样的问句，温度低了三句会写得几乎一样。
         self.temperature_select = float(v.get("temperature_select", 0.85))
         # 改写要保真不要发挥，用低温
@@ -65,6 +109,7 @@ class VlmClient:
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.stats = {"vlm": 0, "cache": 0, "template": 0, "failed": 0, "prefetched": 0}
+        self.by_endpoint = {e.name: 0 for e in self.endpoints}
         self._lock = threading.Lock()      # 保护 stats；缓存写入靠原子 rename
         # prefetch 跑完后置位。此后 describe() 遇到缓存未命中不再重新发请求 ——
         # 组装阶段是串行的，那里发请求会带着重试和超时把整批任务拖垮
@@ -288,35 +333,68 @@ class VlmClient:
             "max_tokens": self.max_tokens,
         }
 
+    def _pick(self) -> Optional[Endpoint]:
+        """轮转取一路健康的端点。全都挂了返回 None。
+
+        按各路的 concurrency 加权 —— 一路写 8、一路写 3，说明前者扛得住的量
+        是后者的两倍多。均分会把慢的那路压垮，快的那路闲着。
+        """
+        with self._lock:
+            healthy = [e for e in self._rotation if e.healthy]
+            if not healthy:
+                return None
+            ep = healthy[self._rr % len(healthy)]
+            self._rr += 1
+            return ep
+
     def _post(self, payload: dict) -> Optional[str]:
-        """发请求并返回模型输出的原始文本。配置类错误记入 _fatal 并立即放弃重试。"""
+        """发请求并返回模型输出的原始文本。
+
+        每次重试换一路端点：多路的时候，一路 401、一路超时，轮着试还能跑完；
+        单路的时候行为和以前一样。配置类错误只标记【那一路】，全部端点都挂了
+        才记入 _fatal 中止整批 —— 否则一路配错就把好的几路也一起停了。
+        """
         try:
             import requests
         except ImportError:
             logger.error("未安装 requests，无法调用 VLM 服务")
             return None
 
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
         for attempt in range(1, self.max_retries + 1):
+            ep = self._pick()
+            if ep is None:
+                with self._lock:
+                    if self._fatal is None:
+                        self._fatal = ("模型池里所有端点都不可用：\n    "
+                                       + "\n    ".join(f"{e.name} -> {e.fatal}"
+                                                       for e in self.endpoints))
+                return None
+
+            headers = {"Content-Type": "application/json"}
+            if ep.api_key:
+                headers["Authorization"] = f"Bearer {ep.api_key}"
+            body = dict(payload, model=ep.model)     # 模型名由这一路决定
+
             try:
-                resp = requests.post(self.api_url, json=payload,
+                resp = requests.post(ep.api_url, json=body,
                                      headers=headers, timeout=self.timeout)
                 if resp.status_code == 200:
+                    with self._lock:
+                        self.by_endpoint[ep.name] = self.by_endpoint.get(ep.name, 0) + 1
                     return resp.json()["choices"][0]["message"]["content"]
                 # 4xx 里除了 429（限流）都是配置问题，重试没有意义 ——
                 # 请求本身就不对，再发一百次还是同样的错。
                 hint = _diagnose(resp.status_code, resp.text)
                 if hint:
                     with self._lock:
-                        if self._fatal is None:
-                            self._fatal = hint
-                    return None
-                logger.warning("VLM 返回 HTTP %s（第 %s 次）", resp.status_code, attempt)
+                        if ep.fatal is None:
+                            ep.fatal = hint
+                            logger.error("模型池中 %s 已摘除：%s", ep.name, hint)
+                    continue                          # 换下一路再试
+                logger.warning("%s 返回 HTTP %s（第 %s 次）",
+                               ep.name, resp.status_code, attempt)
             except Exception as exc:                     # noqa: BLE001
-                logger.warning("调用 VLM 失败（第 %s 次）：%s", attempt, exc)
+                logger.warning("调用 %s 失败（第 %s 次）：%s", ep.name, attempt, exc)
             if attempt < self.max_retries:
                 time.sleep(min(2 ** attempt, 10))
         return None

@@ -28,6 +28,18 @@ vlm:
   temperature_rewrite: 0.3
   max_tokens: 1024
   concurrency: 4                      # 并发请求数，先小后大，看服务承载
+  # 模型池。上面的 api_url/model/concurrency 是「只有一路」的写法，够用就别动。
+  # 要用多台机器或多个模型分担时，在这里列出来 —— 总并发是各路 concurrency
+  # 之和，请求轮转分发，某一路 401 或模型名不对只摘除那一路，其余照跑。
+  # 各路的 api_key 不写就继承上面的。缓存键不含模型名，所以池子里应该放
+  # 【可互换】的模型；换成能力明显不同的模型，请顺手换个 cache_dir。
+  #
+  # endpoints:
+  #   - {name: "主力", api_url: "http://192.168.78.36:3012/v1/chat/completions",
+  #      model: "Qwen3.6-27B", concurrency: 8}
+  #   - {name: "备用", api_url: "http://192.168.78.37:3012/v1/chat/completions",
+  #      model: "Qwen2.5-VL-72B", concurrency: 4}
+  endpoints: []
   max_retries: 3
   cache_dir: "./output/vlm_cache"     # 按图落盘，支持断点续跑
 

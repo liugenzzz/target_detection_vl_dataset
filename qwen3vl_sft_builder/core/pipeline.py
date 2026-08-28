@@ -233,6 +233,11 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         "task_unavailable": {k: v for k, v in failed.items() if v},
         "invalid_dropped": invalid,
         "vlm_calls": dict(vlm.stats),
+        "vlm_endpoints": {e.name: {"model": e.model,
+                                   "concurrency": e.concurrency,
+                                   "calls": vlm.by_endpoint.get(e.name, 0),
+                                   "fatal": e.fatal}
+                          for e in vlm.endpoints},
         "phrase_bank": bank_stats,
         # 问句去重率：不同问法 / 问句总数。这个数掉下来就说明问法在复读，
         # 模型会把问句当固定口令背下来而不是听懂要框什么。

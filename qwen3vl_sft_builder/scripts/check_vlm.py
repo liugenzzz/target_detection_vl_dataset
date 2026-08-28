@@ -23,7 +23,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import prompts                                   # noqa: E402
-from config import load_config                   # noqa: E402
+from config import load_config
+from core.vlm_client import _endpoints_from                   # noqa: E402
 from core.vlm_client import FatalVlmError, _parse_vlm_json      # noqa: E402
 from core.yolo import IMAGE_EXTS                 # noqa: E402
 
@@ -52,10 +53,30 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    url = cfg.get_path("vlm.api_url", "")
-    key = cfg.get_path("vlm.api_key", "")
-    model = cfg.get_path("vlm.model", "")
     timeout = int(cfg.get_path("vlm.timeout", 300))
+    endpoints = _endpoints_from(cfg.get_path("vlm", {}) or {})
+
+    # 模型池里有几路就逐路自检 —— 只测第一路的话，第二路配错要等到跑全量
+    # 才会暴露，那时已经烧掉几小时。
+    if len(endpoints) > 1:
+        print(f"模型池共 {len(endpoints)} 路，逐路自检：")
+        for ep in endpoints:
+            print(f"  {ep.name}  model={ep.model}  concurrency={ep.concurrency}")
+        print("=" * 66)
+    failed = []
+    for ep in endpoints:
+        if len(endpoints) > 1:
+            print(f"\n{'=' * 66}\n检查 {ep.name}\n{'=' * 66}")
+        if _check_one(ep, timeout, cfg, args) != 0:
+            failed.append(ep.name)
+    if failed:
+        print(f"\n{BAD} 模型池里这几路没通过：{'、'.join(failed)}")
+        return 1
+    return 0
+
+
+def _check_one(ep, timeout, cfg, args) -> int:
+    url, key, model = ep.api_url, ep.api_key, ep.model
 
     print(f"服务地址 : {url}")
     print(f"模型名   : {model}")
