@@ -223,6 +223,23 @@ def ground_unique(ctx: Ctx):
                                                     label=b.label))
 
 
+def _box_question_ok(ctx: Ctx, q: str) -> bool:
+    """VLM 现场写的定位问句合不合格。
+
+    过的是 ground_attribute 问法池自己那套规则 —— 手写种子过得了的，
+    模型写的也得过。之前这里只查了语体，漏了「必须明说要框」那一条，
+    于是模型写的「白色面包车在图中的什么位置？」一路进了数据，
+    而它的答案是一串坐标。实测真模型问这句时答的是一段方位描述，
+    不是框 —— 同一个问句两种答案，正是我们要避免的。
+    """
+    if not register.is_instruction(q, ctx.forbid_chat):
+        return False
+    if any(w in q for w in prompts.forbidden_of("ground_attribute")):
+        return False
+    req = prompts.required_any_of("ground_attribute")
+    return not req or any(w in q for w in req)
+
+
 def _describe_question(ctx: Ctx, b) -> str:
     """第三轮「描述这个目标」的问句。
 
@@ -345,9 +362,9 @@ def ground_attribute(ctx: Ctx):
     attr = _clean_attr(info["attribute"])
 
     questions = [q.replace("的的", "的") for q in (info.get("questions") or []) if q]
-    # VLM 现场生成的问句同样要过语体闸。提示词里已经要求指令式并给了反面例子，
+    # VLM 现场生成的问句要过和问法池【同一套】闸。提示词里已经要求了，
     # 但那是「请它别这么写」，不是保证 —— 三句里飘一句就够脏一批数据。
-    questions = [q for q in questions if register.is_instruction(q, ctx.forbid_chat)]
+    questions = [q for q in questions if _box_question_ok(ctx, q)]
     if questions:
         question = ctx.rng.choice(questions)
         source = "vlm"
