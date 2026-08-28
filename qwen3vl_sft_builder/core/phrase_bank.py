@@ -19,6 +19,8 @@ import yaml
 
 import prompts
 
+from . import register
+
 logger = logging.getLogger(__name__)
 
 # 生成的句子里允许出现的前缀垃圾：序号、项目符号、引号
@@ -59,9 +61,9 @@ def accept(name: str, line: str, required: Sequence[str], max_len: int,
     """
     if not line or line.startswith("#"):
         return False
-    if not _TERMINATED.search(line):
-        return False
-    if any(w in line for w in _META):
+    if register.problems(line):
+        # 句法闸：句末缺标点、或者是模型的元话语（「以下是几种写法：」）。
+        # 剥掉序号后这些结构上完全合法，只能靠这道闸拦。
         return False
     if require_any and not any(w in line for w in require_any):
         # 语义漏了：detect_class 问的是穷举，少了「所有」就和 ground_unique 撞车

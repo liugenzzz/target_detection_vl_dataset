@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import prompts
 
+from . import register
 from .referring import is_vacuous_description
 
 # 属性问答目前只问颜色。VLM 返回的 attribute 是「用于指认的最显眼特征」，
@@ -57,6 +58,9 @@ class Ctx:
     # 原图有 4 辆三轮车、3 辆因太小被过滤，仍去问「定位图中的三轮车」并只给 1 个框，
     # 就是在教模型漏检。实测这种情况占 ground_unique 可选组合的 45.2%。
     raw_counts: Dict[str, int] = field(default_factory=dict)
+    # 语体禁用词（config 的 phrase_banks.forbid_global）。ground_attribute 的问句
+    # 是 VLM 按图现场生成的，不走问法库，那道闸管不到它 —— 这里现场过一遍。
+    forbid_chat: tuple = ()
     # 本张图已经被出过样本的框。同一个目标出多条样本时，答案 bbox 完全相同，
     # 只是问法不同，属于近重复数据 —— 实测同一个框曾在一张图里被出了 4 次。
     used: set = field(default_factory=set)
@@ -233,6 +237,9 @@ def ground_attribute(ctx: Ctx):
     attr = _clean_attr(info["attribute"])
 
     questions = [q.replace("的的", "的") for q in (info.get("questions") or []) if q]
+    # VLM 现场生成的问句同样要过语体闸。提示词里已经要求指令式并给了反面例子，
+    # 但那是「请它别这么写」，不是保证 —— 三句里飘一句就够脏一批数据。
+    questions = [q for q in questions if register.is_instruction(q, ctx.forbid_chat)]
     if questions:
         question = ctx.rng.choice(questions)
         source = "vlm"

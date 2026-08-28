@@ -36,7 +36,7 @@ def _load_measure_words(cfg) -> Dict[str, str]:
         return {}
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return {str(k): str(v) for k, v in (data.get("measure_words") or {}).items()}
-from . import phrase_bank
+from . import consistency, phrase_bank
 from .vlm_client import VlmClient
 from .yolo import iter_annotations
 
@@ -83,6 +83,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     weights = cfg.get_path("tasks", {}) or {}
     measure_words = _load_measure_words(cfg)
     bank_stats = phrase_bank.install(cfg)
+    forbid_chat = tuple(cfg.get_path("phrase_banks.forbid_global", []) or [])
     require_desc = bool(cfg.get_path("main_line_requires_description", True))
     min_desc_len = int(cfg.get_path("min_description_len", 18))
     all_labels = sorted(table.id2name.values())
@@ -156,7 +157,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                           rng=rng, short_answer=rng.random() < short_ratio,
                           measure_words=measure_words, require_desc=require_desc,
                           used=used, min_desc_len=min_desc_len,
-                          raw_counts=sc["raw_counts"])
+                          raw_counts=sc["raw_counts"], forbid_chat=forbid_chat)
                 try:
                     out = TASKS[name](ctx)
                 except Exception as exc:                   # noqa: BLE001
@@ -195,7 +196,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                                 "inventory")},
                 },
             }
-            issues = validate_sample(sample)
+            issues = validate_sample(sample, forbid_chat)
             if issues:
                 invalid += 1
                 logger.warning("样本 %s 校验失败：%s", sample["id"], issues)
@@ -210,6 +211,15 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     _write_jsonl(output_dir / "val.jsonl", val)
 
     total = sum(made.values()) or 1
+    # 跨任务一致性核对：同一张图，八个任务说出来的目标数量必须对得上
+    kept_labels = {str(sc["ann"].image_path): dict(Counter(b.label for b in sc["kept"]))
+                   for sc in scenes}
+    consist = consistency.check(samples, kept_labels)
+    if consist["violations"]:
+        logger.error("跨任务一致性核对发现 %d 处冲突，同一张图配了两套真值，"
+                     "详见 build_report.json 的 consistency 段：\n  %s",
+                     len(consist["violations"]), "\n  ".join(consist["violations"][:5]))
+
     stats = {
         "images_scanned": n_images,
         "boxes_total": n_boxes,
@@ -227,6 +237,9 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         # 问句去重率：不同问法 / 问句总数。这个数掉下来就说明问法在复读，
         # 模型会把问句当固定口令背下来而不是听懂要框什么。
         "question_variety": _question_variety(samples),
+        "consistency": {"checked_images": consist["checked_images"],
+                        "violations": len(consist["violations"]),
+                        "detail": consist["violations"][:50]},
         "split": _split_stats(train, val),
         "classes_total": table.count,
     }

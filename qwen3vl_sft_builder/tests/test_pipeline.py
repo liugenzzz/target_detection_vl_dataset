@@ -2,6 +2,7 @@
 
     python -m pytest tests/ -q     或     python tests/test_pipeline.py
 """
+import re
 import sys
 from pathlib import Path
 
@@ -689,6 +690,114 @@ def test_exist_answer_does_not_undercount():
             break
     else:
         raise AssertionError("30 次都没抽到 positive，随机性有问题")
+
+
+
+
+# --------------------------------------------------------------- 语体（指令 vs 聊天）
+
+def test_register_flags_chat_tone():
+    from core import register
+    forbid = ["诶", "帮我", "呗", "哪儿"]
+    assert register.is_instruction("框出图中的卡车。", forbid)
+    assert register.is_instruction("卡车在图中的什么位置？", forbid)
+    assert not register.is_instruction("诶那辆卡车在哪儿？", forbid)
+    assert not register.is_instruction("帮我把人员框出来。", forbid)
+    assert not register.is_instruction("以下是几种写法：", forbid)
+    assert not register.is_instruction("框出图中的卡车", forbid)   # 句末缺标点
+
+
+def test_every_handwritten_prompt_is_instruction():
+    """单模板任务（attribute_qa / spatial_relation / exist_* / region_identify）
+    的问句不走问法库，那道闸管不到，只能靠这项测试守住。"""
+    import prompts, yaml
+    from core import register
+    cfg = yaml.safe_load((Path(__file__).resolve().parents[1]
+                          / "config" / "default.yaml").read_text(encoding="utf-8"))
+    forbid = cfg["phrase_banks"]["forbid_global"]
+    for name in ("attribute_qa", "spatial_relation", "exist_yes", "exist_no",
+                 "region_identify", "ground_attribute"):
+        text = prompts.load(name)
+        rendered = re.sub(r"\{\w+\}", "某物", text)
+        assert register.is_instruction(rendered, forbid), \
+            f"{name}.txt 不是指令口吻：{register.problems(rendered, forbid)}"
+
+
+def test_validate_sample_rejects_chat_question():
+    """落盘前的兜底闸：前两道都可能被绕过，这一道扫的是最终产物。"""
+    sample = {"images": ["a.jpg"], "conversations": [
+        {"from": "human", "value": "<image>\n诶那辆卡车在哪儿？"},
+        {"from": "gpt", "value": "{}"}]}
+    issues = validate_sample(sample, ["诶", "哪儿"])
+    assert any("指令口吻" in i for i in issues), issues
+    # 不传禁用词时行为不变（老调用点不受影响）
+    assert not validate_sample(sample)
+
+
+def test_vlm_questions_pass_through_register_gate():
+    """ground_attribute 的问句是 VLM 按图现场生成的，不走问法库。
+    提示词里要求了指令式，但那是「请它别这么写」，不是保证。"""
+    from core.tasks import ground_attribute
+    import random
+    ctx = _ctx_with_filtered([_Box(0, "卡车")], {"卡车": 1})
+    ctx.forbid_chat = ("诶", "帮我", "哪儿")
+    ctx.vlm[0].update({"attribute": "银灰色", "color": "银灰色",
+                       "questions": ["诶那辆卡车在哪儿？", "帮我框一下卡车。"]})
+    out = ground_attribute(ctx)
+    assert out is not None
+    assert out["question_source"] == "template", "闲聊问句应被丢弃并回落模板"
+    ctx.vlm[0]["questions"] = ["输出银灰色卡车的检测框。"]
+    out = ground_attribute(ctx)
+    assert out["question_source"] == "vlm"
+    assert out["conversations"][0]["value"].endswith("输出银灰色卡车的检测框。")
+
+
+
+
+# --------------------------------------------------------- 跨任务一致性
+
+def _claim_sample(task, answers, **meta):
+    convs = []
+    for i, a in enumerate(answers):
+        convs.append({"from": "human", "value": ("<image>\n问。" if i == 0 else "问。")})
+        convs.append({"from": "gpt", "value": a})
+    return {"images": ["a.jpg"], "conversations": convs,
+            "metadata": dict(task_type=task, **meta)}
+
+
+def test_consistency_catches_contradictions():
+    """核对必须真的能抓到冲突，否则 0 violations 只是空转。"""
+    from core import consistency
+    truth = {"a.jpg": {"人员": 3}}
+
+    # 盘点说 3 名人员，detect_class 却给 2 个框
+    bad = [_claim_sample("inventory_locate", ["有3名人员。"], inventory=["人员x3"]),
+           _claim_sample("detect_class", ['[{"bbox_2d":[1,2,3,4],"label":"人员"},'
+                                    '{"bbox_2d":[5,6,7,8],"label":"人员"}]'],
+                   label="人员", n_boxes=2)]
+    out = consistency.check(bad, truth)
+    assert out["violations"], "数量说法不一致没被抓到"
+
+    # 一条说「没有直升机」，另一条却框出直升机
+    bad2 = [_claim_sample("exist_negative", ["没有，图中不存在直升机。"],
+                    label="直升机", polarity="negative"),
+            _claim_sample("ground_unique", ['{"bbox_2d":[1,2,3,4],"label":"直升机"}'])]
+    out = consistency.check(bad2, {})
+    assert any("却框出" in v for v in out["violations"]), out["violations"]
+
+    # 说的框数超过过滤后实际有的
+    bad3 = [_claim_sample("detect_class", ['[{"bbox_2d":[1,2,3,4],"label":"人员"},'
+                                     '{"bbox_2d":[5,6,7,8],"label":"人员"}]'],
+                    label="人员", n_boxes=2)]
+    assert consistency.check(bad3, {"a.jpg": {"人员": 1}})["violations"]
+
+    # 对得上的不该报
+    good = [_claim_sample("inventory_locate", ["有3名人员。"], inventory=["人员x3"]),
+            _claim_sample("detect_class", ['[{"bbox_2d":[1,2,3,4],"label":"人员"},'
+                                     '{"bbox_2d":[5,6,7,8],"label":"人员"},'
+                                     '{"bbox_2d":[9,9,9,9],"label":"人员"}]'],
+                    label="人员", n_boxes=3)]
+    assert consistency.check(good, truth)["violations"] == []
 
 
 
