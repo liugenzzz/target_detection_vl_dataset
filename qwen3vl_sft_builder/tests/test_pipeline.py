@@ -558,7 +558,7 @@ def test_every_pool_passes_its_own_rules():
     for name in pools:
         required = prompts.placeholders_of(name)
         forbidden = prompts.forbidden_of(name) + glob
-        optional = prompts.has_flag(name, "optional-refer")
+        optional = prompts.optional_group_of(name)
         req_any = prompts.required_any_of(name)
         seeds = prompts.load_variants(name)
         assert forbidden, f"{name} 没写 #! forbid，语义闸是空的"
@@ -570,15 +570,19 @@ def test_every_pool_passes_its_own_rules():
 
 
 
-def test_bank_optional_refer_is_all_or_nothing():
-    req = ["label", "mw"]
-    # 承接上文，整句不带占位符 —— 允许
-    assert phrase_bank.accept("x", "它周围是什么情况？", req, 30, [], (), True)
-    # 只带一半：剩下「这{mw}」或量词丢了的「这三轮车」，比不提还糟
-    assert not phrase_bank.accept("x", "说说这{mw}。", req, 30, [], (), True)
-    assert not phrase_bank.accept("x", "说说这{label}。", req, 30, [], (), True)
-    # 没声明 optional-refer 的池子，一个都不能少
-    assert not phrase_bank.accept("x", "它在哪？", req, 30, [], (), False)
+def test_bank_optional_group_is_all_or_nothing():
+    req, grp = ["label", "mw"], ["label", "mw"]
+    # 承接上文，整组省掉 —— 允许
+    assert phrase_bank.accept("x", "它周围是什么情况？", req, 30, [], (), grp)
+    # 只带一半：剩下「说说这{mw}。」或量词丢了的「说说这三轮车。」，比不提还糟
+    assert not phrase_bank.accept("x", "说说这{mw}。", req, 30, [], (), grp)
+    assert not phrase_bank.accept("x", "说说这{label}。", req, 30, [], (), grp)
+    # 没声明 optional-group 的池子，一个都不能少
+    assert not phrase_bank.accept("x", "它在哪？", req, 30, [], (), ())
+    # 单成员的组 = 那一个可以独立省略（答案池的 {a}：问句刚点过主体）
+    assert phrase_bank.accept("x", "在{b}的{rel}。", ["a", "b", "rel"], 30, [],
+                              (), ["a"])
+    assert not phrase_bank.accept("x", "{rel}。", ["a", "b", "rel"], 30, [], (), ["a"])
 
 
 def test_bank_install_drops_bad_lines(tmp_path=None):
@@ -610,9 +614,9 @@ def test_bank_require_any_keeps_detect_class_exhaustive():
     少了穷举词就是同一个问句配两种答案，模型只能学成随机猜给一个还是给全部。"""
     req_any = ["所有", "全部"]
     assert phrase_bank.accept("x", "框出图中所有的{label}。", ["label"], 30, [],
-                              (), False, req_any)
+                              (), (), req_any)
     assert not phrase_bank.accept("x", "框出图中的{label}。", ["label"], 30, [],
-                                  (), False, req_any)
+                                  (), (), req_any)
 
 
 
@@ -707,20 +711,22 @@ def test_register_flags_chat_tone():
     assert not register.is_instruction("框出图中的卡车", forbid)   # 句末缺标点
 
 
-def test_every_handwritten_prompt_is_instruction():
-    """单模板任务（attribute_qa / spatial_relation / exist_* / region_identify）
-    的问句不走问法库，那道闸管不到，只能靠这项测试守住。"""
-    import prompts, yaml
-    from core import register
-    cfg = yaml.safe_load((Path(__file__).resolve().parents[1]
-                          / "config" / "default.yaml").read_text(encoding="utf-8"))
-    forbid = cfg["phrase_banks"]["forbid_global"]
-    for name in ("attribute_qa", "spatial_relation", "exist_yes", "exist_no",
-                 "region_identify", "ground_attribute"):
-        text = prompts.load(name)
-        rendered = re.sub(r"\{\w+\}", "某物", text)
-        assert register.is_instruction(rendered, forbid), \
-            f"{name}.txt 不是指令口吻：{register.problems(rendered, forbid)}"
+def test_every_question_prompt_is_registered_as_a_pool():
+    """tasks.py 里每一个用作【人类问话】的提示词都必须登记进 phrase_banks.pools。
+
+    没登记的就是一句写死的话，会在十万条样本里原样重复上万遍，而且绕开了
+    语体闸和扩充问法库。这项测试防的是「新加了个任务，忘了登记问法池」。
+    """
+    import re as _re, yaml
+    root = Path(__file__).resolve().parents[1]
+    cfg = yaml.safe_load((root / "config" / "default.yaml").read_text(encoding="utf-8"))
+    pools = set(cfg["phrase_banks"]["pools"])
+    src = (root / "core" / "tasks.py").read_text(encoding="utf-8")
+    used = set(_re.findall(r'render_choice\("(\w+)"', src))
+    # 只作答案、不作问话的池子也走同一套校验，一并登记即可
+    assert used <= pools, f"这些问法池没登记进 config：{sorted(used - pools)}"
+    assert not _re.findall(r'prompts\.render\("(?!vlm_|measure|gen_|review)', src), \
+        "tasks.py 里还有写死的单模板问话，应改成 render_choice 并登记问法池"
 
 
 def test_validate_sample_rejects_chat_question():

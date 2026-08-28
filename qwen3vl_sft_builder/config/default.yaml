@@ -82,6 +82,18 @@ phrase_banks:
     - ask_describe
     - ground_unique
     - detect_class
+    - spatial_ask_lr
+    - spatial_ask_ud
+    - spatial_answer
+    - attribute_qa_color
+    - attribute_qa_feature
+    - exist_ask
+    - exist_yes_answer
+    - exist_yes_vague
+    - exist_no_answer
+    - region_identify
+    - ground_attribute
+    - region_identify_answer
 
 # ---------------------------------------------------------------------------
 # 全量质检。构建阶段的过滤全是结构性的（占位符、类别泄漏、描述长度、坐标越界），
@@ -195,19 +207,26 @@ difficulty:
 # 当前处于单任务打磨阶段：只开 ground_attribute，其余全部关闭（权重 0）。
 # 逐个任务调好后再把权重恢复，注释里是原定配比。
 tasks:
-  ground_attribute:  100    # 属性指代定位（主线）。问句由 VLM 生成，不套模板
-  ground_unique:       0    # 原 12  定位图中的卡车（该类仅一个实例）
-  inventory_locate:    0    # 原 20  盘点->定位->描述（count 已并入第一轮）
-  detect_class:        0    # 原 12  定位图中所有的人员（需该类全部框合格）
-  attribute_qa:        0    # 原  8  [框] 这个目标是什么颜色
-  spatial_relation:    0    # 原  6  卡车在人员的哪一侧（纯坐标，零成本）
-  exist_negative:      0    # 原 10  图中有没有直升机 / 拒答
-  region_identify:     0    # 原 10  [框] 这个位置的是什么（REG）
+  # 主线三个合计 70% —— 「指代物体 -> 坐标 -> 描述语句」是招标要的方向，
+  # 其余五个是围绕它做的丰富度补充，合计 30%。
+  ground_attribute:   30    # 属性指代定位（主线）。问句由 VLM 按图生成
+  inventory_locate:   25    # 盘点 -> 定位 -> 描述（主线，count 已并入第一轮）
+  ground_unique:      15    # 定位图中的卡车（主线，该类原始标注里仅一个实例）
+  detect_class:        8    # 定位图中所有的人员（需该类全部框合格）
+  region_identify:     7    # [框] 这个区域内的是什么（REG）
+  exist_negative:      7    # 图中有没有直升机 / 拒答
+  attribute_qa:        5    # [框] 这个区域内物体的颜色是什么
+  spatial_relation:    3    # 卡车在人员的哪一侧（纯坐标，零成本）
 # image_caption 已移除：描述性内容在主线第二轮已经有了，整图描述靠拼接
 # 各目标描述，读起来断裂重复，不如不要。
 
-# 答案格式维度，与任务类型正交 —— 同一个问题可以要详细答案也可以要一个词。
-# Osprey-724K 用了 14% 的「短答案」样本来增强回答格式的灵活性。
+# 配比是【产出配比】还是【槽位配比】。
+#   strict  主线欠账时优先补主线，补不上就空过这个槽位。配比准，单图产量略低。
+#   fill    优先填满槽位，主线出不来就让给非主线。产量高，配比会偏。
+# 默认 strict：数据量的瓶颈从来不在单张图能出几条，而在有多少张图。
+# 实测 VisDrone 300 图，fill 模式下主线配 70% 实得 41%，兜底任务把份额吃光了。
+tasks_ratio_mode: strict
+
 short_answer_ratio: 0.14
 
 # ---------------------------------------------------------------------------

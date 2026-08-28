@@ -76,9 +76,21 @@ def forbidden_of(name: str) -> Tuple[str, ...]:
     return tuple(dict.fromkeys(words))
 
 
-def has_flag(name: str, flag: str) -> bool:
-    """问法池文件里是否有 `#! <flag>` 这一行。"""
-    return any(ln.strip() == f"#! {flag}" for ln in load(name).splitlines())
+def optional_group_of(name: str) -> Tuple[str, ...]:
+    """取一个问法池的「可整组省略」的占位符，写在文件里形如：
+
+        #! optional-group: mw label
+
+    这组占位符要么全在、要么全不在。全不在是合法的 —— 上一轮刚点过这个目标，
+    「它周围是什么情况？」不带类别名也说得通。只带一半不行：剩下「说说这{mw}。」
+    或者量词丢了的「说说这三轮车。」，比干脆不提还糟。
+    """
+    words: list = []
+    for ln in load(name).splitlines():
+        ln = ln.strip()
+        if ln.startswith("#!") and "optional-group:" in ln:
+            words += ln.split("optional-group:", 1)[1].split()
+    return tuple(dict.fromkeys(words))
 
 
 def required_any_of(name: str) -> Tuple[str, ...]:

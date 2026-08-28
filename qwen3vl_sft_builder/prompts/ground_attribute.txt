@@ -1,1 +1,12 @@
+# VLM 没给出可用问句时的兜底模板。正常情况下这一轮的问句由 VLM 按图生成
+# （见 vlm_select.txt），走到这里说明那三句都被语体闸拦下了。
+#! optional-group: mw
+#! require-any: 框 定位 位置 坐标 检测 找出 标出 圈出 指出
+#! forbid: 所有 全部 每一个 描述 长什么样 什么颜色 有哪些
+定位图中{attribute}的那{mw}{label}。
 框出图中{attribute}的{label}。
+输出{attribute}的{label}的检测框。
+请给出{attribute}的{label}的边界框。
+标出图中{attribute}的那{mw}{label}的位置。
+找出图中{attribute}的{label}，给出坐标。
+{attribute}的{label}在图中的什么位置？

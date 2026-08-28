@@ -46,15 +46,6 @@ logger = logging.getLogger(__name__)
 MAX_TRY = 4
 
 
-def _weighted_order(weights: Dict[str, float], rng: random.Random) -> List[str]:
-    """按权重把任务名铺成一个抽样池。权重为 0 的任务不参与。"""
-    pool: List[str] = []
-    for name, w in weights.items():
-        if name in TASKS and w > 0:
-            pool.extend([name] * int(round(float(w) * 10)))
-    rng.shuffle(pool)
-    return pool or list(TASKS)
-
 
 def _box_list_text(boxes, bbox2d) -> str:
     lines = [f"图中共 {len(boxes)} 个已标注目标："]
@@ -87,9 +78,19 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     require_desc = bool(cfg.get_path("main_line_requires_description", True))
     min_desc_len = int(cfg.get_path("min_description_len", 18))
     all_labels = sorted(table.id2name.values())
+    # 名称维度的易混表，供 exist_negative 挑 hard negative
+    confusable = {}
+    for cid, name in table.id2name.items():
+        group = [g for g in table.confusable_group(cid) if g != name]
+        if group:
+            confusable[name] = group
 
     rng = random.Random(seed)
-    task_pool = _weighted_order(weights, rng)
+    total_w = sum(v for v in weights.values() if v) or 1
+    target = {k: v / total_w for k, v in weights.items() if v}
+    if not target:
+        raise RuntimeError("config 的 tasks 段里所有权重都是 0，没有任务可生成")
+    strict_ratio = str(cfg.get_path("tasks_ratio_mode", "strict")) == "strict"
 
     # ---- 阶段一：扫描 + 质量过滤 ----
     scenes: List[Dict[str, Any]] = []
@@ -131,7 +132,6 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     made = Counter()
     failed = Counter()
     invalid = 0
-    cursor = 0
 
     for sc in scenes:
         ann, kept, gmap = sc["ann"], sc["kept"], sc["gmap"]
@@ -143,23 +143,39 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         label_counts = collections.Counter(b.label for b in kept)
         n_want = min(cap, max(1, len(kept)))
         for _ in range(n_want):
-            # 一个槽位最多试 MAX_TRY 个任务：某个任务在这张图上条件不满足时
-            # （比如没有单实例类别、VLM 没挑中可描述的目标），顺延到池里下一个，
-            # 而不是白白浪费这个槽位。失败次数仍单独统计。
+            # 【按产出缺口调度，不是按槽位轮转】。
+            #
+            # 各任务的可用率差得很远：主线要求类别在原始标注里唯一、要求 VLM
+            # 挑中了目标，约一半槽位填不上；exist_negative 几乎永远能填。
+            # 按权重轮转发槽位的话，填不上的那些槽位会被永远可用的任务接走 ——
+            # 实测配比给主线 70%，实得 41%，exist_negative 配 7% 拿到 31.9%。
+            #
+            # 改成每个槽位挑【当前欠账最多】的任务：欠得越多越优先，一旦补上
+            # 就轮到别人。这是个自校正的反馈，任何任务的可用率再低也不会被
+            # 别人挤掉份额，也不会有任务超发。缺口相同时随机打散，避免固定顺序。
+            done_all = sum(made.values())
+            deficit = sorted(target,
+                             key=lambda t: (made[t] - target[t] * (done_all + 1),
+                                            rng.random()))
+
+            def make_ctx():
+                return Ctx(annotation=ann, boxes=kept, grades=gmap, vlm=vlm_info,
+                           all_labels=all_labels,
+                           bbox2d=b2d, spatial=lambda b: spatial_phrase(b.cx, b.cy),
+                           rng=rng, short_answer=rng.random() < short_ratio,
+                           measure_words=measure_words, require_desc=require_desc,
+                           used=used, min_desc_len=min_desc_len,
+                           raw_counts=sc["raw_counts"], forbid_chat=forbid_chat,
+                           confusable=confusable)
+
+            # strict：只试欠账最多的那一个，补不上就空过这个槽位，配比一分不歪。
+            # fill：往下顺延，优先填满槽位，配比会偏。数据量的瓶颈从来不在
+            # 单张图能出几条，而在有多少张图，所以默认 strict。
             out = None
             name = ""
-            for _try in range(MAX_TRY):
-                name = task_pool[cursor % len(task_pool)]
-                cursor += 1
-                ctx = Ctx(annotation=ann, boxes=kept, grades=gmap, vlm=vlm_info,
-                          all_labels=all_labels,
-                          bbox2d=b2d, spatial=lambda b: spatial_phrase(b.cx, b.cy),
-                          rng=rng, short_answer=rng.random() < short_ratio,
-                          measure_words=measure_words, require_desc=require_desc,
-                          used=used, min_desc_len=min_desc_len,
-                          raw_counts=sc["raw_counts"], forbid_chat=forbid_chat)
+            for name in deficit[:1 if strict_ratio else MAX_TRY]:
                 try:
-                    out = TASKS[name](ctx)
+                    out = TASKS[name](make_ctx())
                 except Exception as exc:                   # noqa: BLE001
                     logger.warning("任务 %s 生成异常：%s", name, exc)
                     out = None
@@ -191,8 +207,9 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                     "focus_box_indices": out.get("focus", []),
                     "n_turns": len(out["conversations"]) // 2,
                     **{k: v for k, v in out.items()
-                       if k in ("attribute", "relation", "count", "polarity",
-                                "question_source", "n_boxes",
+                       if k in ("attribute", "attribute_kind", "relation",
+                                "relation_axis", "count", "polarity",
+                                "hard_negative", "question_source", "n_boxes",
                                 "inventory")},
                 },
             }

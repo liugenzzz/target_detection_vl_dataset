@@ -61,6 +61,9 @@ class Ctx:
     # 语体禁用词（config 的 phrase_banks.forbid_global）。ground_attribute 的问句
     # 是 VLM 按图现场生成的，不走问法库，那道闸管不到它 —— 这里现场过一遍。
     forbid_chat: tuple = ()
+    # {类别名: [易混的类别名]}。拒答样本挑「图里有卡车，问有没有货车」这种，
+    # 比从 347 类里随机抽一个不相干的东西有价值得多。
+    confusable: Dict[str, List[str]] = field(default_factory=dict)
     # 本张图已经被出过样本的框。同一个目标出多条样本时，答案 bbox 完全相同，
     # 只是问法不同，属于近重复数据 —— 实测同一个框曾在一张图里被出了 4 次。
     used: set = field(default_factory=set)
@@ -76,6 +79,13 @@ class Ctx:
         """
         kept = sum(1 for b in self.boxes if b.label == label)
         return self.raw_counts.get(label, kept) == kept
+
+    def confusable_with(self, labels) -> List[str]:
+        """跟这些类别容易混的类别名。用于挑 hard negative。"""
+        out = []
+        for l in labels:
+            out += self.confusable.get(l, [])
+        return sorted(set(out))
 
     def mw(self, label: str) -> str:
         """该类别的量词。船「艘」、车「辆」、人「名」；查不到退回「个」。"""
@@ -244,8 +254,9 @@ def ground_attribute(ctx: Ctx):
         question = ctx.rng.choice(questions)
         source = "vlm"
     else:
-        question = prompts.render("ground_attribute", attribute=attr,
-                                  mw=ctx.mw(b.label), label=b.label)
+        question = prompts.render_choice("ground_attribute", ctx.rng,
+                                         attribute=attr, mw=ctx.mw(b.label),
+                                         label=b.label)
         source = "template"
     return _main_line(ctx, b, question,
                       {"attribute": attr, "question_source": source})
@@ -276,31 +287,59 @@ def detect_class(ctx: Ctx):
 
 
 def attribute_qa(ctx: Ctx):
-    """图中 [框] 这个目标是什么颜色？—— Osprey-724K 里属性是最大一类（29%）。"""
-    cand = ctx.unused([b for b in ctx.boxes if (ctx.vlm.get(b.index) or {}).get("color")])
-    if not cand:
+    """[框] 这个区域内物体是什么颜色 / 有什么特征？—— Osprey-724K 里属性是
+    最大一类（207K，29%）。用坐标指向目标，不存在把答案写进问题的可能。
+
+    两个维度分开问，不能混：
+      color      VLM 返回的主体颜色，配颜色问句
+      attribute  VLM 返回的「用于指认的最显眼特征」，可能是颜色，也可能是
+                 朝向、姿态、载货状态 —— 拿颜色问句去问它，会出现
+                 「问什么颜色，答车头朝左」。
+
+    两者都来自挑对象那次调用，主线已经付过钱，这里复用不额外花费。
+    """
+    dims = []
+    for b in ctx.unused(ctx.boxes):
+        info = ctx.vlm.get(b.index) or {}
+        if info.get("color"):
+            dims.append((b, "color", info["color"]))
+        attr = _clean_attr(info.get("attribute", ""))
+        # 特征和颜色一模一样时问「有什么特征」答「银灰色」，等于重复了颜色那条
+        if attr and attr != info.get("color"):
+            dims.append((b, "feature", attr))
+    if not dims:
         return None
-    b = ctx.rng.choice(cand)
-    key = ctx.rng.choice(sorted(ATTR_QUESTIONS))
-    color = ctx.vlm[b.index][key]
+    b, kind, value = ctx.rng.choice(dims)
+    pool = "attribute_qa_color" if kind == "color" else "attribute_qa_feature"
+    answer = value if ctx.short_answer else (
+        f"是{value}的。" if kind == "color" else f"{value}。")
     return {"conversations": _turns(
-                (_ask(ctx, prompts.render("attribute_qa", bbox=_j(ctx.bbox2d(b)),
-                                          attr_name=ATTR_QUESTIONS[key])),
-                 color if ctx.short_answer else f"是{color}的。")),
-            "focus": [b.index], "label": b.label, "attribute": color}
+                (_ask(ctx, prompts.render_choice(pool, ctx.rng,
+                                                 bbox=_j(ctx.bbox2d(b)))), answer)),
+            "focus": [b.index], "label": b.label, "attribute": value,
+            "attribute_kind": kind}
 
 
 def spatial_relation(ctx: Ctx):
-    """图中的卡车在人员的哪一侧？—— 纯坐标计算，零 VLM 成本（Ferret 四类之一）。
+    """图中的银灰色卡车在人员的左边还是右边？—— 纯坐标计算（Ferret 四类之一）。
 
     只取关系明确的一对：一个轴拉开、另一个轴接近，否则「左边」这种回答不成立。
 
-    参照物 B 必须是该类在图中的唯一实例，否则「在卡车的哪一侧」指不明确。
-    主体 A 只要在 3x3 分区内同类唯一即可，问句里带上空间修饰来消歧 ——
-    最初要求 A 也是唯一实例，在密集数据上一条都出不来（实测 VisDrone 命中 0 次）。
+    三条讲究：
+
+    1. 问法必须跟关系轴匹配。中文里「侧」指左右 —— 「在公交车的哪一侧？」
+       答「在公交车的下方」是问非所答。左右一个问法池、上下一个问法池。
+
+    2. 参照物 B 必须是该类在【原始标注】里的唯一实例，否则指不明确。
+
+    3. 主体 A 的消歧优先用【外观属性】（「银灰色的那辆面包车」），
+       实在没有才回落方位修饰。原先一律用「中部左侧那辆面包车」，一句话里
+       塞两套方位体系：「中部左侧那辆面包车在公交车的下方」，读的人要同时
+       转换两个坐标系。而且方位修饰和关系轴撞上时会直接打架
+       （「左边那辆车在卡车的左侧」）—— 回落时避开同轴。
+
+    属性来自挑对象那次调用，主线已经付过钱了，这里复用不额外花费。
     """
-    # 参照物按【原始标注】算唯一：原图 3 辆卡车、2 辆被过滤，
-    # 再问「在卡车的哪一侧」就指不明确了。
     singles = {l for l in {b.label for b in ctx.boxes}
                if len(_same_label(ctx, l)) == 1 and ctx.all_kept(l)}
     if not singles:
@@ -308,28 +347,56 @@ def spatial_relation(ctx: Ctx):
 
     pool = []
     for a in ctx.boxes:
-        if not ctx.grades[a.index].unique_in_zone:
-            continue
         for b in ctx.boxes:
             if a.index == b.index or a.label == b.label or b.label not in singles:
                 continue
             dx, dy = a.cx - b.cx, a.cy - b.cy
             if abs(dx) > 0.12 and abs(dy) < 0.12:
-                pool.append((a, b, "右侧" if dx > 0 else "左侧"))
+                pool.append((a, b, "右侧" if dx > 0 else "左侧", "lr"))
             elif abs(dy) > 0.12 and abs(dx) < 0.12:
-                pool.append((a, b, "下方" if dy > 0 else "上方"))
+                pool.append((a, b, "下方" if dy > 0 else "上方", "ud"))
     if not pool:
         return None
 
-    a, b, rel = ctx.rng.choice(pool)
-    # A 的类别有多个实例时，问句要带空间修饰才指得明确
-    subject = (a.label if len(_same_label(ctx, a.label)) == 1
-               else f"{ctx.spatial(a)}那{ctx.mw(a.label)}{a.label}")
-    return {"conversations": _turns(
-                (_ask(ctx, prompts.render("spatial_relation",
-                                          label_a=subject, label_b=b.label)),
-                 rel if ctx.short_answer else f"在{b.label}的{rel}。")),
-            "focus": [a.index, b.index], "label": a.label, "relation": rel}
+    ctx.rng.shuffle(pool)
+    for a, b, rel, axis in pool:
+        subject = _spatial_subject(ctx, a, axis)
+        if subject:
+            break
+    else:
+        return None
+
+    question = prompts.render_choice(f"spatial_ask_{axis}", ctx.rng,
+                                     a=subject, b=b.label)
+    answer = (rel if ctx.short_answer else
+              prompts.render_choice("spatial_answer", ctx.rng,
+                                    a=subject, b=b.label, rel=rel))
+    return {"conversations": _turns((_ask(ctx, question), answer)),
+            "focus": [a.index, b.index], "label": a.label, "relation": rel,
+            "relation_axis": axis}
+
+
+# 方位修饰与关系轴同轴时会打架：「左边那辆车在卡车的左侧」。
+# 回落时只用另一根轴上的词。
+_ZONE_WORDS = {"lr": ("上方", "下方"), "ud": ("左侧", "右侧")}
+
+
+def _spatial_subject(ctx: Ctx, a, axis: str) -> Optional[str]:
+    """给主体 A 一个能指明白的说法。全图同类唯一就直接用类别名。"""
+    mw = ctx.mw(a.label)
+    if len(_same_label(ctx, a.label)) == 1:
+        return a.label
+    attr = _clean_attr((ctx.vlm.get(a.index) or {}).get("attribute", ""))
+    if attr:
+        return f"{attr}的那{mw}{a.label}"
+    # 没有属性：用【另一根轴】上的方位词消歧，且必须在该轴上真的分得开
+    lo, hi = _ZONE_WORDS[axis]
+    v = a.cy if axis == "lr" else a.cx
+    same = [o for o in _same_label(ctx, a.label) if o.index != a.index]
+    others = [(o.cy if axis == "lr" else o.cx) for o in same]
+    if others and all(abs(v - o) > 0.2 for o in others):
+        return f"{lo if v < 0.5 else hi}那{mw}{a.label}"
+    return None
 
 
 def exist_negative(ctx: Ctx):
@@ -337,31 +404,38 @@ def exist_negative(ctx: Ctx):
     推理时凭空编框。Ferret 有 95K hard negative（8.6%），Osprey 有 64K（8.8%）。
 
     一半问存在的类别（答有），一半问不存在的（答没有），避免模型学成「一律答没有」。
+
+    问不存在的类别时【优先挑易混类别】。从 347 类里随机抽，抽到的多半是跟画面
+    毫不相干的东西（航拍街景问「有没有N95防护口罩」），模型答「没有」不需要
+    真的看图，学不到东西。挑「图里有卡车，问有没有货车」这种，才逼它去看。
     """
     present = {b.label for b in ctx.boxes}
     if ctx.rng.random() < 0.5 and present:
         label = ctx.rng.choice(sorted(present))
-        q = prompts.render("exist_yes", label=label)
         if ctx.short_answer:
             a = "有"
         elif ctx.all_kept(label):
-            a = prompts.render("exist_yes_answer", n=len(_same_label(ctx, label)),
-                               mw=ctx.mw(label), label=label)
+            a = prompts.render_choice("exist_yes_answer", ctx.rng,
+                                      n=len(_same_label(ctx, label)),
+                                      mw=ctx.mw(label), label=label)
         else:
             # 该类有实例被质量过滤掉了，报出来的数一定小于图里实际的个数。
-            # 「有」是对的，「有 1 名人员」在图里明明站着 5 个人时就是错的。
-            a = prompts.render("exist_yes_vague", label=label)
-        polarity = "positive"
+            a = prompts.render_choice("exist_yes_vague", ctx.rng, label=label)
+        polarity, hard = "positive", False
     else:
-        absent = [l for l in ctx.all_labels if l not in present]
-        if not absent:
+        hard_pool = [l for l in ctx.confusable_with(present) if l not in present]
+        pool = hard_pool or [l for l in ctx.all_labels if l not in present]
+        if not pool:
             return None
-        label = ctx.rng.choice(absent)
-        q = prompts.render("exist_no", label=label)
-        a = "没有" if ctx.short_answer else prompts.render("exist_no_answer", label=label)
+        label = ctx.rng.choice(sorted(pool))
+        hard = bool(hard_pool)
+        a = ("没有" if ctx.short_answer else
+             prompts.render_choice("exist_no_answer", ctx.rng, label=label))
         polarity = "negative"
-    return {"conversations": _turns((_ask(ctx, q), a)),
-            "focus": [], "label": label, "polarity": polarity}
+    return {"conversations": _turns(
+                (_ask(ctx, prompts.render_choice("exist_ask", ctx.rng, label=label)), a)),
+            "focus": [], "label": label, "polarity": polarity,
+            "hard_negative": hard}
 
 
 def region_identify(ctx: Ctx):
@@ -373,9 +447,10 @@ def region_identify(ctx: Ctx):
     if not cand:
         return None
     b = ctx.rng.choice(cand)
-    a = b.label if ctx.short_answer else prompts.render("region_identify_answer", label=b.label)
+    a = b.label if ctx.short_answer else prompts.render_choice("region_identify_answer", ctx.rng, label=b.label)
     return {"conversations": _turns(
-                (_ask(ctx, prompts.render("region_identify", bbox=_j(ctx.bbox2d(b)))), a)),
+                (_ask(ctx, prompts.render_choice("region_identify", ctx.rng,
+                                                 bbox=_j(ctx.bbox2d(b)))), a)),
             "focus": [b.index], "label": b.label}
 
 

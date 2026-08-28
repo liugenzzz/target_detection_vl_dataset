@@ -49,7 +49,7 @@ def visible_len(line: str) -> int:
 
 def accept(name: str, line: str, required: Sequence[str], max_len: int,
            seen: Iterable[str], forbidden: Sequence[str] = (),
-           optional_refer: bool = False,
+           optional_group: Sequence[str] = (),
            require_any: Sequence[str] = ()) -> bool:
     """一条生成结果是否收得下。不合格的直接丢，不做修补 ——
     问法池是要进十万条训练数据的，宁可少几条也不能混进坏句子。
@@ -74,8 +74,8 @@ def accept(name: str, line: str, required: Sequence[str], max_len: int,
     if visible_len(line) > max_len:
         return False
     found = set(_PLACEHOLDER.findall(line))
-    ok = {frozenset(required)} | ({frozenset()} if optional_refer else set())
-    if frozenset(found) not in ok:
+    missing = set(required) - found
+    if found - set(required) or missing not in (set(), set(optional_group)):
         # 占位符对不上：少了会让问句失去指向（「那辆在哪？」），
         # 多了会在 .format() 时抛 KeyError 把整批构建打断。
         return False
@@ -137,7 +137,7 @@ def install(cfg) -> Dict[str, int]:
         try:
             required = prompts.placeholders_of(name)
             forbidden = prompts.forbidden_of(name) + glob
-            optional = prompts.has_flag(name, "optional-refer")
+            optional = prompts.optional_group_of(name)
             req_any = prompts.required_any_of(name)
         except FileNotFoundError:
             # 池子对应的 .txt 已经删了（任务下线），整组跳过

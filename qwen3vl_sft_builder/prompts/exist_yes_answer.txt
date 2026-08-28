@@ -1,1 +1,9 @@
+# 答「有」并报数。只在该类【全部框都通过质量过滤】时才用这个池子 ——
+# 有实例被过滤掉时报出来的数一定偏小，那时走 exist_yes_vague。
+#! require-any: 有
+#! forbid: 没有 不存在 描述 坐标 框
 有，图中有 {n} {mw}{label}。
+有，共 {n} {mw}{label}。
+有，画面中有 {n} {mw}{label}。
+有，图中一共 {n} {mw}{label}。
+有，可以看到 {n} {mw}{label}。
