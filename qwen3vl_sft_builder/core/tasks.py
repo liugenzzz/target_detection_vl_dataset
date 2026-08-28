@@ -52,6 +52,11 @@ class Ctx:
     require_desc: bool = True            # 主线是否强制三段齐全
     min_desc_len: int = 18               # 描述短于此判为空话
     skeletons: Dict[int, Any] = field(default_factory=dict)   # box_index -> Skeleton
+    # 【过滤前】各类别的框数。boxes 是过滤后的，两者的差就是被质量过滤掉的目标。
+    # 穷举式问句（「定位图中的卡车」「框出图中所有的人员」）必须拿这个数来把关：
+    # 原图有 4 辆三轮车、3 辆因太小被过滤，仍去问「定位图中的三轮车」并只给 1 个框，
+    # 就是在教模型漏检。实测这种情况占 ground_unique 可选组合的 45.2%。
+    raw_counts: Dict[str, int] = field(default_factory=dict)
     # 本张图已经被出过样本的框。同一个目标出多条样本时，答案 bbox 完全相同，
     # 只是问法不同，属于近重复数据 —— 实测同一个框曾在一张图里被出了 4 次。
     used: set = field(default_factory=set)
@@ -59,6 +64,14 @@ class Ctx:
     def unused(self, boxes):
         """过滤掉本图已用过的框；全都用过时返回空列表，任务据此跳过。"""
         return [b for b in boxes if b.index not in self.used]
+
+    def all_kept(self, label: str) -> bool:
+        """该类别过滤前后的框数是否一致 —— 即没有任何一个实例被质量过滤掉。
+
+        没传 raw_counts 时（单测直接构造 Ctx）退回「按没被过滤处理」。
+        """
+        kept = sum(1 for b in self.boxes if b.label == label)
+        return self.raw_counts.get(label, kept) == kept
 
     def mw(self, label: str) -> str:
         """该类别的量词。船「艘」、车「辆」、人「名」；查不到退回「个」。"""
@@ -118,8 +131,14 @@ def _describe(ctx: Ctx, b) -> Optional[str]:
 
 # --------------------------------------------------------------- 主线三种
 def ground_unique(ctx: Ctx):
-    """定位图中的卡车。—— 该类在图中仅一个实例，类别名本身就唯一，无需任何修饰。"""
-    singles = ctx.unused([b for b in ctx.boxes if len(_same_label(ctx, b.label)) == 1])
+    """定位图中的卡车。—— 该类在图中仅一个实例，类别名本身就唯一，无需任何修饰。
+
+    「仅一个实例」按【原始标注】算，不是按过滤后算。原图有 4 辆三轮车、
+    3 辆被质量过滤掉，问「定位图中的三轮车」再只给 1 个框，是在教模型漏检。
+    """
+    singles = ctx.unused([b for b in ctx.boxes
+                          if len(_same_label(ctx, b.label)) == 1
+                          and ctx.all_kept(b.label)])
     if not singles:
         return None
     b = ctx.rng.choice(singles)
@@ -236,6 +255,7 @@ def detect_class(ctx: Ctx):
     # 再出一条只是换了问法，属于近重复数据（实测同一答案出现过 6 次）。
     cand = [l for l in {b.label for b in ctx.boxes}
             if len(_same_label(ctx, l)) >= 2
+            and ctx.all_kept(l)                       # 有一个被过滤掉，答案就不完整
             and all(b.index not in ctx.used for b in _same_label(ctx, l))]
     if not cand:
         return None
@@ -272,7 +292,10 @@ def spatial_relation(ctx: Ctx):
     主体 A 只要在 3x3 分区内同类唯一即可，问句里带上空间修饰来消歧 ——
     最初要求 A 也是唯一实例，在密集数据上一条都出不来（实测 VisDrone 命中 0 次）。
     """
-    singles = {l for l in {b.label for b in ctx.boxes} if len(_same_label(ctx, l)) == 1}
+    # 参照物按【原始标注】算唯一：原图 3 辆卡车、2 辆被过滤，
+    # 再问「在卡车的哪一侧」就指不明确了。
+    singles = {l for l in {b.label for b in ctx.boxes}
+               if len(_same_label(ctx, l)) == 1 and ctx.all_kept(l)}
     if not singles:
         return None
 
@@ -311,10 +334,16 @@ def exist_negative(ctx: Ctx):
     present = {b.label for b in ctx.boxes}
     if ctx.rng.random() < 0.5 and present:
         label = ctx.rng.choice(sorted(present))
-        n = len(_same_label(ctx, label))
         q = prompts.render("exist_yes", label=label)
-        a = "有" if ctx.short_answer else prompts.render(
-            "exist_yes_answer", n=n, mw=ctx.mw(label), label=label)
+        if ctx.short_answer:
+            a = "有"
+        elif ctx.all_kept(label):
+            a = prompts.render("exist_yes_answer", n=len(_same_label(ctx, label)),
+                               mw=ctx.mw(label), label=label)
+        else:
+            # 该类有实例被质量过滤掉了，报出来的数一定小于图里实际的个数。
+            # 「有」是对的，「有 1 名人员」在图里明明站着 5 个人时就是错的。
+            a = prompts.render("exist_yes_vague", label=label)
         polarity = "positive"
     else:
         absent = [l for l in ctx.all_labels if l not in present]

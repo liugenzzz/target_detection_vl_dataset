@@ -101,7 +101,9 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         kept = [b for b in ann.boxes if gmap[b.index].grade != REJECT]
         if not kept:
             continue
-        scenes.append({"ann": ann, "kept": kept, "gmap": gmap})
+        raw_counts = Counter(b.label for b in ann.boxes)
+        scenes.append({"ann": ann, "kept": kept, "gmap": gmap,
+                       "raw_counts": dict(raw_counts)})
         if limit and len(scenes) >= limit:
             break
 
@@ -153,7 +155,8 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                           bbox2d=b2d, spatial=lambda b: spatial_phrase(b.cx, b.cy),
                           rng=rng, short_answer=rng.random() < short_ratio,
                           measure_words=measure_words, require_desc=require_desc,
-                          used=used, min_desc_len=min_desc_len)
+                          used=used, min_desc_len=min_desc_len,
+                          raw_counts=sc["raw_counts"])
                 try:
                     out = TASKS[name](ctx)
                 except Exception as exc:                   # noqa: BLE001

@@ -629,6 +629,69 @@ def test_bank_rejects_model_meta_talk():
 
 
 
+
+class _Box:
+    """最小的框替身：任务函数只用到 index / label / cx / cy。"""
+    def __init__(self, i, label, cx=0.5, cy=0.5):
+        self.index, self.label = i, label
+        self.cx, self.cy = cx, cy
+        self.w = self.h = 0.1
+
+
+def _ctx_with_filtered(task_boxes, raw_counts, **kw):
+    """构造一个「有框被质量过滤掉了」的 Ctx：boxes 是过滤后的，raw_counts 是过滤前的。"""
+    import random
+    from core.tasks import Ctx
+    return Ctx(annotation=None, boxes=task_boxes, grades={},
+               vlm={b.index: {"description": "位于画面左下角，一辆银灰色的卡车停在路边，"
+                                             "旁边有一棵树。"} for b in task_boxes},
+               all_labels=["人员", "卡车", "船"], bbox2d=lambda b: [1, 2, 3, 4],
+               spatial=lambda b: "中间", rng=random.Random(0),
+               measure_words={"人员": "名", "卡车": "辆"},
+               raw_counts=raw_counts, **kw)
+
+
+def test_exhaustive_questions_respect_filtered_boxes():
+    """穷举式问句必须按【原始标注】把关，不能按过滤后的框把关。
+
+    原图 4 辆三轮车、3 辆太小被过滤，仍问「定位图中的三轮车」并只给 1 个框，
+    等于在教模型漏检 —— 实测这种情况占 ground_unique 可选组合的 45.2%。
+    """
+    from core.tasks import ground_unique, detect_class
+    B = _Box
+
+    # 卡车过滤后剩 1 个，但原始标注里有 3 个 -> 不能出 ground_unique
+    ctx = _ctx_with_filtered([B(0, "卡车")], {"卡车": 3})
+    assert ground_unique(ctx) is None
+    # 原始标注里也只有 1 个 -> 可以出
+    ctx = _ctx_with_filtered([B(0, "卡车")], {"卡车": 1})
+    assert ground_unique(ctx) is not None
+
+    # 人员过滤后剩 2 个，原始 5 个 -> 「框出图中所有的人员」答案不完整，不能出
+    ctx = _ctx_with_filtered([B(0, "人员"), B(1, "人员")], {"人员": 5})
+    assert detect_class(ctx) is None
+    ctx = _ctx_with_filtered([B(0, "人员"), B(1, "人员")], {"人员": 2})
+    assert detect_class(ctx) is not None
+
+
+def test_exist_answer_does_not_undercount():
+    """该类有实例被过滤掉时，「有 1 名人员」在图里站着 5 个人的情况下就是错的。"""
+    from core.tasks import exist_negative
+    import random
+    ctx = _ctx_with_filtered([_Box(0, "人员")], {"人员": 5})
+    ctx.rng = random.Random(1)
+    for _ in range(30):
+        out = exist_negative(ctx)
+        if out and out["polarity"] == "positive":
+            answer = out["conversations"][1]["value"]
+            assert "1" not in answer, f"报了个偏小的数：{answer}"
+            assert answer.startswith("有")
+            break
+    else:
+        raise AssertionError("30 次都没抽到 positive，随机性有问题")
+
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):
