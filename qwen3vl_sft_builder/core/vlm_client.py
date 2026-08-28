@@ -83,8 +83,22 @@ class VlmResult:
 
 
 class VlmClient:
-    def __init__(self, cfg):
-        v = cfg.get_path("vlm", {}) or {}
+    def __init__(self, cfg, role: str = ""):
+        """role 非空时，先看 vlm.roles.<role> 有没有单独的配置，有就用它覆盖。
+
+        审核这一步尤其需要：用生成它的同一个模型来审自己写的描述，等于自己
+        给自己打分，它会倾向于认同自己的输出。有第二个模型时应该让审核走那个。
+        """
+        v = dict(cfg.get_path("vlm", {}) or {})
+        if role:
+            override = (v.get("roles") or {}).get(role) or {}
+            if override:
+                v = {**v, **override}
+                # roles.<role> 里写了 endpoints 就换池子；只写了 model 则沿用
+                # 外层地址换个模型名，这时要把外层的 endpoints 清掉免得盖不住。
+                if override.get("endpoints") is None and override.get("model"):
+                    v["endpoints"] = []
+        self.role = role
         self.enabled = bool(v.get("enabled", True))
         self.api_url = str(v.get("api_url", ""))
         self.api_key = str(v.get("api_key", ""))
@@ -105,7 +119,12 @@ class VlmClient:
         # 改写要保真不要发挥，用低温
         self.temperature_rewrite = float(v.get("temperature_rewrite", 0.3))
         cache = v.get("cache_dir") or ""
-        self.cache_dir = Path(cache) if cache else None
+        # 按角色分子目录。两个理由：
+        #   1. 缓存键是 (图, 一串整数)，构建用的是 bbox / 图片尺寸，质检用的是
+        #      问答对的哈希 —— 同一个键空间里理论上会撞。
+        #   2. 换了质检模型只想重跑质检，删一个子目录就行，不必连构建结果一起废。
+        self.cache_dir = Path(cache) / role if (cache and role) else (
+            Path(cache) if cache else None)
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.stats = {"vlm": 0, "cache": 0, "template": 0, "failed": 0, "prefetched": 0}

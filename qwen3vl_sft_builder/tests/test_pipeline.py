@@ -851,6 +851,88 @@ def test_endpoint_pool_weights_by_concurrency():
 
 
 
+
+# --------------------------------------------------------------- 全量质检
+
+def test_review_score_is_the_minimum_not_the_average():
+    """一条描述编造了参照物（grounded=1）但问句写得漂亮（instruction=5），
+    取平均还有 3.5 分，照样进训练集。质检要看短板。"""
+    from core import review
+    got = review.parse('{"reviews":[{"id":0,"correct":5,"grounded":1,'
+                       '"clear":4,"instruction":5,"issue":"编了个白色轿车"}]}', 1)
+    assert got[0]["score"] == 1, got
+    passed, reason = review.verdict(got[0], min_score=3, min_dim={"grounded": 3})
+    assert not passed and "grounded" in reason
+
+
+def test_review_parse_rejects_garbage():
+    """解析失败必须返回 None —— 当成满分放行等于质检形同虚设。"""
+    from core import review
+    assert review.parse("", 3) is None
+    assert review.parse("模型今天不想干活", 3) is None
+    assert review.parse('{"reviews": "不是列表"}', 3) is None
+    assert review.parse('{"reviews":[{"id":0}]}', 3) is None      # 一个维度都没给
+    # 编了个不存在的编号
+    assert review.parse('{"reviews":[{"id":99,"correct":5,"grounded":5,'
+                        '"clear":5,"instruction":5}]}', 3) is None
+    # 分数超出 1~5 要夹回去，不能让 99 分冲高均值
+    got = review.parse('{"reviews":[{"id":0,"correct":99,"grounded":0,'
+                       '"clear":3,"instruction":3}]}', 1)
+    assert got[0]["correct"] == 5 and got[0]["grounded"] == 1
+
+
+def test_review_groups_by_image():
+    """一张图上的样本必须合并成一次调用 —— 图片 base64 是请求里最大的一块，
+    分开发等于把同一张图传 N 遍。十万条样本差的是十万次调用和一万多次调用。"""
+    from core import review
+    rows = [{"images": ["a.jpg"], "conversations": []},
+            {"images": ["a.jpg"], "conversations": []},
+            {"images": ["b.jpg"], "conversations": []}]
+    g = review.group_by_image(rows)
+    assert len(g) == 2 and len(g["a.jpg"]) == 2
+
+
+def test_review_resolves_bare_filenames(tmp_path=None):
+    """images 字段默认存裸文件名（LLaMA-Factory 风格），质检要读图得拼回去。"""
+    import tempfile, os
+    from core import review
+    d = Path(tempfile.mkdtemp())
+    (d / "a.jpg").write_bytes(b"x")
+    assert review.resolve_image("a.jpg", d) == d / "a.jpg"
+    assert review.resolve_image("别处/a.jpg", d) == d / "a.jpg"
+    assert review.resolve_image("不存在.jpg", d) is None
+    os.unlink(d / "a.jpg"); os.rmdir(d)
+
+
+def test_review_cache_is_isolated_per_role():
+    """质检的缓存键是问答对的哈希，构建用的是 bbox —— 同一个键空间会撞。
+    分子目录后，换质检模型只想重跑质检，删一个目录就行。"""
+    from config import Config
+    from core.vlm_client import VlmClient
+    cfg = Config({"vlm": {"api_url": "http://a/v1/c", "model": "m",
+                          "cache_dir": "/tmp/_c"}})
+    assert str(VlmClient(cfg).cache_dir) == "/tmp/_c"
+    assert str(VlmClient(cfg, role="review").cache_dir) == "/tmp/_c/review"
+
+
+def test_review_summary_reports_by_task():
+    from core import review
+    rows = [{"metadata": {"task_type": "ground_unique"},
+             "review": {"correct": 5, "grounded": 5, "clear": 4,
+                        "instruction": 5, "score": 4, "passed": True}},
+            {"metadata": {"task_type": "ground_unique"},
+             "review": {"correct": 2, "grounded": 5, "clear": 4,
+                        "instruction": 5, "score": 2, "passed": False,
+                        "reason": "correct=2 低于下限 3"}},
+            {"metadata": {"task_type": "detect_class"}}]      # 没判上的
+    out = review.summarize(rows)
+    assert out["scored"] == 2 and out["unscored"] == 1
+    assert out["pass_rate"] == 0.5
+    assert out["by_task"]["ground_unique"]["n"] == 2
+    assert out["top_reject_reasons"] == {"correct=2 低于下限 3": 1}
+
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

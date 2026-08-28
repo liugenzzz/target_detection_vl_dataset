@@ -40,6 +40,17 @@ vlm:
   #   - {name: "备用", api_url: "http://192.168.78.37:3012/v1/chat/completions",
   #      model: "Qwen2.5-VL-72B", concurrency: 4}
   endpoints: []
+  # 按角色覆盖。审核尤其需要：用生成它的同一个模型来审自己写的描述，
+  # 它会倾向于认同自己的输出。有第二个模型时让审核走那个。
+  # 只写 model 就是「同一个地址换个模型名」；写 endpoints 则整个池子换掉。
+  #
+  # roles:
+  #   review:
+  #     temperature: 0.0
+  #     endpoints:
+  #       - {name: "质检", api_url: "http://192.168.78.40:3012/v1/chat/completions",
+  #          model: "Qwen2.5-VL-72B", concurrency: 4}
+  roles: {}
   max_retries: 3
   cache_dir: "./output/vlm_cache"     # 按图落盘，支持断点续跑
 
@@ -71,6 +82,23 @@ phrase_banks:
     - ask_describe
     - ground_unique
     - detect_class
+
+# ---------------------------------------------------------------------------
+# 全量质检。构建阶段的过滤全是结构性的（占位符、类别泄漏、描述长度、坐标越界），
+# 都不看图。框偏了、参照物是编的、指代不唯一 —— 只有看图才发现得了。
+#   python scripts/review.py
+# 按图分组，一张图上的样本合并成一次调用。十万条按每图 8 条算约一万两千次调用。
+# 不通过的不直接删，落进 *.rejected.jsonl 供人工看 —— 审核模型自己也会看错。
+# ---------------------------------------------------------------------------
+review:
+  min_score: 3                        # 综合分下限。综合分取各维度的【最小值】
+  # 单维度下限。编造参照物（grounded）是最要命的，卡得比别的严。
+  # 一条描述编了参照物但问句写得漂亮，取平均还有 3 分多，照样进训练集 ——
+  # 所以要看短板，不看平均。
+  min_dimension:
+    grounded: 3
+    correct: 3
+  max_samples_per_call: 8             # 一次让模型判几条，太多它会开始敷衍
 
 # ---------------------------------------------------------------------------
 # 坐标系。Qwen3-VL-8B-Instruct 吃 0~1000 归一化坐标。
