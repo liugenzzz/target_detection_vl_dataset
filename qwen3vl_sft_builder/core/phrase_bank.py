@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 # 生成的句子里允许出现的前缀垃圾：序号、项目符号、引号
 _JUNK = re.compile(r'^\s*(?:[-*·•]|\d+[.、)）]|\(\d+\)|["“”\'‘’])+\s*')
 _PLACEHOLDER = re.compile(r"\{(\w+)\}")
+# 问句必须以句号、问号或叹号收尾。模型爱在正文外多写一句「以下是几种写法：」，
+# 剥掉序号后它结构上完全合法（无占位符、无禁用词、长度也够短），
+# 会一路混进问法库当成问句用 —— 实测出现过「这条带了序号」当第二轮问句。
+_TERMINATED = re.compile(r"[。？！?!]$")
+# 模型的元话语：它在讲「我要写几种说法」，而不是在写那句说法本身
+_META = ("以下", "如下", "例如", "比如", "示例", "写法", "说法", "第一句",
+         "这条", "这句", "上面", "下面", "注意")
 
 
 def sanitize(line: str) -> str:
@@ -40,7 +47,8 @@ def visible_len(line: str) -> int:
 
 def accept(name: str, line: str, required: Sequence[str], max_len: int,
            seen: Iterable[str], forbidden: Sequence[str] = (),
-           optional_refer: bool = False) -> bool:
+           optional_refer: bool = False,
+           require_any: Sequence[str] = ()) -> bool:
     """一条生成结果是否收得下。不合格的直接丢，不做修补 ——
     问法池是要进十万条训练数据的，宁可少几条也不能混进坏句子。
 
@@ -50,6 +58,13 @@ def accept(name: str, line: str, required: Sequence[str], max_len: int,
     比干脆不提还糟。
     """
     if not line or line.startswith("#"):
+        return False
+    if not _TERMINATED.search(line):
+        return False
+    if any(w in line for w in _META):
+        return False
+    if require_any and not any(w in line for w in require_any):
+        # 语义漏了：detect_class 问的是穷举，少了「所有」就和 ground_unique 撞车
         return False
     if any(w in line for w in forbidden):
         # 语义跑偏：往「描述」池里塞了「在哪」。结构上完全合法，只能靠禁用词拦。
@@ -113,13 +128,15 @@ def install(cfg) -> Dict[str, int]:
     """
     banks = load(cfg.get_path("phrase_banks.path", ""))
     max_len = int(cfg.get_path("phrase_banks.max_len", 30))
+    glob = tuple(cfg.get_path("phrase_banks.forbid_global", []) or [])
     kept: Dict[str, List[str]] = {}
     dropped: Dict[str, int] = {}
     for name, phrases in banks.items():
         try:
             required = prompts.placeholders_of(name)
-            forbidden = prompts.forbidden_of(name)
+            forbidden = prompts.forbidden_of(name) + glob
             optional = prompts.has_flag(name, "optional-refer")
+            req_any = prompts.required_any_of(name)
         except FileNotFoundError:
             # 池子对应的 .txt 已经删了（任务下线），整组跳过
             dropped[name] = len(phrases)
@@ -127,7 +144,8 @@ def install(cfg) -> Dict[str, int]:
         good: List[str] = []
         for line in phrases:
             line = sanitize(line)
-            if accept(name, line, required, max_len, good, forbidden, optional):
+            if accept(name, line, required, max_len, good, forbidden,
+                      optional, req_any):
                 good.append(line)
         if good:
             kept[name] = good

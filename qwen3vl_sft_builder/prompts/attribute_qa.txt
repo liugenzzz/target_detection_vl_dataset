@@ -1,1 +1,1 @@
-图中 {bbox} 这个目标是什么{attr_name}？
+图中 {bbox} 区域内物体的{attr_name}是什么？

@@ -81,6 +81,23 @@ def has_flag(name: str, flag: str) -> bool:
     return any(ln.strip() == f"#! {flag}" for ln in load(name).splitlines())
 
 
+def required_any_of(name: str) -> Tuple[str, ...]:
+    """取一个问法池的必含词（至少命中一个），写在文件里形如：
+
+        #! require-any: 所有 全部 每一个
+
+    禁用词管「不能是别的意思」，必含词管「必须是这个意思」。detect_class
+    问的是穷举（「框出图中所有的人员」），少了「所有」就和 ground_unique
+    撞车 —— 同一个问句配两种答案，模型只能学成随机猜要给一个还是给全部。
+    """
+    words: list = []
+    for ln in load(name).splitlines():
+        ln = ln.strip()
+        if ln.startswith("#!") and "require-any:" in ln:
+            words += ln.split("require-any:", 1)[1].split()
+    return tuple(dict.fromkeys(words))
+
+
 def placeholders_of(name: str) -> Tuple[str, ...]:
     """一个问法池用到的占位符集合，例如 inv_ask_box 是 (label, mw)。"""
     found = set()

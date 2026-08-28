@@ -46,12 +46,23 @@ def _forbid_rule(forbidden) -> str:
             + "。\n  它们属于别的问法池，混进来会让这一轮问非所答。\n")
 
 
+def _require_rule(required_any) -> str:
+    if not required_any:
+        return ""
+    return ("- 每句都必须含有下面任意一个词："
+            + "、".join(required_any)
+            + "。\n  这一轮问的是穷举，少了这个词就和「只问一个」的问法撞车了。\n")
+
+
 def expand(client: VlmClient, name: str, target: int, batch: int,
-           max_len: int, temperature: float, verbose: bool) -> list[str]:
+           max_len: int, temperature: float, forbid_global: tuple,
+           verbose: bool) -> list[str]:
     """扩充一个池子，返回新增的说法（不含 .txt 里手写的）。"""
     seeds = list(prompts.load_variants(name))
     required = prompts.placeholders_of(name)
-    forbidden = prompts.forbidden_of(name)
+    forbidden = prompts.forbidden_of(name) + forbid_global
+    require_any = prompts.required_any_of(name)
+    optional = prompts.has_flag(name, "optional-refer")
     purpose = prompts.comment_of(name) or f"图片问答对话里的一句话（{name}）"
     seen = list(seeds)
     fresh: list[str] = []
@@ -67,7 +78,7 @@ def expand(client: VlmClient, name: str, target: int, batch: int,
             seeds="\n".join(seen[-30:]),      # 只给最近的，太长模型会开始抄前面
             n=want + 5,                       # 多要几条，抵掉被丢掉的
             placeholder_rule=_placeholder_rule(required),
-            forbid_rule=_forbid_rule(forbidden),
+            forbid_rule=_forbid_rule(forbidden) + _require_rule(require_any),
         )
         raw = client._post({
             "model": client.model,
@@ -81,7 +92,8 @@ def expand(client: VlmClient, name: str, target: int, batch: int,
         got = 0
         for line in raw.splitlines():
             line = phrase_bank.sanitize(line)
-            if phrase_bank.accept(name, line, required, max_len, seen, forbidden):
+            if phrase_bank.accept(name, line, required, max_len, seen, forbidden,
+                                  optional, require_any):
                 seen.append(line)
                 fresh.append(line)
                 got += 1
@@ -116,6 +128,7 @@ def main() -> int:
     batch = int(cfg.get_path("phrase_banks.batch", 20))
     max_len = int(cfg.get_path("phrase_banks.max_len", 30))
     temperature = float(cfg.get_path("phrase_banks.temperature", 1.0))
+    forbid_global = tuple(cfg.get_path("phrase_banks.forbid_global", []) or [])
     pools = args.pool or list(cfg.get_path("phrase_banks.pools", []) or [])
     if not pools:
         raise SystemExit("phrase_banks.pools 是空的，没有要扩充的池子")
@@ -131,7 +144,7 @@ def main() -> int:
             print(f"  {name:18s} 已有 {len(banks[name])} 条，跳过（--force 重新生成）")
             continue
         banks[name] = expand(client, name, target, batch, max_len, temperature,
-                             verbose=args.show)
+                             forbid_global, verbose=args.show)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(phrase_bank.dump(banks), encoding="utf-8")

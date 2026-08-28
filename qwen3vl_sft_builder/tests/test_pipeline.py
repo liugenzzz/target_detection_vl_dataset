@@ -551,15 +551,19 @@ def test_every_pool_passes_its_own_rules():
     cfg = yaml.safe_load((Path(__file__).resolve().parents[1]
                           / "config" / "default.yaml").read_text(encoding="utf-8"))
     pools = cfg["phrase_banks"]["pools"]
+    glob = tuple(cfg["phrase_banks"]["forbid_global"])
     assert pools, "config 里一个问法池都没登记"
+    assert glob, "全局语体禁用词是空的"
     for name in pools:
         required = prompts.placeholders_of(name)
-        forbidden = prompts.forbidden_of(name)
+        forbidden = prompts.forbidden_of(name) + glob
         optional = prompts.has_flag(name, "optional-refer")
+        req_any = prompts.required_any_of(name)
         seeds = prompts.load_variants(name)
         assert forbidden, f"{name} 没写 #! forbid，语义闸是空的"
         for v in seeds:
-            assert phrase_bank.accept(name, v, required, 30, [], forbidden, optional), \
+            assert phrase_bank.accept(name, v, required, 30, [], forbidden,
+                                      optional, req_any), \
                 f"{name} 自己的种子 {v!r} 过不了自己的规则"
 
 
@@ -596,6 +600,32 @@ def test_bank_install_drops_bad_lines(tmp_path=None):
         assert "那{mw}{label}在哪？" not in prompts.variants("ask_describe")
     finally:
         os.unlink(path); prompts.use_bank({})
+
+
+
+
+def test_bank_require_any_keeps_detect_class_exhaustive():
+    """detect_class 与 ground_unique 占位符相同，只差「单个 vs 全部」的语义。
+    少了穷举词就是同一个问句配两种答案，模型只能学成随机猜给一个还是给全部。"""
+    req_any = ["所有", "全部"]
+    assert phrase_bank.accept("x", "框出图中所有的{label}。", ["label"], 30, [],
+                              (), False, req_any)
+    assert not phrase_bank.accept("x", "框出图中的{label}。", ["label"], 30, [],
+                                  (), False, req_any)
+
+
+
+
+def test_bank_rejects_model_meta_talk():
+    """剥掉序号后的元话语结构上完全合法，只能靠句法与元话语词拦。
+    实测「3. 这条带了序号」被剥成「这条带了序号」，当成第二轮问句用了。"""
+    assert not phrase_bank.accept("x", "这条带了序号", [], 30, [])
+    assert not phrase_bank.accept("x", "以下是几种写法：", [], 30, [])
+    assert not phrase_bank.accept("x", "例如可以这样问。", [], 30, [])
+    # 没有句末标点 = 多半不是一句完整的问话
+    assert not phrase_bank.accept("x", "框出图中的车", [], 30, [])
+    assert phrase_bank.accept("x", "框出图中的车。", [], 30, [])
+    assert phrase_bank.accept("x", "车在什么位置？", [], 30, [])
 
 
 
