@@ -344,37 +344,49 @@ def inventory_locate(ctx: Ctx):
             "inventory": [f"{l}x{n}" for l, n in inventory]}
 
 
-def ground_attribute(ctx: Ctx):
-    """属性指代定位 —— 主线。问句由 VLM 生成，不套模板。
+def _ground_describe(ctx: Ctx, kind: str):
+    """指代 -> 框 -> 【某一种】描述。七个 ground_* 任务共用这一个实现。
 
-    模板问句「定位图中{attribute}的那{mw}{label}。」写死后所有样本一个腔调，
-    十万条同一句式，既不像真人说话，也让模型只学到那一个句式。改由 VLM 为每个
-    目标生成三种说法，这里随机取一句；VLM 没给问句时才退回模板。
+    描述的多样性来自【答案里装的是什么】，不是问句换说法：
+    appearance 只说物体本身、position 只说方位、relation 只说邻接关系……
+    每种的答案信息结构完全不同。子类型由代码在预取阶段按配比指派给每个目标，
+    模型做不到就返回空，这里取不到就跳过 —— 换下一张图的下一个目标。
     """
-    # 属性必须能在同类目标里【唯一】指认这个框。同类里还有别的目标也是
-    # 「穿白色上衣」时，这条指代同时匹配好几个人，问题就有了多个正确答案。
     cand = [b for b in ctx.unused(ctx.boxes)
-            if _attr_identifies(ctx, b, (ctx.vlm.get(b.index) or {}).get("attribute", ""))]
+            if (ctx.vlm.get(b.index) or {}).get("describe_kind") == kind
+            and _attr_identifies(ctx, b, (ctx.vlm.get(b.index) or {}).get("attribute", ""))]
     if not cand:
         return None
     b = ctx.rng.choice(cand)
     info = ctx.vlm[b.index]
     attr = _clean_attr(info["attribute"])
 
+    desc, desc_q = info.get("description", ""), info.get("describe_q", "")
+    if not desc or not desc_q:
+        return None            # 模型拒绝了这个子类型
+
     questions = [q.replace("的的", "的") for q in (info.get("questions") or []) if q]
-    # VLM 现场生成的问句要过和问法池【同一套】闸。提示词里已经要求了，
-    # 但那是「请它别这么写」，不是保证 —— 三句里飘一句就够脏一批数据。
     questions = [q for q in questions if _box_question_ok(ctx, q)]
     if questions:
-        question = ctx.rng.choice(questions)
-        source = "vlm"
+        question, source = ctx.rng.choice(questions), "vlm"
     else:
         question = prompts.render_choice("ground_attribute", ctx.rng,
                                          attribute=attr, mw=ctx.mw(b.label),
                                          label=b.label)
         source = "template"
-    return _main_line(ctx, b, question,
-                      {"attribute": attr, "question_source": source})
+
+    return {"conversations": _turns(
+                (_ask(ctx, question, box_answer=True), _j(_box_of(ctx, b), ctx.json_fence)),
+                (desc_q, desc)),
+            "focus": [b.index], "label": b.label, "attribute": attr,
+            "describe_kind": kind, "question_source": source}
+
+
+def _make_ground_task(kind: str):
+    fn = lambda ctx, _k=kind: _ground_describe(ctx, _k)      # noqa: E731
+    fn.__name__ = f"ground_{kind}"
+    fn.__doc__ = f"指代 -> 框 -> {kind} 类描述。见 prompts/describe/{kind}.txt"
+    return fn
 
 
 # --------------------------------------------------------------- 其余七种
@@ -573,10 +585,16 @@ def region_identify(ctx: Ctx):
             "focus": [b.index], "label": b.label}
 
 
+# 七个描述子类型各是一个任务 —— 配比可控、报告里看得到每种多少条、
+# 可以按 task_type 直接筛掉不要的。名字统一 ground_<子类型>，
+# 对应 prompts/describe/<子类型>.txt。
+DESCRIBE_KINDS = ("appearance", "state", "part", "position",
+                  "relation", "contrast", "full")
+
 TASKS: Dict[str, Callable[[Ctx], Optional[Dict[str, Any]]]] = {
     "ground_unique": ground_unique,
     "inventory_locate": inventory_locate,
-    "ground_attribute": ground_attribute,
+    **{f"ground_{k}": _make_ground_task(k) for k in DESCRIBE_KINDS},
     "detect_class": detect_class,
     "attribute_qa": attribute_qa,
     "spatial_relation": spatial_relation,
@@ -584,4 +602,5 @@ TASKS: Dict[str, Callable[[Ctx], Optional[Dict[str, Any]]]] = {
     "region_identify": region_identify,
 }
 
-MAIN_LINE = ("ground_unique", "inventory_locate", "ground_attribute")
+MAIN_LINE = ("ground_unique", "inventory_locate",
+             *(f"ground_{k}" for k in DESCRIBE_KINDS))

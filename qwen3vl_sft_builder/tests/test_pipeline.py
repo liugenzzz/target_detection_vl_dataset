@@ -13,6 +13,7 @@ from core.classes import _detect_confusable, _one_char_apart
 from core.coords import yolo_to_bbox2d, zone_of
 from core.grouping import source_group_key
 from core.referring import spatial_phrase
+import prompts
 from core import phrase_bank
 
 
@@ -584,11 +585,14 @@ def test_validate_sample_rejects_chat_question():
 def test_vlm_questions_pass_through_register_gate():
     """ground_attribute 的问句是 VLM 按图现场生成的，不走问法库。
     提示词里要求了指令式，但那是「请它别这么写」，不是保证。"""
-    from core.tasks import ground_attribute
+    from core.tasks import TASKS
+    ground_attribute = TASKS["ground_full"]
     import random
     ctx = _ctx_with_filtered([_Box(0, "卡车")], {"卡车": 1})
     ctx.forbid_chat = ("诶", "帮我", "哪儿")
     ctx.vlm[0].update({"attribute": "银灰色", "color": "银灰色",
+                       "describe_kind": "full", "describe_q": "描述这辆卡车。",
+                       "description": "一辆银灰色的卡车，停在路边，旁边有棵树。",
                        "questions": ["诶那辆卡车在哪儿？", "帮我框一下卡车。"]})
     out = ground_attribute(ctx)
     assert out is not None
@@ -849,41 +853,6 @@ def test_needs_image_does_not_drag_down_the_core_score():
 
 
 
-def test_desc_opening_rotates_uniformly():
-    """固定的例子会把模型的句式钉在那几条上，十万条描述全是一个套路。
-    每张图换一种起手方式，各种句式才在整批数据里均匀铺开。"""
-    import random, prompts
-    from collections import Counter
-    rng = random.Random(0)
-    n = len(prompts.load_variants("desc_opening"))
-    got = Counter(prompts.pick_pair("desc_opening", rng)[0] for _ in range(2000))
-    assert len(got) == n, "有起手方式一次都没被抽到"
-    # 均匀：没有哪一种超过均值的 1.4 倍
-    assert max(got.values()) < 2000 / n * 1.4, got
-
-
-def test_desc_opening_format_is_enforced():
-    """池子里每行必须是「说明 ||| 示例」。少了分隔符会把整行当成说明塞进
-    提示词，示例位置留空 —— 模型拿不到样子，描述质量当场掉下去，而且不报错。"""
-    import prompts
-    for line in prompts.load_variants("desc_opening"):
-        assert prompts.SPLIT in line, f"缺分隔符：{line}"
-        rule, example = line.split(prompts.SPLIT, 1)
-        assert rule.strip() and example.strip(), line
-        assert len(example.strip()) >= 20, f"示例太短，起不到示范作用：{example}"
-
-
-def test_vlm_select_renders_with_rotating_opening():
-    import prompts
-    text = prompts.render("vlm_select", box_list="  [0] 卡车  位于 [1,2,3,4]",
-                          max_pick=3, opening_rule="先说位置。",
-                          opening_example="位于画面左下角，一辆卡车停在路边。")
-    assert "先说位置。" in text and "一辆卡车停在路边" in text
-    # 两个新占位符必须被填掉；提示词里 {{特征}} 这类是给模型看的示范，
-    # 渲染成 {特征} 是对的，不能一刀切地断言「没有大括号」
-    assert "{opening_rule}" not in text and "{opening_example}" not in text
-    assert "{box_list}" not in text and "{max_pick}" not in text
-
 
 
 
@@ -904,8 +873,14 @@ def test_every_task_has_its_own_prompt_dir():
     from core.tasks import TASKS
     dirs = {d.name for d in prompts.PROMPT_DIR.iterdir()
             if d.is_dir() and not d.name.startswith("__")}
-    missing = set(TASKS) - dirs
+    # 七个 ground_<子类型> 是同一条链的变体，提示词在 prompts/describe/<子类型>.txt，
+    # 不各占一个目录 —— 它们共用「指代 -> 框」那两轮，只有描述那一轮不同。
+    kinds = {f"ground_{k}" for k in __import__("core.tasks", fromlist=["x"]).DESCRIBE_KINDS}
+    missing = set(TASKS) - dirs - kinds
     assert not missing, f"这些任务没有自己的提示词目录：{sorted(missing)}"
+    for k in kinds:
+        f = prompts.PROMPT_DIR / "describe" / f"{k[len('ground_'):]}.txt"
+        assert f.exists(), f"{k} 缺提示词文件 {f}"
     shared = {d for d in dirs if d.startswith("_")}
     assert shared == {"_shared", "_vlm", "_tools"}, sorted(shared)
 
@@ -1103,15 +1078,20 @@ def test_attribute_must_identify_uniquely_among_same_class():
     「穿白色上衣」，于是生成了两条问句几乎一样、答案却是不同框的样本 ——
     同一个问题两个正确答案，模型只能学成随机猜。"""
     import random
-    from core.tasks import Ctx, ground_attribute, _attr_identifies, _norm_attr
+    from core.tasks import Ctx, TASKS, _attr_identifies, _norm_attr
+    ground_attribute = TASKS["ground_full"]
 
     desc = "一名穿白色上衣的行人走在步道上，位于画面中央，旁边是一辆银白色摩托车。"
     boxes = [_Box(0, "行人"), _Box(1, "行人"), _Box(2, "摩托车")]
+    q = "描述这辆车的外观、方位和周边。"
     vlm = {0: {"attribute": "穿白色上衣", "color": "白色", "description": desc,
+               "describe_q": q, "describe_kind": "full",
                "questions": ["输出穿白色上衣的行人的检测框。"]},
            1: {"attribute": "白色上衣、黑色裤子", "color": "白色", "description": desc,
+               "describe_q": q, "describe_kind": "full",
                "questions": ["框出穿白色上衣的行人。"]},
            2: {"attribute": "粉红色", "color": "粉色", "description": desc,
+               "describe_q": q, "describe_kind": "full",
                "questions": ["框出粉红色的摩托车。"]}}
     ctx = Ctx(annotation=None, boxes=boxes, grades={}, vlm=vlm,
               all_labels=["行人", "摩托车"], bbox2d=lambda b: [1, 2, 3, 4],
@@ -1176,6 +1156,71 @@ def test_color_check_uses_chroma_not_saturation_alone():
     assert dim_green[1] > colorcheck.SAT_ACHROMATIC     # 单看饱和度会误判
     assert not colorcheck.conflicts("白色", dim_green), "昏暗偏绿不该拦白色"
     assert colorcheck.conflicts("白色", blue_truck), "鲜蓝色必须拦下白色"
+
+
+
+
+# ------------------------------------------------- 描述子类型（内容维度）
+
+def test_describe_kinds_load_and_are_registered():
+    """七种子类型各一个提示词文件，都要有对应的 ground_* 任务和配比权重。
+    加一种就多一种 —— 文件即配置，别的地方忘了登记这项测试会挂。"""
+    import yaml
+    from core import describe_kinds
+    from core.tasks import TASKS, DESCRIBE_KINDS
+    kinds = describe_kinds.load_all()
+    assert set(kinds) == set(DESCRIBE_KINDS), (sorted(kinds), sorted(DESCRIBE_KINDS))
+    cfg = yaml.safe_load((Path(__file__).resolve().parents[1]
+                          / "config" / "default.yaml").read_text(encoding="utf-8"))
+    for k in kinds:
+        assert f"ground_{k}" in TASKS, f"ground_{k} 没注册进 TASKS"
+        assert f"ground_{k}" in cfg["tasks"], f"ground_{k} 没有配比权重"
+        assert kinds[k].answer_spec and kinds[k].q_example and kinds[k].a_example, k
+
+
+def test_describe_kind_scope_is_enforced():
+    """模型很容易把「只说外观」写成「位于画面左侧的一辆红色三轮车」——
+    加了方位就又滑回三段式了。没有这道闸，七种跑几轮会退化成同一种。"""
+    from core import describe_kinds
+    kinds = describe_kinds.load_all()
+    ok = "深红色车身，支着一顶白色遮阳篷，车斗敞开着，里面堆着几个纸箱。"
+    bad = "位于画面左侧，一辆红色三轮车，旁边有一棵树。"
+    assert describe_kinds.answer_violates(kinds["appearance"], ok) == ""
+    assert describe_kinds.answer_violates(kinds["appearance"], bad)
+    # position 反过来：不该跑去说外观
+    assert describe_kinds.answer_violates(kinds["position"], "车身是红色的。")
+
+
+def test_ground_task_skips_when_model_declines():
+    """指派的类型不适合这个目标时模型返回空，这里要跳过换下一个 ——
+    不能拿空描述硬凑一条样本。"""
+    from core.tasks import TASKS
+    ctx = _ctx_with_filtered([_Box(0, "卡车")], {"卡车": 1})
+    ctx.vlm[0].update({"attribute": "银灰色", "color": "银灰色",
+                       "describe_kind": "part", "describe_q": "", "description": ""})
+    assert TASKS["ground_part"](ctx) is None
+    ctx.vlm[0].update({"describe_q": "这辆卡车的货斗是什么样的？",
+                       "description": "货斗是蓝色金属的，后挡板放了下来，里面空着。"})
+    out = TASKS["ground_part"](ctx)
+    assert out is not None and out["describe_kind"] == "part"
+    # 只有被指派了这个类型的目标才算数
+    assert TASKS["ground_state"](ctx) is None
+
+
+def test_prompt_change_invalidates_the_vlm_cache():
+    """缓存的意义是「同一个问题不重复问」，改了提示词就不是同一个问题了。
+    少了这一项，改完 prompts/ 重跑会全部命中旧缓存、输出一字未变，
+    而且完全没有提示 —— 实测因此白跑了三次。"""
+    import importlib, core.vlm_client as m
+    target = prompts.PROMPT_DIR / "describe" / "appearance.txt"
+    original = target.read_text(encoding="utf-8")
+    before = m._prompt_fingerprint()
+    try:
+        target.write_text(original + "\n# 改一个字\n", encoding="utf-8")
+        assert m._prompt_fingerprint() != before, "改提示词没让指纹变"
+    finally:
+        target.write_text(original, encoding="utf-8")
+    assert m._prompt_fingerprint() == before, "改回来指纹要还原"
 
 
 

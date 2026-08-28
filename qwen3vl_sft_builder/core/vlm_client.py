@@ -84,6 +84,20 @@ class VlmResult:
     source: str          # "vlm" | "cache"
 
 
+def _prompt_fingerprint() -> str:
+    """prompts/ 下所有 .txt 的内容指纹。
+
+    按内容而不是按修改时间 —— git checkout 会改 mtime 但内容没变，
+    按时间算会把好好的缓存全废掉。
+    """
+    import prompts as _p
+    h = hashlib.md5()
+    for path in sorted(_p.PROMPT_DIR.rglob("*.txt")):
+        h.update(path.name.encode())
+        h.update(path.read_bytes())
+    return h.hexdigest()[:12]
+
+
 class VlmClient:
     def __init__(self, cfg, role: str = ""):
         """role 非空时，先看 vlm.roles.<role> 有没有单独的配置，有就用它覆盖。
@@ -114,6 +128,8 @@ class VlmClient:
         self.endpoints = _endpoints_from(v)
         self.concurrency = sum(e.concurrency for e in self.endpoints)
         self._rr = 0                      # 轮转游标，_lock 保护
+        # prompts/ 全部内容的指纹，进缓存键。改提示词自动让缓存失效。
+        self._prompt_fp = _prompt_fingerprint()
         # 加权轮转表：concurrency=8 的那路在表里出现 8 次
         self._rotation = [e for e in self.endpoints for _ in range(e.concurrency)]
         # 挑对象那次调用要顺带生成多样的问句，温度低了三句会写得几乎一样。
@@ -145,9 +161,16 @@ class VlmClient:
         self._fatal: Optional[str] = None      # 命中配置错误后记在这里，供 prefetch 中止
 
     # ------------------------------------------------------------ 缓存
-    @staticmethod
-    def _key(image_path: Path, bbox: Sequence[int]) -> str:
-        return hashlib.md5(f"{image_path.name}|{list(bbox)}".encode()).hexdigest()
+    def _key(self, image_path: Path, bbox: Sequence[int]) -> str:
+        """缓存键 = 图片 + 参数 + 【提示词指纹】。
+
+        提示词必须进键。缓存的意义是「同一个问题不重复问」，改了提示词就
+        不是同一个问题了 —— 少了这一项，你改完 prompts/ 重跑会全部命中旧缓存，
+        看到的还是上一版的结果，而且完全没有提示。
+        实测踩过：改完描述子类型重跑三次，输出一字未变。
+        """
+        return hashlib.md5(
+            f"{image_path.name}|{list(bbox)}|{self._prompt_fp}".encode()).hexdigest()
 
     def _cache_path(self, image_path: Path, bbox: Sequence[int]) -> Optional[Path]:
         if not self.cache_dir:

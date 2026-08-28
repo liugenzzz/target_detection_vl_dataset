@@ -36,7 +36,7 @@ def _load_measure_words(cfg) -> Dict[str, str]:
         return {}
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return {str(k): str(v) for k, v in (data.get("measure_words") or {}).items()}
-from . import colorcheck, consistency, phrase_bank
+from . import colorcheck, consistency, describe_kinds, phrase_bank
 from .vlm_client import VlmClient
 from .yolo import iter_annotations
 
@@ -78,6 +78,16 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     require_desc = bool(cfg.get_path("main_line_requires_description", True))
     min_desc_len = int(cfg.get_path("min_description_len", 18))
     all_labels = sorted(table.id2name.values())
+    kinds = describe_kinds.load_all()
+    # 按 tasks 里各 ground_* 的权重排出轮转表 —— 权重大的在表里出现次数多，
+    # 指派频率就跟着配比走。
+    kind_list = [kinds[n] for n, w in sorted(_kind_weights(weights, kinds).items())
+                 for _ in range(w) if n in kinds]
+    if not kind_list:
+        kind_list = list(kinds.values())
+    kind_cursor = 0
+    kind_plan: Dict[str, List[str]] = {}    # 图 -> [第1个挑中的子类型, 第2个, ...]
+    kind_stats = Counter()
     color_gate = bool(cfg.get_path("quality.verify_color_with_pixels", True))
     color_stats = Counter()
     color_dropped: List[Dict[str, Any]] = []      # 抽样留证，进构建报告
@@ -133,14 +143,21 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         tasks = []
         for sc in scenes:
             ann, kept = sc["ann"], sc["kept"]
-            # 每张图换一种描述的起手方式。固定的例子会把模型的句式钉在那几条上，
-            # 十万条描述全是一个套路。轮换之后各种起手方式在整批数据里均匀铺开。
-            # 效果用 scripts/dataset_stats.py 的「答案开头集中度」验。
-            rule, example = prompts.pick_pair("desc_opening", rng)
+            # 【按目标轮转指派描述子类型】。让模型自己挑会坍缩到最省力的那种
+            # （实测过一次：给它「换动词换句式」的自由，它就只换同义词、
+            # 骨架一个不动）。代码指派、模型可拒绝，分布才控得住。
+            n_slots = min(max_pick, len(kept))
+            slots, lines = [], []
+            for i in range(n_slots):
+                k = kind_list[kind_cursor % len(kind_list)]
+                kind_cursor += 1
+                slots.append(k.name)
+                lines.append(describe_kinds.render_assignment(k, i + 1))
+            kind_plan[str(ann.image_path)] = slots
             text = prompts.render("vlm_select",
                                   box_list=_box_list_text(kept, bbox2d_for(ann)),
                                   max_pick=min(max_pick, len(kept)),
-                                  opening_rule=rule, opening_example=example)
+                                  kind_assignments="\n\n".join(lines))
             tasks.append((ann.image_path, [ann.width, ann.height], "scene", text))
         vlm.prefetch(tasks)
 
@@ -159,6 +176,22 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         # 指代就指向了错误的目标，attribute_qa 更是直接答错。颜色能从像素量出来，
         # 不该靠模型自觉。对不上就把这个颜色说法丢掉（其余字段照用），
         # 判据刻意宽松，只拦明显冲突。
+        # 把指派的子类型贴回每个目标，并检查答案有没有跑出这个类型的范围 ——
+        # 模型很容易把「只说外观」写成「位于画面左侧的一辆红色三轮车」，
+        # 加了方位就又滑回三段式了。没有这道闸，七种跑几轮会退化成同一种。
+        # 按【模型挑中的顺序】把子类型贴回去 —— scene_info 保序返回。
+        slots = kind_plan.get(str(ann.image_path), [])
+        for i, (bid, info) in enumerate(vlm_info.items()):
+            kname = slots[i] if i < len(slots) else (slots[-1] if slots else "full")
+            info["describe_kind"] = kname
+            bad = describe_kinds.answer_violates(kinds[kname], info.get("description", ""))
+            if bad:
+                kind_stats[f"out_of_scope_{kname}"] += 1
+                info["description"] = info["describe_q"] = ""
+            elif info.get("description"):
+                kind_stats[f"ok_{kname}"] += 1
+            else:
+                kind_stats[f"declined_{kname}"] += 1
         if color_gate:
             color_stats["checked"] += _drop_bad_colors(
                 ann, kept, vlm_info, color_stats, color_dropped)
@@ -232,7 +265,8 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                     "focus_box_indices": out.get("focus", []),
                     "n_turns": len(out["conversations"]) // 2,
                     **{k: v for k, v in out.items()
-                       if k in ("attribute", "attribute_kind", "relation",
+                       if k in ("attribute", "attribute_kind", "describe_kind",
+                                "relation",
                                 "relation_axis", "count", "polarity",
                                 "hard_negative", "question_source", "n_boxes",
                                 "inventory")},
@@ -286,6 +320,10 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         "question_variety": _question_variety(samples),
         # 像素核对颜色拦下了多少条。dropped 明显偏高说明模型看颜色不准，
         # 该换个视觉能力更强的模型，或者把 attribute_qa 的配比调低。
+        # 每种描述子类型：模型接了多少、拒绝了多少、写跑题被丢了多少。
+        # declined 高说明这个子类型对你的数据不适用（航拍小目标看不清部件），
+        # out_of_scope 高说明 prompts/describe/<子类型>.txt 的要求还不够硬。
+        "describe_kinds": dict(kind_stats),
         "color_check": {
             **color_stats,
             # 丢弃率高时（比如超过 20%）对着这几条打开原图看：
@@ -385,6 +423,21 @@ def _drop_bad_colors(ann, kept, vlm_info, stats, samples_dropped) -> int:
                                          round(hsv[2], 2)],
                     })
     return checked
+
+
+
+# 描述子类型的任务名统一是 ground_<子类型>，这样配比表里一眼看得出是同一族。
+KIND_TASK_PREFIX = "ground_"
+
+
+def _kind_weights(weights, kinds) -> Dict[str, int]:
+    """从 tasks 配比里抽出各描述子类型的权重。"""
+    out = {}
+    for name in kinds:
+        w = int(weights.get(KIND_TASK_PREFIX + name, 0) or 0)
+        if w > 0:
+            out[name] = w
+    return out
 
 
 def _image_value(image_path: Path, style: str) -> str:
