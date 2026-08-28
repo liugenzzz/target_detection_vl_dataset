@@ -7,6 +7,62 @@
 
 ---
 
+## 输入 / 输出
+
+### 输入（三样东西，都在 `config/local.yaml` 里指路）
+
+| 输入 | 是什么 | 要求 |
+|---|---|---|
+| `labels_dir` | YOLO 标注目录 | 每张图一个 `.txt`，每行 `class_id cx cy w h`，坐标是 0~1 归一化 |
+| `images_dir` | 图片目录 | 文件名与标注同名（`a.jpg` ↔ `a.txt`），分辨率不限 |
+| `classes_yaml` | 类别表 | `names:` 字段，字典或列表写法都支持 |
+
+不需要人工写任何问答对 —— 问答对由标注文件 + 类别表 + VLM 共同生成。
+
+### 输出（`output_dir` 下）
+
+| 文件 | 内容 |
+|---|---|
+| `train.jsonl` / `val.jsonl` | **主产物**。ShareGPT 多轮格式，按来源分组划分，无同源泄漏 |
+| `build_report.json` | 各任务实得配比、跨任务一致性核对、问法去重率、模型池分发 |
+| `train.reviewed.jsonl` | 质检通过的（跑过 `review.py` 之后） |
+| `train.rejected.jsonl` | 质检没通过的，带驳回原因，**人工扫一眼再决定**，不自动删 |
+| `review_report.json` | 分数分布、各维度均值、按任务的通过率 |
+| `dataset_stats.json` | CHAIR 幻觉率、类别覆盖、框分布、词汇多样性 |
+| `vlm_cache/` | 按图落盘的 VLM 结果，支持断点续跑；`vlm_cache/review/` 是质检的 |
+
+### 一条样本长什么样
+
+```json
+{
+  "id": "0000277_00001_d_0000539_ground_unique_42",
+  "images": ["0000277_00001_d_0000539.jpg"],
+  "conversations": [
+    {"from": "human", "value": "<image>\n找出图像中公交车的边界框。"},
+    {"from": "gpt",   "value": "{\"bbox_2d\":[150,746,249,842],\"label\":\"公交车\"}"},
+    {"from": "human", "value": "说明这辆公交车的外观特征。"},
+    {"from": "gpt",   "value": "位于画面右上方，一辆车顶载货的公交车正沿着路面行进，身后是一排店铺门脸。"}
+  ],
+  "metadata": {
+    "task_type": "ground_unique", "is_main_line": true,
+    "answer_format": "normal", "label": "公交车",
+    "source_image": "...", "source_annotation": "...",
+    "image_width": 1360, "image_height": 765,
+    "coordinate_mode": "qwen_relative_1000", "bbox_scale": 1000,
+    "focus_box_indices": [55], "n_turns": 2
+  }
+}
+```
+
+`metadata` 训练时用不到，但**筛数据全靠它** —— 按 `task_type` 挑任务、
+按 `is_main_line` 挑主线、按 `answer_format` 挑短答案、按 `review.passed` 挑质检结果。
+不想要就把 `output.include_metadata` 设 false。
+
+**各任务的样本实例见 [`samples/preview.md`](samples/preview.md)**（每任务 10 条），
+对应的原始 jsonl 是 `samples/preview.jsonl`，可以直接喂 LLaMA-Factory 试跑。
+
+---
+
 ## 部署（远程 Linux 服务器）
 
 ```bash
@@ -67,7 +123,7 @@ VisDrone 覆盖不到的：全是日间彩色图，**测不了夜视/红外场�
 python scripts/get_visdrone.py --out ./data/visdrone   # 约 78MB
 ```
 
-## 五步走
+## 六步走
 
 ```bash
 # 0. 接入新的模型服务后第一个跑这个，别跳过
@@ -92,6 +148,9 @@ python scripts/review.py
 
 # 5. 数据集体检：不调模型，纯离线的客观指标（几秒钟）
 python scripts/dataset_stats.py
+
+# 6. 每个任务抽 10 条合成预览，人工过一遍
+python scripts/export_samples.py
 ```
 
 产出：
@@ -104,34 +163,6 @@ output/
 ├── verify/              验证图 + manifest.json（人工复核看这个）
 └── vlm_cache/           VLM 结果缓存，支持断点续跑
 ```
-
----
-
-## 样本结构
-
-一条样本 = 一张图 + 一个目标 + 三轮递进对话：
-
-| 轮次 | 问 | 答 |
-|---|---|---|
-| 1 识别 | 图中**中部右侧那个目标**是什么？ | 是人员。 |
-| 2 定位 | 请给出它在图中的位置。 | `{"bbox_2d":[718,331,742,379],"label":"人员"}` |
-| 3 描述 | 描述一下这个人员。 | *（VLM 生成的自然语言描述）* |
-
-**第一轮为什么用指代锁定，而不是直接问「图中是什么」**：一张图里有多个目标时，
-直接问「图中是什么」却只答一个，等于在教模型漏报（实测 VisDrone 每图均 70 个目标）。
-用指代先锁定对象，三轮都指向同一个目标，每轮答案都是真话。
-
-另有两类变体，占比在 config 里配：
-
-- **多目标**（默认 10%）：一次涉及 2~3 个目标，第二轮答案是 JSON 数组。
-- **拒答**（默认 5%）：问图中不存在的类别，答「图中没有 X」。
-  **没有这类样本，模型会学到「被问就一定有」的先验，推理时凭空编框。**
-
-### 格式硬约束
-
-`<image>` 占位符**只在第一轮 human 出现一次**。多轮里每轮都加会导致图像 token
-重复注入，训练直接崩。`validate_sample()` 强制检查这一条，不合格的样本会被丢弃
-并计入报告的 `invalid_dropped`。
 
 ---
 
@@ -507,6 +538,16 @@ python scripts/build_phrase_banks.py --target 60 --force  # 重新生成
 （`人员` ⊂ `一般人员` / `军事人员`）、等长且一字之差（`切管器` vs `切管机`、
 `压接钳` vs `压管钳`）。
 
+**包含关系与一字之差要分开对待**，这是拒答样本的正确性问题：
+
+| 关系 | 例子 | 能不能拿来做拒答样本 |
+|---|---|---|
+| 包含（上下位） | `三轮车` ⊂ `遮阳三轮车`、`人员` ⊂ `军事人员` | **不能**。图里有遮阳三轮车，问「有没有三轮车」答「没有」是错的 —— 遮阳三轮车本来就是三轮车 |
+| 一字之差 | `切管器` vs `切管机`、`轿车` vs `卡车` | 能。它们是并列的不同东西，答「没有」成立 |
+
+`exist_negative` 挑难负样本时只用后者，**并且把上下位词从整个拒答池里排掉** ——
+随机兜底那一路照样会抽到它。
+
 这类类别靠视觉难以可靠区分。**构建时不阻塞**（标注文件已指定 `class_id`，
 直接查表取名即可），但会在样本 `metadata.confusable_class` 打标记，
 训练后若这几类混淆严重，可据此快速定位到是哪批样本。全部易混组会列在构建报告里。
@@ -516,28 +557,31 @@ python scripts/build_phrase_banks.py --target 60 --force  # 重新生成
 ## 目录
 
 ```
-config/       default.yaml（进版本控制） + local.yaml（服务器上改，已 gitignore）
-prompts/      提示词纯文本，与代码分离
-core/         classes 类别表与易混检测 / coords 坐标换算 / yolo 标注解析
+config/       default.yaml（进版本控制）+ local.yaml（服务器上改，已 gitignore）
+              measure_words.yaml / phrase_banks.yaml（一次性生成，长期复用）
+prompts/      提示词纯文本，按【任务】分目录 —— 见 prompts/README.md
+  ground_unique/ ground_attribute/ inventory_locate/ detect_class/
+  spatial_relation/ attribute_qa/ exist_negative/ region_identify/
+                每个任务一个目录，改一个不会误伤别的
+  _shared/    多任务共用（主线末轮的描述问法、短答案后缀）
+  _vlm/       调 VLM 用（vlm_select 挑对象 / desc_opening 描述起手方式）
+  _tools/     一次性脚本用（量词表 / 扩充问法库 / 质检）
+core/         classes 类别表、易混与上下位检测 / coords 坐标换算 / yolo 标注解析
               difficulty 难度分级与配额 / grouping 来源分组
               tasks 八个任务的样本生成 / pipeline 编排 / sample 格式契约
               vlm_client 调模型（含模型池）/ phrase_bank 扩充问法库
               register 语体闸 / consistency 跨任务一致性
               review 主观质检 / stats 客观体检
               referring 描述成色判定与空间措辞 / cli 脚本入口包装
-scripts/      check_vlm.py 服务自检 / analyze.py 分布分析
-              review.py 主观质检 / dataset_stats.py 客观体检
-              build.py 构建 / preview.py 验证图
+scripts/      check_vlm.py 服务自检（逐路）/ analyze.py 分布分析
               build_measure_words.py 量词表 / build_phrase_banks.py 扩充问法库
+              build.py 构建 / preview.py 验证图
+              review.py 主观质检 / dataset_stats.py 客观体检
+              export_samples.py 每任务抽 N 条合成预览
               get_visdrone.py 下载测试数据集
+samples/      preview.jsonl + preview.md，各任务样本各 10 条（进版本控制）
 tests/        回归测试，不依赖外部数据和 VLM 服务
 ```
-
-```bash
-python tests/test_pipeline.py      # 55 项，服务器上部署后先跑这个
-```
-
----
 
 ## 参考实现
 

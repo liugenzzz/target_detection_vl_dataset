@@ -31,7 +31,7 @@ class ClassTable:
             if key in self.name2id:
                 logger.warning("类别表存在重名：'%s'（编号 %s 和 %s）", name, self.name2id[key], cid)
             self.name2id[key] = cid
-        self._confusable = _detect_confusable(id2name)
+        self._confusable, self._hypernym = _detect_confusable(id2name)
 
     @staticmethod
     def _norm(name: str) -> str:
@@ -51,6 +51,15 @@ class ClassTable:
         """该类别是否属于某个易混组。"""
         return class_id in self._confusable
 
+    def hypernym_group(self, class_id: int) -> List[str]:
+        """与该类别存在【上下位关系】的类别名（名字互相包含）。
+
+        这一组不能拿来做拒答样本：图里有遮阳三轮车，问「有没有三轮车」
+        答「没有」是错的 —— 遮阳三轮车本来就是三轮车。
+        """
+        group = self._hypernym.get(class_id)
+        return sorted(group) if group else []
+
     def confusable_group(self, class_id: int) -> List[str]:
         """返回与该类别互相易混的类别名列表（含自身）。不属于任何组则返回 []。"""
         group = self._confusable.get(class_id)
@@ -66,8 +75,8 @@ class ClassTable:
         return seen
 
 
-def _detect_confusable(id2name: Dict[int, str]) -> Dict[int, Set[str]]:
-    """检测名称存在包含关系的类别组。
+def _detect_confusable(id2name: Dict[int, str]):
+    """检测名称相近的类别组。返回 (易混组, 上下位关系组)。
 
     两条判据：
       1. 包含关系：'人员' 是 '一般人员' / '军事人员' 的子串 -> 三者互为易混。
@@ -77,16 +86,25 @@ def _detect_confusable(id2name: Dict[int, str]) -> Dict[int, Set[str]]:
     """
     names = {cid: str(n).strip() for cid, n in id2name.items()}
     groups: Dict[int, Set[str]] = {}
+    hypernym: Dict[int, Set[str]] = {}
     items = [(cid, n) for cid, n in names.items() if len(n) >= 2]
 
     for cid_a, name_a in items:
         for cid_b, name_b in items:
             if cid_a >= cid_b:
                 continue
-            if name_a in name_b or name_b in name_a or _one_char_apart(name_a, name_b):
+            contained = name_a in name_b or name_b in name_a
+            if contained or _one_char_apart(name_a, name_b):
                 groups.setdefault(cid_a, {name_a}).add(name_b)
                 groups.setdefault(cid_b, {name_b}).add(name_a)
-    return groups
+            if contained:
+                # 包含关系多半是上下位词（三轮车 ⊂ 遮阳三轮车、人员 ⊂ 军事人员）。
+                # 标记出来，因为它对【拒答样本】是有害的：图里有遮阳三轮车，
+                # 问「有没有三轮车」答「没有」是错的 —— 遮阳三轮车本来就是三轮车。
+                # 一字之差的（切管器 vs 切管机）是并列的不同东西，答「没有」才成立。
+                hypernym.setdefault(cid_a, set()).add(name_b)
+                hypernym.setdefault(cid_b, set()).add(name_a)
+    return groups, hypernym
 
 
 def _one_char_apart(a: str, b: str) -> bool:

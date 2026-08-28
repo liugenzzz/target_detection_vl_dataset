@@ -78,12 +78,18 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     require_desc = bool(cfg.get_path("main_line_requires_description", True))
     min_desc_len = int(cfg.get_path("min_description_len", 18))
     all_labels = sorted(table.id2name.values())
-    # 名称维度的易混表，供 exist_negative 挑 hard negative
-    confusable = {}
+    # 名称维度的易混表，供 exist_negative 挑 hard negative。
+    # 【剔除上下位词】：图里有遮阳三轮车，问「有没有三轮车」答「没有」是错的。
+    # 剩下的是一字之差的并列类别（切管器 vs 切管机），答「没有」才成立。
+    confusable, hypernym = {}, {}
     for cid, name in table.id2name.items():
-        group = [g for g in table.confusable_group(cid) if g != name]
+        hyper = set(table.hypernym_group(cid))
+        group = [g for g in table.confusable_group(cid)
+                 if g != name and g not in hyper]
         if group:
             confusable[name] = group
+        if hyper:
+            hypernym[name] = sorted(hyper - {name})
 
     rng = random.Random(seed)
     total_w = sum(v for v in weights.values() if v) or 1
@@ -171,7 +177,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                            measure_words=measure_words, require_desc=require_desc,
                            used=used, min_desc_len=min_desc_len,
                            raw_counts=sc["raw_counts"], forbid_chat=forbid_chat,
-                           confusable=confusable)
+                           confusable=confusable, hypernym=hypernym)
 
             # strict：只试欠账最多的那一个，补不上就空过这个槽位，配比一分不歪。
             # fill：往下顺延，优先填满槽位，配比会偏。数据量的瓶颈从来不在

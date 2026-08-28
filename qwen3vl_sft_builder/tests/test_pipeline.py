@@ -57,14 +57,42 @@ def test_grouping_video_frames_and_augments():
 
 
 def test_confusable_detection():
-    groups = _detect_confusable({3: "一般人员", 9: "人员", 18: "军事人员",
-                                 23: "切管器", 24: "切管机",
-                                 5: "两栖战舰", 6: "主力战舰", 2: "suv"})
+    groups, hyper = _detect_confusable({3: "一般人员", 9: "人员", 18: "军事人员",
+                                        23: "切管器", 24: "切管机",
+                                        5: "两栖战舰", 6: "主力战舰", 2: "suv"})
     assert 9 in groups and "军事人员" in groups[9]      # 包含关系
     assert 23 in groups and "切管机" in groups[23]      # 一字之差
     assert 5 not in groups                              # 差两字，视觉可区分
     assert _one_char_apart("压接钳", "压管钳")
     assert not _one_char_apart("剪刀", "剪线钳")
+
+    # 包含关系要单独标出来：它多半是上下位词，对【拒答样本】有害 ——
+    # 图里有军事人员，问「有没有人员」答「没有」是错的。
+    # 一字之差的是并列的不同东西（切管器 vs 切管机），答「没有」才成立。
+    assert 9 in hyper and "军事人员" in hyper[9]
+    assert 23 not in hyper
+
+
+def test_hard_negative_never_asks_about_a_hypernym():
+    """图里有遮阳三轮车，问「有没有三轮车」答「没有」是错的 ——
+    遮阳三轮车本来就是三轮车。上下位词要从【整个】拒答池里排掉，
+    不只是难负样本那一路：随机兜底那一路照样会抽到它。"""
+    import random
+    from core.tasks import Ctx, exist_negative
+    ctx = Ctx(annotation=None, boxes=[_Box(0, "遮阳三轮车")], grades={}, vlm={},
+              all_labels=["三轮车", "遮阳三轮车", "切管器", "切管机", "直升机"],
+              bbox2d=lambda b: [1, 2, 3, 4], spatial=lambda b: "中间",
+              rng=random.Random(0), measure_words={"遮阳三轮车": "辆"},
+              confusable={"遮阳三轮车": ["三轮车", "切管器"]},
+              hypernym={"遮阳三轮车": ["三轮车"]})
+    asked = set()
+    for i in range(200):
+        ctx.rng = random.Random(i)
+        out = exist_negative(ctx)
+        if out and out["polarity"] == "negative":
+            asked.add(out["label"])
+    assert asked, "一条拒答样本都没生成"
+    assert "三轮车" not in asked, f"上下位词漏进拒答池：{sorted(asked)}"
 
 
 def _sample(convs):
@@ -846,6 +874,31 @@ def test_vlm_select_renders_with_rotating_opening():
     # 渲染成 {特征} 是对的，不能一刀切地断言「没有大括号」
     assert "{opening_rule}" not in text and "{opening_example}" not in text
     assert "{box_list}" not in text and "{max_pick}" not in text
+
+
+
+
+def test_prompt_names_are_globally_unique():
+    """提示词按【文件名】加载，与所在目录无关。重名会取到哪一个是不确定的 ——
+    改了另一个却不生效，是最难查的那种问题。加载时就要报错。"""
+    import prompts
+    idx = prompts._index()
+    assert len(idx) >= 20
+    stems = [p.stem for p in prompts.PROMPT_DIR.rglob("*.txt")]
+    assert len(stems) == len(set(stems)), "提示词重名"
+
+
+def test_every_task_has_its_own_prompt_dir():
+    """每个任务的提示词单独成目录，改一个任务不会误伤别的。
+    共用件放 _ 开头的目录，目录名上就标出「动它会影响多个任务」。"""
+    import prompts
+    from core.tasks import TASKS
+    dirs = {d.name for d in prompts.PROMPT_DIR.iterdir()
+            if d.is_dir() and not d.name.startswith("__")}
+    missing = set(TASKS) - dirs
+    assert not missing, f"这些任务没有自己的提示词目录：{sorted(missing)}"
+    shared = {d for d in dirs if d.startswith("_")}
+    assert shared == {"_shared", "_vlm", "_tools"}, sorted(shared)
 
 
 

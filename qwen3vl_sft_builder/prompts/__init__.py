@@ -1,6 +1,22 @@
 """提示词加载。所有提示词都是 prompts/ 下的纯文本文件，与代码分离。
 
 改提示词不需要动代码，也不需要重装依赖 —— 服务器上直接改 .txt 即可。
+
+目录按【任务】分：
+
+    prompts/ground_unique/       只服务这一个任务的提示词
+    prompts/inventory_locate/
+    prompts/exist_negative/
+    ...                          八个任务各一个目录
+    prompts/_shared/             多个任务共用的（主线末轮的描述问法、短答案后缀）
+    prompts/_vlm/                调 VLM 那两次用的（挑对象、描述起手方式）
+    prompts/_tools/              一次性脚本用的（量词表、扩充问法库、质检）
+
+要改某个任务的问法，进它自己的目录改就行，不会误伤别的任务。
+下划线开头的三个目录是共用件，改动会影响多个任务 —— 目录名上就标出来了。
+
+加载按【文件名】而不是路径，所以移动目录不用改任何调用点；
+文件名全局唯一，重名会在加载时立刻报错而不是静默取到其中一个。
 """
 
 from __future__ import annotations
@@ -18,13 +34,33 @@ _BANK: Dict[str, Tuple[str, ...]] = {}
 
 
 @lru_cache(maxsize=None)
+def _index() -> Dict[str, Path]:
+    """文件名 -> 路径。重名立刻报错 —— 静默取到其中一个，改了另一个却不生效，
+    是最难查的那种问题。"""
+    found: Dict[str, Path] = {}
+    for path in sorted(PROMPT_DIR.rglob("*.txt")):
+        if path.stem in found:
+            raise ValueError(
+                f"提示词重名：{path} 与 {found[path.stem]} 都叫 {path.stem}.txt。"
+                f"加载按文件名进行，重名会取到哪一个是不确定的，请改名。")
+        found[path.stem] = path
+    return found
+
+
+@lru_cache(maxsize=None)
 def load(name: str) -> str:
-    """读取一个提示词模板。name 不带 .txt 后缀。"""
-    path = PROMPT_DIR / f"{name}.txt"
-    if not path.exists():
-        available = ", ".join(sorted(p.stem for p in PROMPT_DIR.glob("*.txt")))
-        raise FileNotFoundError(f"找不到提示词 {path}。当前可用：{available}")
+    """读取一个提示词模板。name 不带 .txt 后缀，也不带目录 —— 按文件名查找，
+    所以在 prompts/ 下怎么分目录都不影响调用点。"""
+    path = _index().get(name)
+    if path is None:
+        raise FileNotFoundError(
+            f"找不到提示词 {name}.txt。当前可用：{', '.join(sorted(_index()))}")
     return path.read_text(encoding="utf-8").strip()
+
+
+def path_of(name: str) -> Path:
+    """提示词的实际路径，用于给用户指路（「改 prompts/xxx/yyy.txt」）。"""
+    return _index()[name]
 
 
 @lru_cache(maxsize=None)

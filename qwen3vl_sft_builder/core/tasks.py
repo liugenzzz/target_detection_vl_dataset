@@ -64,6 +64,8 @@ class Ctx:
     # {类别名: [易混的类别名]}。拒答样本挑「图里有卡车，问有没有货车」这种，
     # 比从 347 类里随机抽一个不相干的东西有价值得多。
     confusable: Dict[str, List[str]] = field(default_factory=dict)
+    # {类别名: [与它互为上下位的类别名]}。拒答样本必须避开，见 hypernyms_of。
+    hypernym: Dict[str, List[str]] = field(default_factory=dict)
     # 本张图已经被出过样本的框。同一个目标出多条样本时，答案 bbox 完全相同，
     # 只是问法不同，属于近重复数据 —— 实测同一个框曾在一张图里被出了 4 次。
     used: set = field(default_factory=set)
@@ -81,11 +83,22 @@ class Ctx:
         return self.raw_counts.get(label, kept) == kept
 
     def confusable_with(self, labels) -> List[str]:
-        """跟这些类别容易混的类别名。用于挑 hard negative。"""
+        """跟这些类别容易混、但【不是】上下位关系的类别名。用于挑 hard negative。"""
         out = []
         for l in labels:
             out += self.confusable.get(l, [])
         return sorted(set(out))
+
+    def hypernyms_of(self, labels) -> set:
+        """与这些类别互为上下位的类别名（名字互相包含）。
+
+        拒答样本必须避开它们：图里有遮阳三轮车，问「有没有三轮车」答「没有」
+        是错的 —— 遮阳三轮车本来就是三轮车。
+        """
+        out = set()
+        for l in labels:
+            out |= set(self.hypernym.get(l, ()))
+        return out
 
     def mw(self, label: str) -> str:
         """该类别的量词。船「艘」、车「辆」、人「名」；查不到退回「个」。"""
@@ -423,8 +436,12 @@ def exist_negative(ctx: Ctx):
             a = prompts.render_choice("exist_yes_vague", ctx.rng, label=label)
         polarity, hard = "positive", False
     else:
-        hard_pool = [l for l in ctx.confusable_with(present) if l not in present]
-        pool = hard_pool or [l for l in ctx.all_labels if l not in present]
+        # 上下位词要从【整个】拒答池里排掉，不只是难负样本那一路：
+        # 图里有遮阳三轮车，问「有没有三轮车」答「没有」是错的，
+        # 随机兜底那一路照样会抽到它。
+        banned = set(present) | ctx.hypernyms_of(present)
+        hard_pool = [l for l in ctx.confusable_with(present) if l not in banned]
+        pool = hard_pool or [l for l in ctx.all_labels if l not in banned]
         if not pool:
             return None
         label = ctx.rng.choice(sorted(pool))

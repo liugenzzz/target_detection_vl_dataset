@@ -8,3 +8,7 @@ config/local.yaml
 # 构建产物
 output/
 *.jsonl
+
+# 样本预览是刻意进版本控制的：拉下来就能看各任务长什么样，
+# 不用先跑一遍构建。由 scripts/export_samples.py 生成。
+!samples/preview.jsonl
