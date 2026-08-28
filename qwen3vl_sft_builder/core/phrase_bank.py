@@ -138,6 +138,7 @@ def install(cfg) -> Dict[str, int]:
             required = prompts.placeholders_of(name)
             forbidden = prompts.forbidden_of(name) + glob
             optional = prompts.optional_group_of(name)
+            cap = prompts.max_len_of(name, max_len)
             req_any = prompts.required_any_of(name)
         except FileNotFoundError:
             # 池子对应的 .txt 已经删了（任务下线），整组跳过
@@ -146,7 +147,7 @@ def install(cfg) -> Dict[str, int]:
         good: List[str] = []
         for line in phrases:
             line = sanitize(line)
-            if accept(name, line, required, max_len, good, forbidden,
+            if accept(name, line, required, cap, good, forbidden,
                       optional, req_any):
                 good.append(line)
         if good:

@@ -112,6 +112,23 @@ def forbidden_of(name: str) -> Tuple[str, ...]:
     return tuple(dict.fromkeys(words))
 
 
+def max_len_of(name: str, default: int) -> int:
+    """该问法池的字数上限，写在文件里形如 `#! max-len: 45`。
+
+    定位指令天然短（「框出图中的卡车。」），描述问句天然长 —— 它要把外观、
+    方位、周边三样都点出来才问得明白。一个全局上限套所有池子，要么把描述
+    问句全判掉，要么把定位指令放成三十字的长句。
+    """
+    for ln in load(name).splitlines():
+        ln = ln.strip()
+        if ln.startswith("#!") and "max-len:" in ln:
+            try:
+                return int(ln.split("max-len:", 1)[1].split()[0])
+            except (ValueError, IndexError):
+                raise ValueError(f"{name}.txt 的 `#! max-len:` 后面要跟一个整数：{ln}")
+    return default
+
+
 def optional_group_of(name: str) -> Tuple[str, ...]:
     """取一个问法池的「可整组省略」的占位符，写在文件里形如：
 

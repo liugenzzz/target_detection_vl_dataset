@@ -26,8 +26,12 @@ _BOX_JSON = re.compile(r'\{.*"bbox_2d".*\}|\[\s*\{.*"bbox_2d".*\}\s*\]', re.DOTA
 
 
 def _boxes_in(answer: str) -> List[Tuple[str, Tuple[int, ...]]]:
-    """从一条答案里抠出 (label, bbox) 列表。不是框答案就返回空。"""
-    text = answer.strip()
+    """从一条答案里抠出 (label, bbox) 列表。不是框答案就返回空。
+
+    答案可能带 ```json 代码块包裹（output.wrap_json_in_code_block），先剥掉。
+    """
+    text = re.sub(r"^```(?:json)?|```$", "", answer.strip(),
+                  flags=re.MULTILINE).strip()
     if not text.startswith(("{", "[")):
         return []
     try:

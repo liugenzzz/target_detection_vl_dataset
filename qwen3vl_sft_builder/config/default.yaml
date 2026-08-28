@@ -243,3 +243,12 @@ output:
   # metadata 训练时用不到，但筛数据全靠它（按 task_type 挑任务、按 is_main_line
   # 挑主线、按 answer_format 挑短答案）。设 false 只影响落盘，构建全程照常使用。
   include_metadata: true
+  # 坐标答案要不要用 ```json 代码块包起来。
+  # Qwen3-VL 基座自带这个习惯 —— 直接问它「框出图中全部的轿车」，返回的是
+  #     ```json
+  #     [{"bbox_2d": [494, 709, 530, 819], "label": "轿车"}]
+  #     ```
+  # false（默认）裸 JSON，省 token，下游 json.loads 直接能解析
+  # true         带包裹，与基座输出一致，已有解析器不用改
+  # 训练会把数据里的格式教给模型，两种都行 —— 按你下游解析器来定。
+  wrap_json_in_code_block: false

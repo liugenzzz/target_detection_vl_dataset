@@ -461,6 +461,9 @@ def _parse_scene_json(text: str) -> Optional[Dict[int, Dict[str, str]]]:
             "attribute": str(item.get("attribute") or "").strip(),
             "color": str(item.get("color") or "").strip(),
             "description": str(item.get("description") or "").strip(),
+            # 第三轮的问句由模型和 description 成对生成 —— 问句问了哪几样、
+            # 答句就答哪几样。模型没给就回落 ask_describe 问法池。
+            "describe_q": str(item.get("describe_q") or "").strip(),
             "questions": questions,
         }
     return out or None

@@ -403,7 +403,8 @@ def test_every_pool_passes_its_own_rules():
         seeds = prompts.load_variants(name)
         assert forbidden, f"{name} 没写 #! forbid，语义闸是空的"
         for v in seeds:
-            assert phrase_bank.accept(name, v, required, 30, [], forbidden,
+            cap = prompts.max_len_of(name, 30)
+            assert phrase_bank.accept(name, v, required, cap, [], forbidden,
                                       optional, req_any), \
                 f"{name} 自己的种子 {v!r} 过不了自己的规则"
 
@@ -936,6 +937,92 @@ def test_output_options_are_honoured():
         assert "metadata" in json.loads(Path(path).read_text(encoding="utf-8"))
     finally:
         os.unlink(path)
+
+
+
+
+# ------------------------------------------------- 问答要对得上、不能宽泛
+
+def test_box_answer_questions_must_ask_for_a_box():
+    """答案是坐标的问句必须明说要框/坐标。「这辆自行车在哪？」既可以答
+    「在画面左下角」也可以答一个 bbox —— 两种答案都成立，而训练数据只给了
+    其中一种，等于在教模型猜。"""
+    import prompts
+    from core import phrase_bank
+    for name in ("ground_unique", "inv_ask_box", "detect_class", "ground_attribute"):
+        req = prompts.required_any_of(name)
+        forbid = prompts.forbidden_of(name)
+        assert req, f"{name} 没声明 require-any，宽泛问法拦不住"
+        for w in ("在哪", "什么位置"):
+            assert w in forbid, f"{name} 的 forbid 里缺「{w}」"
+        for v in prompts.load_variants(name):
+            assert any(k in v for k in req), f"{name} 的种子没说要框：{v}"
+            assert not any(w in v for w in forbid), f"{name} 的种子命中禁用词：{v}"
+        # 宽泛问法要被拦下
+        assert not phrase_bank.accept(name, "那辆车在哪？", prompts.placeholders_of(name),
+                                      30, [], forbid, prompts.optional_group_of(name), req)
+
+
+def test_describe_question_names_what_it_wants():
+    """答案里有外观、方位、周边三样，问句就得把这三样点出来。
+    「介绍一下这辆自行车」——中文里「介绍」是说牌子型号价格，问的和答的
+    不是一回事；「描述该区域的内容」太空泛，答成什么样都算对。"""
+    import prompts
+    assert "介绍" in prompts.forbidden_of("ask_describe")
+    for v in prompts.load_variants("ask_describe"):
+        assert any(w in v for w in ("方位", "周围", "旁边", "周边", "附近", "环境")), \
+            f"没点明要方位/周边：{v}"
+        assert any(w in v for w in ("外观", "长什么样", "什么样子", "颜色", "特征")), \
+            f"没点明要外观：{v}"
+
+
+def test_model_written_describe_question_is_gated():
+    """模型和 description 成对写的问句优先用 —— 同一次调用写出来的，问答对得上。
+    但它写飘了（宽泛、跑去问坐标、太短）就得回落模板池，不能直接进数据。"""
+    from core.tasks import _describe_question
+    ctx = _ctx_with_filtered([_Box(0, "卡车")], {"卡车": 1})
+    ctx.forbid_chat = ("诶", "帮我")
+
+    good = "描述这辆卡车的外观、所在方位，以及它旁边有什么。"
+    ctx.vlm[0]["describe_q"] = good
+    assert _describe_question(ctx, ctx.boxes[0]) == good
+
+    for bad in ("介绍一下这辆卡车。",          # 「介绍」问的不是外观方位
+                "这辆卡车在哪？",              # 宽泛，而且答案不是坐标
+                "给出这辆卡车的坐标。",        # 跑去问坐标了，答案却是描述
+                "描述。",                      # 太短
+                "帮我说说这辆卡车呗。"):       # 闲聊腔
+        ctx.vlm[0]["describe_q"] = bad
+        got = _describe_question(ctx, ctx.boxes[0])
+        assert got != bad, f"这句本该被拦下：{bad}"
+        assert got in [v.format(mw="辆", label="卡车")
+                       for v in __import__("prompts").load_variants("ask_describe")]
+
+
+
+
+def test_json_fence_option_and_consistency_still_parses():
+    """Qwen3-VL 基座输出坐标时自带 ```json 包裹。数据可以跟着包、也可以不包，
+    但一致性核对必须两种都读得懂 —— 否则开了包裹之后核对静默失效，
+    永远报 0 冲突。"""
+    import json, random
+    from core.tasks import _j, ground_unique
+    from core import consistency
+    assert _j({"a": 1}) == '{"a":1}'
+    assert _j({"a": 1}, fence=True).startswith("```json")
+
+    ctx = _ctx_with_filtered([_Box(0, "卡车")], {"卡车": 1})
+    ctx.json_fence = True
+    out = ground_unique(ctx)
+    answer = out["conversations"][1]["value"]
+    assert answer.startswith("```json") and answer.rstrip().endswith("```")
+    assert json.loads(answer.strip().strip("`").removeprefix("json"))["label"] == "卡车"
+
+    # 一致性核对剥得掉包裹
+    sample = {"images": ["a.jpg"], "metadata": {"task_type": "ground_unique"},
+              "conversations": [{"from": "human", "value": "问。"},
+                                {"from": "gpt", "value": answer}]}
+    assert consistency.claims_of(sample)["boxes"], "带包裹的框答案没被解析出来"
 
 
 

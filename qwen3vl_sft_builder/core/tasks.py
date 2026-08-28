@@ -61,6 +61,9 @@ class Ctx:
     # 语体禁用词（config 的 phrase_banks.forbid_global）。ground_attribute 的问句
     # 是 VLM 按图现场生成的，不走问法库，那道闸管不到它 —— 这里现场过一遍。
     forbid_chat: tuple = ()
+    # 坐标【答案】要不要用 ```json 包起来。问句里出现的坐标不受影响 ——
+    # 那是指向目标的记号，不是模型要输出的东西。
+    json_fence: bool = False
     # {类别名: [易混的类别名]}。拒答样本挑「图里有卡车，问有没有货车」这种，
     # 比从 347 类里随机抽一个不相干的东西有价值得多。
     confusable: Dict[str, List[str]] = field(default_factory=dict)
@@ -105,8 +108,19 @@ class Ctx:
         return self.measure_words.get(label, "个")
 
 
-def _j(v) -> str:
-    return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+# 坐标答案要不要用 ```json 代码块包起来。
+# Qwen3-VL 基座模型自带这个习惯 —— 直接问它「框出图中全部的轿车」，
+# 返回的是 ```json\n[...]\n```。训练数据用裸 JSON 会把这个习惯覆盖掉，
+# 用代码块则是顺着基座的既有行为练。两种都能用，取决于下游解析器：
+#   false（默认）  裸 JSON，省 token，解析器直接 json.loads 即可
+#   true           带 ```json 包裹，与基座输出一致，已有解析器不用改
+# 由 config 的 output.wrap_json_in_code_block 控制。
+JSON_FENCE = "```json\n{body}\n```"
+
+
+def _j(v, fence: bool = False) -> str:
+    body = json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+    return JSON_FENCE.format(body=body) if fence else body
 
 
 def _box_of(ctx: Ctx, b) -> Dict[str, Any]:
@@ -173,6 +187,32 @@ def ground_unique(ctx: Ctx):
                                                     label=b.label))
 
 
+def _describe_question(ctx: Ctx, b) -> str:
+    """第三轮「描述这个目标」的问句。
+
+    优先用 VLM 和 description 成对生成的那一句 —— 同一次调用里写出来的，
+    问句问了哪几样、答句就答哪几样，对得上。模板池是各写各的，
+    问「介绍一下这辆自行车」而答颜色方位这种问答脱节就是这么来的。
+
+    模型没给、或给的那句自己就不合格（宽泛、跑去问坐标）时回落模板池。
+    """
+    q = (ctx.vlm.get(b.index) or {}).get("describe_q", "")
+    if q and _describe_q_ok(ctx, q):
+        return q
+    return prompts.render_choice("ask_describe", ctx.rng,
+                                 mw=ctx.mw(b.label), label=b.label)
+
+
+def _describe_q_ok(ctx: Ctx, q: str) -> bool:
+    """模型写的描述问句合不合格。用问法池自己那套闸来判 ——
+    手写种子过得了的规则，模型写的也得过。"""
+    if not register.is_instruction(q, ctx.forbid_chat):
+        return False
+    if any(w in q for w in prompts.forbidden_of("ask_describe")):
+        return False
+    return 8 <= len(q) <= prompts.max_len_of("ask_describe", 45)
+
+
 def _main_line(ctx: Ctx, b, question: str, extra=None):
     """组装一条主线样本：指代 -> 框 -> 描述。
 
@@ -182,10 +222,9 @@ def _main_line(ctx: Ctx, b, question: str, extra=None):
     desc = _describe(ctx, b)
     if ctx.require_desc and not desc:
         return None
-    pairs = [(_ask(ctx, question, box_answer=True), _j(_box_of(ctx, b)))]
+    pairs = [(_ask(ctx, question, box_answer=True), _j(_box_of(ctx, b), ctx.json_fence))]
     if desc:
-        pairs.append((prompts.render_choice("ask_describe", ctx.rng,
-                                            mw=ctx.mw(b.label), label=b.label), desc))
+        pairs.append((_describe_question(ctx, b), desc))
     out = {"conversations": _turns(*pairs), "focus": [b.index], "label": b.label}
     if extra:
         out.update(extra)
@@ -235,11 +274,10 @@ def inventory_locate(ctx: Ctx):
         (prompts.render_choice("inv_ask_what", ctx.rng),
          prompts.render_choice("inv_answer_what", ctx.rng, listing=listing)),
         (prompts.render_choice("inv_ask_box", ctx.rng, mw=ctx.mw(label), label=label),
-         _j(_box_of(ctx, box))),
+         _j(_box_of(ctx, box), ctx.json_fence)),
     ]
     if desc:
-        pairs.append((prompts.render_choice("ask_describe", ctx.rng,
-                                            mw=ctx.mw(label), label=label), desc))
+        pairs.append((_describe_question(ctx, box), desc))
     return {"conversations": _turns(*pairs), "focus": [box.index], "label": label,
             "inventory": [f"{l}x{n}" for l, n in inventory]}
 
@@ -295,7 +333,7 @@ def detect_class(ctx: Ctx):
     return {"conversations": _turns(
                 (_ask(ctx, prompts.render_choice("detect_class", ctx.rng, label=label),
                       box_answer=True),
-                 _j([_box_of(ctx, b) for b in boxes]))),
+                 _j([_box_of(ctx, b) for b in boxes], ctx.json_fence))),
             "focus": [b.index for b in boxes], "label": label, "n_boxes": len(boxes)}
 
 

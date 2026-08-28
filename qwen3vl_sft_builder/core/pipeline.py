@@ -80,6 +80,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     all_labels = sorted(table.id2name.values())
     image_style = str(cfg.get_path("output.image_path_style", "filename"))
     include_meta = bool(cfg.get_path("output.include_metadata", True))
+    json_fence = bool(cfg.get_path("output.wrap_json_in_code_block", False))
     # 名称维度的易混表，供 exist_negative 挑 hard negative。
     # 【剔除上下位词】：图里有遮阳三轮车，问「有没有三轮车」答「没有」是错的。
     # 剩下的是一字之差的并列类别（切管器 vs 切管机），答「没有」才成立。
@@ -179,7 +180,8 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                            measure_words=measure_words, require_desc=require_desc,
                            used=used, min_desc_len=min_desc_len,
                            raw_counts=sc["raw_counts"], forbid_chat=forbid_chat,
-                           confusable=confusable, hypernym=hypernym)
+                           confusable=confusable, hypernym=hypernym,
+                          json_fence=json_fence)
 
             # strict：只试欠账最多的那一个，补不上就空过这个槽位，配比一分不歪。
             # fill：往下顺延，优先填满槽位，配比会偏。数据量的瓶颈从来不在

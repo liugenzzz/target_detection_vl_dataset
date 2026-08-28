@@ -63,6 +63,7 @@ def expand(client: VlmClient, name: str, target: int, batch: int,
     forbidden = prompts.forbidden_of(name) + forbid_global
     require_any = prompts.required_any_of(name)
     optional = prompts.optional_group_of(name)
+    max_len = prompts.max_len_of(name, max_len)
     purpose = prompts.comment_of(name) or f"图片问答对话里的一句话（{name}）"
     seen = list(seeds)
     fresh: list[str] = []
