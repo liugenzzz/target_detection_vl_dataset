@@ -190,7 +190,8 @@ def load_jsonl(path: Path) -> List[Dict[str, Any]]:
 
 def dump_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> int:
     n = 0
-    with path.open("w", encoding="utf-8") as f:
+    # newline="\n"：见 pipeline._write_jsonl 的说明
+    with path.open("w", encoding="utf-8", newline="\n") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
             n += 1

@@ -753,12 +753,20 @@ def test_review_resolves_bare_filenames(tmp_path=None):
 def test_review_cache_is_isolated_per_role():
     """质检的缓存键是问答对的哈希，构建用的是 bbox —— 同一个键空间会撞。
     分子目录后，换质检模型只想重跑质检，删一个目录就行。"""
+    import shutil, tempfile
     from config import Config
     from core.vlm_client import VlmClient
-    cfg = Config({"vlm": {"api_url": "http://a/v1/c", "model": "m",
-                          "cache_dir": "/tmp/_c"}})
-    assert str(VlmClient(cfg).cache_dir) == "/tmp/_c"
-    assert str(VlmClient(cfg, role="review").cache_dir) == "/tmp/_c/review"
+    # 用临时目录：VlmClient 会真的把 cache_dir 建出来，写死 "/tmp/_c" 在
+    # Windows 上会在 C:\ 根下留垃圾目录。路径也要按 Path 比，不能按字符串 ——
+    # Windows 的分隔符是反斜杠，字符串比较必然失败。
+    root = Path(tempfile.mkdtemp())
+    try:
+        cfg = Config({"vlm": {"api_url": "http://a/v1/c", "model": "m",
+                              "cache_dir": str(root)}})
+        assert VlmClient(cfg).cache_dir == root
+        assert VlmClient(cfg, role="review").cache_dir == root / "review"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_review_summary_reports_by_task():
@@ -899,6 +907,35 @@ def test_every_task_has_its_own_prompt_dir():
     assert not missing, f"这些任务没有自己的提示词目录：{sorted(missing)}"
     shared = {d for d in dirs if d.startswith("_")}
     assert shared == {"_shared", "_vlm", "_tools"}, sorted(shared)
+
+
+
+
+def test_output_options_are_honoured():
+    """output.image_path_style / include_metadata 这两个配置项曾经在清理死代码时
+    被弄丢过 —— 配置文件里还写着，但没有任何代码在读，改了不生效也不报错。"""
+    from core.pipeline import _image_value, _write_jsonl
+    import json, tempfile, os
+    img = Path("data/images/a.jpg")
+    assert _image_value(img, "filename") == "a.jpg"
+    assert _image_value(img, "absolute") == str(img.resolve())
+    # relative 要把分隔符统一成正斜杠：Windows 上生成、Linux 上训练时，
+    # 反斜杠会被当成转义符
+    assert "\\" not in _image_value(img, "relative")
+
+    rows = [{"id": "x", "images": ["a.jpg"], "conversations": [],
+             "metadata": {"task_type": "t"}}]
+    fd, path = tempfile.mkstemp(suffix=".jsonl"); os.close(fd)
+    try:
+        _write_jsonl(Path(path), rows, include_meta=False)
+        got = json.loads(Path(path).read_text(encoding="utf-8"))
+        assert "metadata" not in got and got["id"] == "x"
+        # 摘 metadata 不能改坏传进来的对象 —— 后面还要用它算配比和一致性
+        assert "metadata" in rows[0]
+        _write_jsonl(Path(path), rows, include_meta=True)
+        assert "metadata" in json.loads(Path(path).read_text(encoding="utf-8"))
+    finally:
+        os.unlink(path)
 
 
 

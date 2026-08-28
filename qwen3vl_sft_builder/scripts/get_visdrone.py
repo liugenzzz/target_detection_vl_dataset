@@ -64,7 +64,7 @@ def convert(root: Path, out: Path) -> tuple[int, int, int]:
         W, H = read_image_size(img)
         n_img += 1
         lines = []
-        for line in ann.read_text().strip().splitlines():
+        for line in ann.read_text(encoding="utf-8").strip().splitlines():
             parts = [p for p in line.replace(" ", "").split(",") if p != ""]
             if len(parts) < 6:
                 continue
@@ -75,7 +75,8 @@ def convert(root: Path, out: Path) -> tuple[int, int, int]:
             lines.append(f"{cat - 1} {(x + w / 2) / W:.6f} {(y + h / 2) / H:.6f} "
                          f"{w / W:.6f} {h / H:.6f}")
             n_kept += 1
-        (labels_out / f"{ann.stem}.txt").write_text("\n".join(lines))
+        (labels_out / f"{ann.stem}.txt").write_text("\n".join(lines),
+                                             encoding="utf-8", newline="\n")
 
     (out / "classes.yaml").write_text(
         f"nc: {len(NAMES)}\nnames:\n" + "\n".join(f'  {i}: "{n}"' for i, n in enumerate(NAMES)),

@@ -235,5 +235,11 @@ split:
 
 output:
   format: sharegpt
-  image_path_style: filename          # filename | absolute | relative
+  # images 字段写什么：
+  #   filename（默认）  裸文件名，LLaMA-Factory 按它的 media_dir 拼
+  #   absolute          绝对路径，省掉配 media_dir 这一步
+  #   relative          原样保留配置里给的相对路径，分隔符统一成正斜杠
+  image_path_style: filename
+  # metadata 训练时用不到，但筛数据全靠它（按 task_type 挑任务、按 is_main_line
+  # 挑主线、按 answer_format 挑短答案）。设 false 只影响落盘，构建全程照常使用。
   include_metadata: true

@@ -78,6 +78,8 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     require_desc = bool(cfg.get_path("main_line_requires_description", True))
     min_desc_len = int(cfg.get_path("min_description_len", 18))
     all_labels = sorted(table.id2name.values())
+    image_style = str(cfg.get_path("output.image_path_style", "filename"))
+    include_meta = bool(cfg.get_path("output.include_metadata", True))
     # 名称维度的易混表，供 exist_negative 挑 hard negative。
     # 【剔除上下位词】：图里有遮阳三轮车，问「有没有三轮车」答「没有」是错的。
     # 剩下的是一字之差的并列类别（切管器 vs 切管机），答「没有」才成立。
@@ -198,7 +200,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
 
             sample = {
                 "id": f"{ann.stem}_{name}_{made[name]}",
-                "images": [ann.image_path.name],
+                "images": [_image_value(ann.image_path, image_style)],
                 "conversations": out["conversations"],
                 "metadata": {
                     "task_type": name,
@@ -235,8 +237,8 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
 
     # ---- 阶段四：按来源分组划分 ----
     train, val = _split_by_source(samples, cfg, seed)
-    _write_jsonl(output_dir / "train.jsonl", train)
-    _write_jsonl(output_dir / "val.jsonl", val)
+    _write_jsonl(output_dir / "train.jsonl", train, include_meta)
+    _write_jsonl(output_dir / "val.jsonl", val, include_meta)
 
     total = sum(made.values()) or 1
     # 跨任务一致性核对：同一张图，八个任务说出来的目标数量必须对得上
@@ -322,7 +324,28 @@ def _split_stats(train, val) -> Dict[str, Any]:
             "group_overlap": len(tg & vg)}
 
 
-def _write_jsonl(path: Path, rows) -> None:
-    with path.open("w", encoding="utf-8") as fh:
+def _image_value(image_path: Path, style: str) -> str:
+    """样本里 images 字段写什么。
+
+    filename（默认）  裸文件名，LLaMA-Factory 按 media_dir 拼
+    absolute          绝对路径，省掉配 media_dir 这一步
+    relative          原样保留配置里给的相对路径，分隔符统一成正斜杠 ——
+                      Windows 上生成、Linux 上训练时反斜杠会被当成转义符
+    """
+    if style == "absolute":
+        return str(image_path.resolve())
+    if style == "relative":
+        return str(image_path).replace("\\", "/")
+    return image_path.name
+
+
+def _write_jsonl(path: Path, rows, include_meta: bool = True) -> None:
+    """落盘。include_metadata=false 时把 metadata 摘掉 —— 训练用不到它，
+    但构建全程要用（校验、一致性核对、配比统计），所以只在最后这一步删。"""
+    # newline="\n"：Windows 上文本模式会把 \n 写成 \r\n，同一份配置在本地和
+    # 服务器上跑出来的 jsonl 字节不一致，diff 和校验和都对不上。
+    with path.open("w", encoding="utf-8", newline="\n") as fh:
         for row in rows:
+            if not include_meta:
+                row = {k: v for k, v in row.items() if k != "metadata"}
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
