@@ -154,7 +154,8 @@ def box_distribution(samples: Sequence[Dict[str, Any]], scale: int = 1000) -> Di
     }
 
 
-def answer_shape(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+def answer_shape(samples: Sequence[Dict[str, Any]],
+                 opening_kinds: Sequence[str] = ()) -> Dict[str, Any]:
     """答案侧的形态分布。问句多样性我们一直在盯，答案侧同样会退化 ——
     描述全是「位于画面左下角，一辆…」一个句式，模型学到的就是那个句式。"""
     texts, lens = [], []
@@ -180,6 +181,14 @@ def answer_shape(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         # 开头四个字最集中的几种。一种开头占比过高说明句式在退化
         "top_openings": {k: round(v / len(texts), 4)
                          for k, v in starts.most_common(5)} if texts else {},
+        # 判据：描述的起手方式由 prompts/desc_opening.txt 轮换（当前 N 种），
+        # 均匀的话每种约 1/N。最集中的一种超过 1/N 的两倍，说明模型没照着
+        # 轮换的要求写，而是退回了它自己熟悉的那个套路。
+        "opening_kinds": len(opening_kinds),
+        "opening_max_share": round(starts.most_common(1)[0][1] / len(texts), 4)
+                             if texts else 0.0,
+        "opening_ok": (starts.most_common(1)[0][1] / len(texts)
+                       <= 2.0 / max(1, len(opening_kinds))) if texts else True,
     }
 
 
@@ -202,12 +211,13 @@ def pope_balance(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def report(samples: Sequence[Dict[str, Any]], truth: Dict[str, set],
-           all_labels: Sequence[str], scale: int = 1000) -> Dict[str, Any]:
+           all_labels: Sequence[str], scale: int = 1000,
+           opening_kinds: Sequence[str] = ()) -> Dict[str, Any]:
     return {
         "samples": len(samples),
         "hallucination_chair": chair(samples, truth, all_labels),
         "class_coverage": coverage(samples, all_labels),
         "box_distribution": box_distribution(samples, scale),
-        "answer_shape": answer_shape(samples),
+        "answer_shape": answer_shape(samples, opening_kinds),
         "exist_balance": pope_balance(samples),
     }

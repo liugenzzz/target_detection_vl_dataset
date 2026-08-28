@@ -811,6 +811,44 @@ def test_needs_image_does_not_drag_down_the_core_score():
 
 
 
+
+def test_desc_opening_rotates_uniformly():
+    """固定的例子会把模型的句式钉在那几条上，十万条描述全是一个套路。
+    每张图换一种起手方式，各种句式才在整批数据里均匀铺开。"""
+    import random, prompts
+    from collections import Counter
+    rng = random.Random(0)
+    n = len(prompts.load_variants("desc_opening"))
+    got = Counter(prompts.pick_pair("desc_opening", rng)[0] for _ in range(2000))
+    assert len(got) == n, "有起手方式一次都没被抽到"
+    # 均匀：没有哪一种超过均值的 1.4 倍
+    assert max(got.values()) < 2000 / n * 1.4, got
+
+
+def test_desc_opening_format_is_enforced():
+    """池子里每行必须是「说明 ||| 示例」。少了分隔符会把整行当成说明塞进
+    提示词，示例位置留空 —— 模型拿不到样子，描述质量当场掉下去，而且不报错。"""
+    import prompts
+    for line in prompts.load_variants("desc_opening"):
+        assert prompts.SPLIT in line, f"缺分隔符：{line}"
+        rule, example = line.split(prompts.SPLIT, 1)
+        assert rule.strip() and example.strip(), line
+        assert len(example.strip()) >= 20, f"示例太短，起不到示范作用：{example}"
+
+
+def test_vlm_select_renders_with_rotating_opening():
+    import prompts
+    text = prompts.render("vlm_select", box_list="  [0] 卡车  位于 [1,2,3,4]",
+                          max_pick=3, opening_rule="先说位置。",
+                          opening_example="位于画面左下角，一辆卡车停在路边。")
+    assert "先说位置。" in text and "一辆卡车停在路边" in text
+    # 两个新占位符必须被填掉；提示词里 {{特征}} 这类是给模型看的示范，
+    # 渲染成 {特征} 是对的，不能一刀切地断言「没有大括号」
+    assert "{opening_rule}" not in text and "{opening_example}" not in text
+    assert "{box_list}" not in text and "{max_pick}" not in text
+
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

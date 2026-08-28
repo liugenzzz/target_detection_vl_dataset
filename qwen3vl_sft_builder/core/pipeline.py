@@ -121,9 +121,14 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         tasks = []
         for sc in scenes:
             ann, kept = sc["ann"], sc["kept"]
+            # 每张图换一种描述的起手方式。固定的例子会把模型的句式钉在那几条上，
+            # 十万条描述全是一个套路。轮换之后各种起手方式在整批数据里均匀铺开。
+            # 效果用 scripts/dataset_stats.py 的「答案开头集中度」验。
+            rule, example = prompts.pick_pair("desc_opening", rng)
             text = prompts.render("vlm_select",
                                   box_list=_box_list_text(kept, bbox2d_for(ann)),
-                                  max_pick=min(max_pick, len(kept)))
+                                  max_pick=min(max_pick, len(kept)),
+                                  opening_rule=rule, opening_example=example)
             tasks.append((ann.image_path, [ann.width, ann.height], "scene", text))
         vlm.prefetch(tasks)
 

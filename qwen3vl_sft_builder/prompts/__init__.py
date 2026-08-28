@@ -141,6 +141,23 @@ def render_choice(name: str, rng, **kwargs) -> str:
     return rng.choice(variants(name)).format(**kwargs)
 
 
+SPLIT = " ||| "
+
+
+def pick_pair(name: str, rng) -> Tuple[str, str]:
+    """从一个「说明 ||| 示例」的池子里随机取一条，返回 (说明, 示例)。
+
+    提示词里给固定的例子，模型会朝那几个例子的句式收敛 —— 例子越少收敛得越死。
+    每次调用换一条要求和示例，等于把「例子」这个变量本身也随机化了。
+    """
+    line = rng.choice(load_variants(name))
+    if SPLIT not in line:
+        raise ValueError(f"{name}.txt 的每一行都要写成「说明{SPLIT}示例」，"
+                         f"这一行没有分隔符：{line}")
+    rule, example = line.split(SPLIT, 1)
+    return rule.strip(), example.strip()
+
+
 def render(name: str, **kwargs) -> str:
     """读取并填充占位符。缺占位符会明确报错，不静默出错。"""
     template = load(name)

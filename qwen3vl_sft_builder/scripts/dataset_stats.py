@@ -30,6 +30,7 @@ from config import load_config                   # noqa: E402
 from core.cli import _cli                        # noqa: E402
 from core import review, stats                   # noqa: E402
 from core.classes import load_class_table        # noqa: E402
+import prompts                                  # noqa: E402
 from core.yolo import iter_annotations           # noqa: E402
 
 
@@ -58,7 +59,8 @@ def main() -> int:
         truth[ann.image_path.name] |= {b.label for b in ann.boxes}
 
     rep = stats.report(samples, dict(truth), sorted(table.id2name.values()),
-                       int(cfg.get_path("coords.scale", 1000)))
+                       int(cfg.get_path("coords.scale", 1000)),
+                       prompts.load_variants("desc_opening"))
     dst = args.out or src.with_name("dataset_stats.json")
     dst.write_text(json.dumps(rep, ensure_ascii=False, indent=2), encoding="utf-8")
     _print(rep, src, dst)
@@ -110,7 +112,14 @@ def _print(r, src, dst) -> None:
         print("  开头四个字最集中的：")
         for k, v in a["top_openings"].items():
             print(f"    {k!r:12s} {v:>6.1%}  {_bar(v * 3)}")
-        print("    一种开头占比过高说明句式在退化")
+        n = a.get("opening_kinds") or 1
+        mark = "✓" if a.get("opening_ok") else "✗"
+        print(f"    {mark} 起手方式由 prompts/desc_opening.txt 轮换 {n} 种，"
+              f"均匀的话每种约 {1 / n:.1%}；最集中的一种占 "
+              f"{a.get('opening_max_share', 0):.1%}")
+        if not a.get("opening_ok"):
+            print("      超过均值两倍 —— 模型没照着轮换的要求写，退回了它自己的套路。")
+            print("      改 prompts/desc_opening.txt 把要求写得更硬，或换个描述能力更强的模型。")
 
     e = r["exist_balance"]
     if e:
