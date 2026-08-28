@@ -46,10 +46,25 @@ HUE_BANDS: Dict[str, Tuple[Tuple[float, float], ...]] = {
     "金": ((35, 60),),
 }
 
-# 高于这个饱和度就认为「明显有颜色」，说白/黑/灰/银就站不住
-SAT_CHROMATIC = 0.45
+# 高于这个【彩度】就认为「明显有颜色」，说白/黑/灰/银就站不住。
+#
+# 用 S×V 而不是单看 S。HSV 圆锥里彩度约等于 S×V，两者必须一起看：
+# 实测踩到 (色相 95°, S=0.47, V=0.39) —— 一块昏暗的偏绿区域（小框套在草地边上
+# 取到了背景），单看 S=0.47 就判成「明显有颜色」，把正确的「白色」误杀了；
+# 而真正该拦的蓝色卡车是 (219°, S=0.85, V=0.78)。
+# 前者 S×V=0.18，后者 0.66 —— 差了三倍多，用彩度一刀就分开了。
+CHROMA_CHROMATIC = 0.35
 # 低于这个饱和度就认为「基本没颜色」，说红/蓝/绿就站不住
 SAT_ACHROMATIC = 0.12
+
+# 【明度不在这个区间就不判】。HSV 的饱和度在明暗两端都不可靠：
+#   太暗：近黑的像素 (20,10,15) 算出来 S=0.5，但它感官上就是黑的。
+#         航拍图里阴影、深色车顶一大片落在这里，按饱和度判会把「白色」「银灰色」
+#         这类正确说法大量误杀 —— 实测丢弃率因此虚高到 25%。
+#   太亮：过曝的高光区 RGB 都贴近 255，色相是噪声。
+# 这两种情况一律放行，交给质检模型去看。
+VALUE_MIN = 0.25
+VALUE_MAX = 0.95
 
 
 def color_word(text: str) -> Optional[str]:
@@ -108,11 +123,13 @@ def conflicts(claimed: str, hsv: Optional[Tuple[float, float, float]]) -> bool:
     word = color_word(claimed)
     if word is None or hsv is None:
         return False
-    hue, sat, _val = hsv
+    hue, sat, val = hsv
+    if not VALUE_MIN <= val <= VALUE_MAX:
+        return False        # 太暗或过曝，颜色量不准，不判
 
     if word in ACHROMATIC:
         # 说白/黑/灰/银，却量到明显的颜色
-        return sat >= SAT_CHROMATIC
+        return sat * val >= CHROMA_CHROMATIC
 
     bands = HUE_BANDS.get(word)
     if not bands:

@@ -1149,6 +1149,36 @@ def test_prompt_forbids_inventing_details():
 
 
 
+
+def test_color_check_does_not_judge_dark_or_blown_regions():
+    """HSV 的饱和度在明暗两端都不可靠：近黑的像素 (20,10,15) 算出来 S=0.5，
+    但它感官上就是黑的。航拍图里阴影、深色车顶一大片落在这里 ——
+    实测因此把「白色」「银灰色」这类正确说法误杀，丢弃率虚高到 25%。"""
+    from core import colorcheck
+    dark_but_saturated = (337, 0.63, 0.20)      # 实测踩到的：几乎全黑
+    assert not colorcheck.conflicts("银灰色", dark_but_saturated)
+    assert not colorcheck.conflicts("白色", dark_but_saturated)
+    blown = (95, 0.5, 0.98)                     # 过曝，色相是噪声
+    assert not colorcheck.conflicts("白色", blown)
+    # 明度正常时照常判
+    normal = (219, 0.85, 0.60)
+    assert colorcheck.conflicts("白色", normal)
+
+
+def test_color_check_uses_chroma_not_saturation_alone():
+    """饱和度要和明度一起看。实测踩到 (95°, S=0.47, V=0.39) —— 一块昏暗的偏绿
+    区域（小框套在草地边上取到了背景），单看 S=0.47 就判成「明显有颜色」，
+    把正确的「白色」误杀了。真正该拦的蓝卡车是 (219°, S=0.85, V=0.78)，
+    S×V 一个 0.18 一个 0.66，用彩度一刀就分开了。丢弃率 25% -> 12.9%。"""
+    from core import colorcheck
+    dim_green = (95, 0.47, 0.39)
+    blue_truck = (219, 0.85, 0.78)
+    assert dim_green[1] > colorcheck.SAT_ACHROMATIC     # 单看饱和度会误判
+    assert not colorcheck.conflicts("白色", dim_green), "昏暗偏绿不该拦白色"
+    assert colorcheck.conflicts("白色", blue_truck), "鲜蓝色必须拦下白色"
+
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

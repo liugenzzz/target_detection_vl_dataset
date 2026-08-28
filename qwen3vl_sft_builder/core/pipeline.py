@@ -80,6 +80,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     all_labels = sorted(table.id2name.values())
     color_gate = bool(cfg.get_path("quality.verify_color_with_pixels", True))
     color_stats = Counter()
+    color_dropped: List[Dict[str, Any]] = []      # 抽样留证，进构建报告
     image_style = str(cfg.get_path("output.image_path_style", "filename"))
     include_meta = bool(cfg.get_path("output.include_metadata", True))
     json_fence = bool(cfg.get_path("output.wrap_json_in_code_block", False))
@@ -160,7 +161,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         # 判据刻意宽松，只拦明显冲突。
         if color_gate:
             color_stats["checked"] += _drop_bad_colors(
-                ann, kept, vlm_info, color_stats)
+                ann, kept, vlm_info, color_stats, color_dropped)
         used: set = set()          # 本图已出过样本的框，避免同一目标反复出样本
         # 指代骨架按图算一次：全图唯一性校验需要看到该图全部目标
         label_counts = collections.Counter(b.label for b in kept)
@@ -285,7 +286,16 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         "question_variety": _question_variety(samples),
         # 像素核对颜色拦下了多少条。dropped 明显偏高说明模型看颜色不准，
         # 该换个视觉能力更强的模型，或者把 attribute_qa 的配比调低。
-        "color_check": dict(color_stats),
+        "color_check": {
+            **color_stats,
+            # 丢弃率高时（比如超过 20%）对着这几条打开原图看：
+            # 是模型真看错了，还是这道闸对你的数据太严。
+            # 后者就把 quality.verify_color_with_pixels 关掉。
+            "rate": round(sum(v for k, v in color_stats.items()
+                              if k.startswith("dropped"))
+                          / max(1, color_stats["checked"]), 4),
+            "examples": color_dropped[:15],
+        },
         "consistency": {"checked_images": consist["checked_images"],
                         "violations": len(consist["violations"]),
                         "detail": consist["violations"][:50]},
@@ -339,7 +349,7 @@ def _split_stats(train, val) -> Dict[str, Any]:
 
 
 
-def _drop_bad_colors(ann, kept, vlm_info, stats) -> int:
+def _drop_bad_colors(ann, kept, vlm_info, stats, samples_dropped) -> int:
     """把和像素明显冲突的颜色说法从 vlm_info 里摘掉，返回核对了几个目标。
 
     只摘颜色，不整条丢：模型可能颜色看错但位置、类别都对，
@@ -362,10 +372,18 @@ def _drop_bad_colors(ann, kept, vlm_info, stats) -> int:
                 hsv = colorcheck.sample_hsv(ann.image_path, px)
                 checked += 1
             if colorcheck.conflicts(claimed, hsv):
-                logger.debug("颜色对不上，丢弃 %s 的 %s=%r（实测 HSV %s）",
-                             ann.image_path.name, field, claimed, hsv)
                 info[field] = ""
                 stats[f"dropped_{field}"] += 1
+                # 留几条证据进报告。丢弃率高的时候光看数字判断不了是模型看错了
+                # 还是这道闸太严 —— 得能对着原图看具体是哪个框、说的什么颜色、
+                # 实测什么颜色。
+                if len(samples_dropped) < 30:
+                    samples_dropped.append({
+                        "image": ann.image_path.name, "label": b.label,
+                        "bbox_px": px, "field": field, "claimed": claimed,
+                        "measured_hsv": [round(hsv[0]), round(hsv[1], 2),
+                                         round(hsv[2], 2)],
+                    })
     return checked
 
 
