@@ -89,6 +89,9 @@ python scripts/build.py
 
 # 4. 全量质检：每条问答对让大模型对着原图核对一遍并打分
 python scripts/review.py
+
+# 5. 数据集体检：不调模型，纯离线的客观指标（几秒钟）
+python scripts/dataset_stats.py
 ```
 
 产出：
@@ -232,8 +235,13 @@ output/
 | `grounded` | 描述里说的东西图里是不是真有（编造参照物直接给 1 分） |
 | `clear` | 照着问句能不能唯一地找到那个目标；描述是否空泛 |
 | `instruction` | 问句是不是指令口吻 |
+| `needs_image` | 这道题必须看图才能答吗。「街景图里有没有潜水艇？」答「没有」不看图也知道，这种样本训不出东西 |
 
-**综合分取各维度的最小值，不取平均。** 一条描述编造了参照物（`grounded=1`）
+`needs_image` **不进综合分** —— 它衡量的是「这条样本有没有训练价值」，
+不是「这条样本对不对」。一条不看图也能答对的拒答样本并没有错，只是没用；
+该不该留由 `review.min_dimension` 单独卡，卡得比别的松。
+
+**其余四个维度取最小值作为综合分，不取平均。** 一条描述编造了参照物（`grounded=1`）
 但问句写得漂亮（`instruction=5`），平均下来还有 3 分多，照样进训练集。质检要看短板。
 
 ### 三件必须知道的事
@@ -261,6 +269,36 @@ vlm:
 
 质检的缓存自动落在 `<cache_dir>/review/` 子目录 —— 与构建的缓存键空间隔离，
 换质检模型只想重跑质检时删一个目录即可。
+
+---
+
+## 数据集体检（客观指标）
+
+`scripts/review.py` 是**主观**质检 —— 让大模型看图逐条打分。
+`scripts/dataset_stats.py` 是**客观**体检 —— 不调模型，纯离线统计，几秒钟跑完。
+
+两者互补，缺一不可。主观质检能发现「框住的是旁边那棵树」，客观体检发现不了；
+客观体检能发现下面这些**分布层面**的问题，而它们单看任何一条样本都是好的，
+主观质检逐条打分永远发现不了：
+
+| 指标 | 对标 | 抓什么 |
+|---|---|---|
+| `CHAIR_i` / `CHAIR_s` | CHAIR (Rohrbach 2018) | 答案里提到的类别有多少不在该图标注里。原版比对 COCO 标注，我们比对 YOLO 标注文件，思路相同且更严格 —— 标注文件就是真值 |
+| 类别覆盖率 + 基尼系数 | 长尾分析 | 347 个类别只练到 40 个，训出来的模型就只认那 40 个 |
+| 九宫格框分布 | — | 85% 的框挤在画面中央的话，模型学到的是「往中间猜」 |
+| `Distinct-2` / `Distinct-3` | Distinct-n (Li 2016) | 词汇多样性 |
+| 答案开头集中度 | — | 描述全是「位于画面…」一个句式，模型学到的就是那个句式 |
+| 正负比 + 难负样本率 | POPE (Li 2023) | 存在性问答失衡会让模型学成「一律答有」 |
+
+两个刻意的取舍：
+
+**CHAIR 只统计类别表里的词。** 描述里的「斑马线」「路灯杆」不在类别表中，
+无从判定真假，不计入。这会**低估**真实幻觉率，但绝不会误报 —— 一个客观指标
+出现假阳性比漏报更糟。
+
+**Distinct-n 在固定 2000 条子样本上算。** 原始 Distinct-n 有语料规模偏差：
+语料越大分母涨得比分子快，1 千条和 10 万条算出来必然是后者低，那是规模造成的、
+不是多样性真的下降。固定子样本量之后跨版本才可比。
 
 ---
 
@@ -556,9 +594,10 @@ core/         classes 类别表与易混检测 / coords 坐标换算 / yolo 标�
               difficulty 难度分级与配额 / grouping 来源分组 / referring 指代生成
               vlm_client 调 Qwen 服务 / builder 三轮样本组装 / pipeline 编排
               phrase_bank 扩充问法库的读写与校验
-              register 语体闸 / consistency 跨任务一致性 / review 质检
+              register 语体闸 / consistency 跨任务一致性
+              review 主观质检 / stats 客观体检
 scripts/      check_vlm.py 服务自检 / analyze.py 分布分析
-              review.py 全量质检打分
+              review.py 主观质检 / dataset_stats.py 客观体检
               build.py 构建 / preview.py 验证图
               build_measure_words.py 量词表 / build_phrase_banks.py 扩充问法库
               get_visdrone.py 下载测试数据集
@@ -566,7 +605,7 @@ tests/        回归测试，不依赖外部数据和 VLM 服务
 ```
 
 ```bash
-python tests/test_pipeline.py      # 61 项，服务器上部署后先跑这个
+python tests/test_pipeline.py      # 66 项，服务器上部署后先跑这个
 ```
 
 ---

@@ -939,6 +939,66 @@ def test_review_summary_reports_by_task():
 
 
 
+
+# --------------------------------------------------------- 客观体检指标
+
+def test_chair_counts_only_labels_in_the_table():
+    """CHAIR 只统计类别表里的词。描述里的「斑马线」「路灯杆」不在表中，
+    无从判定真假 —— 不计入。宁可低估幻觉率，也不能让客观指标出现假阳性。"""
+    from core import stats
+    labels = ["卡车", "人员", "直升机"]
+    rows = [{"images": ["a.jpg"], "conversations": [
+        {"from": "human", "value": "问。"},
+        {"from": "gpt", "value": "一辆卡车停在斑马线旁，旁边有一架直升机。"}]}]
+    out = stats.chair(rows, {"a.jpg": {"卡车"}}, labels)
+    # 提到卡车（对）和直升机（错）；斑马线不在表里，不算
+    assert out["mentions_total"] == 2 and out["mentions_wrong"] == 1
+    assert out["chair_i"] == 0.5 and out["chair_s"] == 1.0
+    assert out["top_hallucinated"] == {"直升机": 1}
+
+
+def test_chair_ignores_box_answers():
+    """框答案里的 label 直接来自标注文件，不是模型生成的，不该算进幻觉。"""
+    from core import stats
+    rows = [{"images": ["a.jpg"], "conversations": [
+        {"from": "human", "value": "问。"},
+        {"from": "gpt", "value": '{"bbox_2d":[1,2,3,4],"label":"直升机"}'}]}]
+    assert stats.chair(rows, {"a.jpg": {"卡车"}}, ["卡车", "直升机"])[
+        "mentions_total"] == 0
+
+
+def test_distinct_n_is_comparable_across_corpus_sizes():
+    """原始 Distinct-n 有语料规模偏差：语料越大分母涨得越快，
+    1 千条和 10 万条算出来必然是后者低 —— 那是规模造成的不是多样性下降。
+    固定子样本量之后跨版本才可比。"""
+    from core import stats
+    base = [f"这是第{i}条不一样的描述语句。" for i in range(500)]
+    small = stats.distinct_n(base, 2)
+    big = stats.distinct_n(base * 20, 2)          # 同样的内容，语料大 20 倍
+    assert abs(small - big) < 0.15, f"规模一变数就崩了：{small} vs {big}"
+
+
+def test_coverage_gini_flags_long_tail():
+    from core import stats
+    even = [{"metadata": {"label": l}} for l in ["a", "b", "c"] * 10]
+    skew = [{"metadata": {"label": "a"}}] * 29 + [{"metadata": {"label": "b"}}]
+    assert stats.coverage(even, ["a", "b", "c"])["gini"] < 0.05
+    assert stats.coverage(skew, ["a", "b", "c"])["gini"] > 0.4
+    assert stats.coverage(skew, ["a", "b", "c"])["never_used"] == ["c"]
+
+
+def test_needs_image_does_not_drag_down_the_core_score():
+    """needs_image 衡量的是「有没有训练价值」，不是「对不对」。
+    一条不看图也能答对的拒答样本并没有错，不该把综合分拉到 1。"""
+    from core import review
+    got = review.parse('{"reviews":[{"id":0,"correct":5,"grounded":5,"clear":5,'
+                       '"instruction":5,"needs_image":1}]}', 1)
+    assert got[0]["score"] == 5, got
+    # 但可以用单维度下限单独卡它
+    assert not review.verdict(got[0], 3, {"needs_image": 2})[0]
+
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

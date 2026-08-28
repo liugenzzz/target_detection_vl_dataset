@@ -170,7 +170,8 @@ def _print_summary(summary, scored, unscored, n_ok, n_bad, src, stem) -> None:
         print(f"    {k} 分  {v:5d}  {bar}")
     print("\n  各维度均值：")
     names = {"correct": "答案与图相符", "grounded": "描述没有编造",
-             "clear": "指代唯一/描述具体", "instruction": "问句是指令口吻"}
+             "clear": "指代唯一/描述具体", "instruction": "问句是指令口吻",
+             "needs_image": "必须看图才能答"}
     for dim, avg in summary["dimension_avg"].items():
         print(f"    {names.get(dim, dim):16s} {avg}")
     print("\n  按任务：")

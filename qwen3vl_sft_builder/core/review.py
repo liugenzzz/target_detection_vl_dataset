@@ -35,7 +35,11 @@ from .builder import IMAGE_TOKEN
 
 logger = logging.getLogger(__name__)
 
-DIMENSIONS = ("correct", "grounded", "clear", "instruction")
+DIMENSIONS = ("correct", "grounded", "clear", "instruction", "needs_image")
+
+# 综合分只看这几个维度的最小值。needs_image 不进综合分 —— 它衡量的是
+# 「这条样本有没有训练价值」，不是「这条样本对不对」。一条不看图也能答对的
+# 拒答样本并没有错，只是没用；该不该留由 review.min_dimension 单独卡。
 
 
 def render_samples(group: List[Dict[str, Any]]) -> str:
@@ -90,7 +94,8 @@ def parse(raw: str, n: int) -> Optional[Dict[int, Dict[str, Any]]]:
         if not scores:
             continue
         scores["issue"] = str(item.get("issue") or "").strip()
-        scores["score"] = min(scores[d] for d in DIMENSIONS if d in scores)
+        core_dims = [d for d in DIMENSIONS if d != "needs_image" and d in scores]
+        scores["score"] = min(scores[d] for d in core_dims) if core_dims else 3
         out[idx] = scores
     return out or None
 
