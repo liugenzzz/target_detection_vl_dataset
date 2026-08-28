@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import prompts                                   # noqa: E402
 from config import load_config
 from core.cli import _cli  # noqa: E402
-from core.vlm_client import _endpoints_from                   # noqa: E402
+from core.vlm_client import _diagnose, _endpoints_from, _parse_scene_json  # noqa: E402
 from core.yolo import IMAGE_EXTS                 # noqa: E402
 
 OK, BAD = "  [通过]", "  [失败]"
@@ -50,6 +50,8 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config")
     ap.add_argument("--image", help="测试用图片；不给则从 images_dir 里挑第一张")
+    ap.add_argument("--list-models", action="store_true",
+                    help="只列出这个 api_key 能用哪些模型，然后退出")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -63,6 +65,11 @@ def main() -> int:
         for ep in endpoints:
             print(f"  {ep.name}  model={ep.model}  concurrency={ep.concurrency}")
         print("=" * 66)
+    if args.list_models:
+        for ep in endpoints:
+            _list_models(ep, timeout)
+        return 0
+
     failed = []
     for ep in endpoints:
         if len(endpoints) > 1:
@@ -73,6 +80,38 @@ def main() -> int:
         print(f"\n{BAD} 模型池里这几路没通过：{'、'.join(failed)}")
         return 1
     return 0
+
+
+def _list_models(ep, timeout) -> None:
+    """列出这个 key 能用哪些模型。403「no access to model X」时最需要的就是这个 ——
+    不然只能靠猜模型名。"""
+    url = ep.api_url.split("/chat/completions")[0].rstrip("/") + "/models"
+    print(f"\n{ep.name}\n  GET {url}")
+    try:
+        import requests
+        headers = {"Authorization": f"Bearer {ep.api_key}"} if ep.api_key else {}
+        r = requests.get(url, headers=headers, timeout=timeout)
+    except Exception as exc:                                   # noqa: BLE001
+        print(f"  {BAD} 连不上：{exc}")
+        return
+    if r.status_code != 200:
+        print(f"  {BAD} HTTP {r.status_code}：{r.text[:300]}")
+        return
+    try:
+        names = sorted(str(m.get("id", "")) for m in r.json().get("data", []))
+    except (ValueError, AttributeError):
+        print(f"  {BAD} 返回结构不认识：{r.text[:300]}")
+        return
+    if not names:
+        print(f"  {BAD} 这个 key 一个模型都没有授权，找服务方开权限。")
+        return
+    print(f"  {OK} 可用模型 {len(names)} 个：")
+    for n in names:
+        mark = "  <- 当前 vlm.model" if n == ep.model else ""
+        print(f"      {n}{mark}")
+    if ep.model not in names:
+        print(f"\n  {BAD} 配置里的 vlm.model = {ep.model!r} 不在这个列表里，")
+        print("      把它改成上面某一个（改 config/local.yaml 或 $env:VLM_MODEL）。")
 
 
 def _check_one(ep, timeout, cfg, args) -> int:
@@ -94,8 +133,10 @@ def _check_one(ep, timeout, cfg, args) -> int:
         return 1
     if r.status_code != 200:
         print(f"{BAD} HTTP {r.status_code}：{r.text[:300]}")
-        print("\n  排查：401/403 -> api_key 不对；404 -> 路径不对（要带 /v1/chat/completions）；"
-              "\n        400 且提示 model -> model 名和服务上的对不上")
+        hint = _diagnose(r.status_code, r.text)
+        print("\n  " + (hint or "重试可能能过；持续失败就找服务方看日志。").replace("\n", "\n  "))
+        if r.status_code in (400, 403):
+            _list_models(ep, timeout)
         return 1
     try:
         print(f"{OK} {el:.2f}s，返回：{content_of(r.json())[:60]!r}")

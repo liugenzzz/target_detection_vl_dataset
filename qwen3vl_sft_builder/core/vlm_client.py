@@ -419,7 +419,15 @@ def _diagnose(status: int, body: str) -> Optional[str]:
                 "    Linux/Mac :  export VLM_API_KEY=sk-...\n"
                 "    或写进 config/local.yaml 的 vlm.api_key")
     if status == 403:
-        return "HTTP 403 无权访问：api_key 对但没有这个模型的权限，找服务方确认。"
+        # 403 和 401 是两回事：能返回这种结构化错误说明 key 有效、服务认得它，
+        # 只是这个 token 的授权范围里没有 vlm.model 指的那个模型。
+        # 网关（new-api / one-api 这类）按模型分组发 token，很常见。
+        return ("HTTP 403 无权访问：api_key 是【有效】的，但它没有 vlm.model "
+                "指定的那个模型的权限。\n"
+                "    要么模型名写错了，要么这个 key 的授权里没有这个模型。\n"
+                f"    服务返回：{snippet}\n"
+                "    先看这个 key 到底能用哪些模型：\n"
+                "        python scripts/check_vlm.py --list-models")
     if status == 404:
         return ("HTTP 404 路径不对：vlm.api_url 必须带完整路径，"
                 "形如 http://主机:端口/v1/chat/completions")
