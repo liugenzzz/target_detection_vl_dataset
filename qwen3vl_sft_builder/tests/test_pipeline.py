@@ -1088,7 +1088,7 @@ def test_color_gate_only_drops_the_colour_not_the_target():
     info = {0: {"color": "白色", "attribute": "白色车身",
                 "description": "一辆卡车。", "questions": ["框出卡车。"]}}
     stats = Counter()
-    _drop_bad_colors(_Ann(), [box], info, stats)
+    _drop_bad_colors(_Ann(), [box], info, stats, [])
     assert info[0]["color"] == "" and info[0]["attribute"] == ""
     assert stats["dropped_color"] == 1 and stats["dropped_attribute"] == 1
     # 其余字段原样保留 —— 目标本身没问题
