@@ -36,7 +36,7 @@ def _load_measure_words(cfg) -> Dict[str, str]:
         return {}
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return {str(k): str(v) for k, v in (data.get("measure_words") or {}).items()}
-from . import consistency, phrase_bank
+from . import colorcheck, consistency, phrase_bank
 from .vlm_client import VlmClient
 from .yolo import iter_annotations
 
@@ -78,6 +78,8 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     require_desc = bool(cfg.get_path("main_line_requires_description", True))
     min_desc_len = int(cfg.get_path("min_description_len", 18))
     all_labels = sorted(table.id2name.values())
+    color_gate = bool(cfg.get_path("quality.verify_color_with_pixels", True))
+    color_stats = Counter()
     image_style = str(cfg.get_path("output.image_path_style", "filename"))
     include_meta = bool(cfg.get_path("output.include_metadata", True))
     json_fence = bool(cfg.get_path("output.wrap_json_in_code_block", False))
@@ -152,6 +154,13 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         b2d = bbox2d_for(ann)
         vlm_info = vlm.scene_info(ann.image_path, [ann.width, ann.height],
                                  {b.index for b in kept})
+        # 【像素核对颜色】模型说「白色车身的卡车」而框落在蓝色卡车上时，
+        # 指代就指向了错误的目标，attribute_qa 更是直接答错。颜色能从像素量出来，
+        # 不该靠模型自觉。对不上就把这个颜色说法丢掉（其余字段照用），
+        # 判据刻意宽松，只拦明显冲突。
+        if color_gate:
+            color_stats["checked"] += _drop_bad_colors(
+                ann, kept, vlm_info, color_stats)
         used: set = set()          # 本图已出过样本的框，避免同一目标反复出样本
         # 指代骨架按图算一次：全图唯一性校验需要看到该图全部目标
         label_counts = collections.Counter(b.label for b in kept)
@@ -274,6 +283,9 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         # 问句去重率：不同问法 / 问句总数。这个数掉下来就说明问法在复读，
         # 模型会把问句当固定口令背下来而不是听懂要框什么。
         "question_variety": _question_variety(samples),
+        # 像素核对颜色拦下了多少条。dropped 明显偏高说明模型看颜色不准，
+        # 该换个视觉能力更强的模型，或者把 attribute_qa 的配比调低。
+        "color_check": dict(color_stats),
         "consistency": {"checked_images": consist["checked_images"],
                         "violations": len(consist["violations"]),
                         "detail": consist["violations"][:50]},
@@ -324,6 +336,37 @@ def _split_stats(train, val) -> Dict[str, Any]:
     return {"train": len(train), "val": len(val),
             "train_groups": len(tg), "val_groups": len(vg),
             "group_overlap": len(tg & vg)}
+
+
+
+def _drop_bad_colors(ann, kept, vlm_info, stats) -> int:
+    """把和像素明显冲突的颜色说法从 vlm_info 里摘掉，返回核对了几个目标。
+
+    只摘颜色，不整条丢：模型可能颜色看错但位置、类别都对，
+    那这个目标换个非颜色属性（「车头朝左」）照样能用。
+    """
+    boxes = {b.index: b for b in kept}
+    checked = 0
+    for idx, info in vlm_info.items():
+        b = boxes.get(idx)
+        if b is None:
+            continue
+        px = [int((b.cx - b.w / 2) * ann.width), int((b.cy - b.h / 2) * ann.height),
+              int((b.cx + b.w / 2) * ann.width), int((b.cy + b.h / 2) * ann.height)]
+        hsv = None
+        for field in ("color", "attribute"):
+            claimed = info.get(field) or ""
+            if colorcheck.color_word(claimed) is None:
+                continue          # 不是颜色说法，这道闸不管
+            if hsv is None:
+                hsv = colorcheck.sample_hsv(ann.image_path, px)
+                checked += 1
+            if colorcheck.conflicts(claimed, hsv):
+                logger.debug("颜色对不上，丢弃 %s 的 %s=%r（实测 HSV %s）",
+                             ann.image_path.name, field, claimed, hsv)
+                info[field] = ""
+                stats[f"dropped_{field}"] += 1
+    return checked
 
 
 def _image_value(image_path: Path, style: str) -> str:

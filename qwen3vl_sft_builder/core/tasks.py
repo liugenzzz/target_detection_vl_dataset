@@ -157,6 +157,42 @@ def _clean_attr(attr: str) -> str:
     return (attr or "").strip().rstrip("的") or (attr or "").strip()
 
 
+def _norm_attr(attr: str) -> str:
+    """属性归一化，用来判两个属性是不是「同一个说法」。
+
+    去掉不承载区分信息的虚词 —— 「穿白色上衣」和「白色上衣」指的是同一件事，
+    比字面相等要严，否则模型换个说法就绕过唯一性检查了。
+    """
+    out = _clean_attr(attr)
+    for w in ("穿着", "穿", "戴着", "戴", "身着", "正在", "正", "着", "的"):
+        out = out.replace(w, "")
+    return out.strip("，,、 ")
+
+
+def _attr_identifies(ctx: Ctx, b, attr: str) -> bool:
+    """这个属性能不能在【同类目标】里唯一指认 b。
+
+    实测踩到：一张公园图里好几个人都穿白上衣，VLM 给其中两个都写了
+    「穿白色上衣」，于是生成了两条问句几乎一样、答案却是不同框的样本 ——
+    同一个问题两个正确答案，模型只能学成随机猜。
+
+    包含关系也算不唯一：「白色上衣」和「白色上衣、黑色裤子」这两个说法，
+    前者同时匹配两个人，照样指不明确。
+    """
+    key = _norm_attr(attr)
+    if not key:
+        return False
+    for o in _same_label(ctx, b.label):
+        if o.index == b.index:
+            continue
+        other = _norm_attr((ctx.vlm.get(o.index) or {}).get("attribute", ""))
+        if not other:
+            continue
+        if key == other or key in other or other in key:
+            return False
+    return True
+
+
 def _same_label(ctx: Ctx, label: str) -> List:
     return [b for b in ctx.boxes if b.label == label]
 
@@ -203,12 +239,21 @@ def _describe_question(ctx: Ctx, b) -> str:
                                  mw=ctx.mw(b.label), label=b.label)
 
 
+# 描述问句必须点明要什么。只禁用词不够 —— 「这辆车在哪？」一个禁用词都不沾，
+# 但它宽泛得答什么都算对。答案里有外观、方位、周边三样，问句至少要点到
+# 外观和方位，否则问的和答的对不上。
+_WANTS_LOOK = ("外观", "外形", "什么样", "样子", "颜色", "特征", "样式")
+_WANTS_WHERE = ("方位", "位置", "周围", "旁边", "周边", "附近", "环境", "画面")
+
+
 def _describe_q_ok(ctx: Ctx, q: str) -> bool:
     """模型写的描述问句合不合格。用问法池自己那套闸来判 ——
     手写种子过得了的规则，模型写的也得过。"""
     if not register.is_instruction(q, ctx.forbid_chat):
         return False
     if any(w in q for w in prompts.forbidden_of("ask_describe")):
+        return False
+    if not (any(w in q for w in _WANTS_LOOK) and any(w in q for w in _WANTS_WHERE)):
         return False
     return 8 <= len(q) <= prompts.max_len_of("ask_describe", 45)
 
@@ -289,8 +334,10 @@ def ground_attribute(ctx: Ctx):
     十万条同一句式，既不像真人说话，也让模型只学到那一个句式。改由 VLM 为每个
     目标生成三种说法，这里随机取一句；VLM 没给问句时才退回模板。
     """
-    cand = ctx.unused([b for b in ctx.boxes
-                       if (ctx.vlm.get(b.index) or {}).get("attribute")])
+    # 属性必须能在同类目标里【唯一】指认这个框。同类里还有别的目标也是
+    # 「穿白色上衣」时，这条指代同时匹配好几个人，问题就有了多个正确答案。
+    cand = [b for b in ctx.unused(ctx.boxes)
+            if _attr_identifies(ctx, b, (ctx.vlm.get(b.index) or {}).get("attribute", ""))]
     if not cand:
         return None
     b = ctx.rng.choice(cand)

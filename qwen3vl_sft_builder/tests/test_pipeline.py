@@ -432,7 +432,7 @@ def test_bank_install_drops_bad_lines(tmp_path=None):
     from config import Config
     banks = {"ask_describe": [
         "具体说说这{mw}{label}。",          # 好
-        "那{mw}{label}在哪？",              # 禁用词：跑到「问位置」上去了
+        "给出那{mw}{label}的坐标。",        # 禁用词：跑到「要坐标」上去了
         "描述一下这{label}。",              # 占位符掉了一半
         "具体说说这{mw}{label}。",          # 重复
     ]}
@@ -968,12 +968,11 @@ def test_describe_question_names_what_it_wants():
     「介绍一下这辆自行车」——中文里「介绍」是说牌子型号价格，问的和答的
     不是一回事；「描述该区域的内容」太空泛，答成什么样都算对。"""
     import prompts
+    from core.tasks import _WANTS_LOOK, _WANTS_WHERE
     assert "介绍" in prompts.forbidden_of("ask_describe")
     for v in prompts.load_variants("ask_describe"):
-        assert any(w in v for w in ("方位", "周围", "旁边", "周边", "附近", "环境")), \
-            f"没点明要方位/周边：{v}"
-        assert any(w in v for w in ("外观", "长什么样", "什么样子", "颜色", "特征")), \
-            f"没点明要外观：{v}"
+        assert any(w in v for w in _WANTS_WHERE), f"没点明要方位/周边：{v}"
+        assert any(w in v for w in _WANTS_LOOK), f"没点明要外观：{v}"
 
 
 def test_model_written_describe_question_is_gated():
@@ -1023,6 +1022,130 @@ def test_json_fence_option_and_consistency_still_parses():
               "conversations": [{"from": "human", "value": "问。"},
                                 {"from": "gpt", "value": answer}]}
     assert consistency.claims_of(sample)["boxes"], "带包裹的框答案没被解析出来"
+
+
+
+
+# --------------------------------------------------------- 像素核对颜色
+
+def test_color_word_extraction():
+    from core import colorcheck
+    assert colorcheck.color_word("银灰色") == "银"
+    assert colorcheck.color_word("深蓝色") == "蓝"
+    assert colorcheck.color_word("白色车身") == "白"
+    # 非颜色属性不归这道闸管
+    assert colorcheck.color_word("车头朝左") is None
+    assert colorcheck.color_word("停在路边") is None
+    assert colorcheck.color_word("") is None
+
+
+def test_color_conflict_catches_the_real_failure():
+    """真实踩到的：数据说「框出图中白色车身的卡车」，框却落在一辆蓝色卡车上。
+    指代指向了错误的目标，而答案是框 —— 模型会学到「白色」对应蓝色卡车。"""
+    from core import colorcheck
+    blue = (219, 0.85, 0.78)        # 实测的蓝色卡车
+    assert colorcheck.conflicts("白色车身", blue)
+    assert colorcheck.conflicts("银灰色", blue)
+    assert not colorcheck.conflicts("蓝色", blue)
+    # 非颜色属性一律放行
+    assert not colorcheck.conflicts("车头朝左", blue)
+
+
+def test_color_check_is_deliberately_lenient():
+    """航拍小目标、阴影、JPEG 压缩都会让颜色发飘。这道闸的定位是
+    「拦住离谱的」，不是「精确判定颜色」—— 拿不准一律放行，
+    否则会把大量正确样本误杀。"""
+    from core import colorcheck
+    # 拿不到像素 -> 放行
+    assert not colorcheck.conflicts("白色", None)
+    # 低饱和的灰白目标，说白说银都放行
+    pale = (60, 0.06, 0.88)
+    assert not colorcheck.conflicts("白色", pale)
+    assert not colorcheck.conflicts("银灰色", pale)
+    # 但在这种目标上说「红色」站不住
+    assert colorcheck.conflicts("红色", pale)
+
+
+def test_color_gate_only_drops_the_colour_not_the_target():
+    """模型可能颜色看错但位置、类别都对 —— 那个目标换个非颜色属性照样能用。
+    只摘颜色说法，不整条丢。"""
+    import sys, tempfile
+    from pathlib import Path as P
+    from PIL import Image
+    from core.pipeline import _drop_bad_colors
+    from collections import Counter
+
+    d = P(tempfile.mkdtemp()); img = d / "a.jpg"
+    im = Image.new("RGB", (200, 200), (150, 150, 150))
+    for x in range(60, 140):
+        for y in range(60, 140):
+            im.putpixel((x, y), (30, 90, 200))     # 蓝色目标
+    im.save(img)
+
+    class _Ann:
+        image_path = img; width = height = 200
+    box = _Box(0, "卡车", cx=0.5, cy=0.5); box.w = box.h = 0.4
+    info = {0: {"color": "白色", "attribute": "白色车身",
+                "description": "一辆卡车。", "questions": ["框出卡车。"]}}
+    stats = Counter()
+    _drop_bad_colors(_Ann(), [box], info, stats)
+    assert info[0]["color"] == "" and info[0]["attribute"] == ""
+    assert stats["dropped_color"] == 1 and stats["dropped_attribute"] == 1
+    # 其余字段原样保留 —— 目标本身没问题
+    assert info[0]["description"] == "一辆卡车。"
+    assert info[0]["questions"] == ["框出卡车。"]
+
+
+
+
+def test_attribute_must_identify_uniquely_among_same_class():
+    """真实踩到：一张公园图里好几个人都穿白上衣，VLM 给其中两个都写了
+    「穿白色上衣」，于是生成了两条问句几乎一样、答案却是不同框的样本 ——
+    同一个问题两个正确答案，模型只能学成随机猜。"""
+    import random
+    from core.tasks import Ctx, ground_attribute, _attr_identifies, _norm_attr
+
+    desc = "一名穿白色上衣的行人走在步道上，位于画面中央，旁边是一辆银白色摩托车。"
+    boxes = [_Box(0, "行人"), _Box(1, "行人"), _Box(2, "摩托车")]
+    vlm = {0: {"attribute": "穿白色上衣", "color": "白色", "description": desc,
+               "questions": ["输出穿白色上衣的行人的检测框。"]},
+           1: {"attribute": "白色上衣、黑色裤子", "color": "白色", "description": desc,
+               "questions": ["框出穿白色上衣的行人。"]},
+           2: {"attribute": "粉红色", "color": "粉色", "description": desc,
+               "questions": ["框出粉红色的摩托车。"]}}
+    ctx = Ctx(annotation=None, boxes=boxes, grades={}, vlm=vlm,
+              all_labels=["行人", "摩托车"], bbox2d=lambda b: [1, 2, 3, 4],
+              spatial=lambda b: "中间", rng=random.Random(0),
+              measure_words={"行人": "名", "摩托车": "辆"}, min_desc_len=10)
+
+    # 「穿白色上衣」和「白色上衣、黑色裤子」是包含关系 —— 前者同时匹配两个人
+    assert not _attr_identifies(ctx, boxes[0], "穿白色上衣")
+    assert not _attr_identifies(ctx, boxes[1], "白色上衣、黑色裤子")
+    assert _attr_identifies(ctx, boxes[2], "粉红色")
+
+    # 归一化要能看穿「换个说法」：穿白色上衣 == 白色上衣
+    assert _norm_attr("穿白色上衣") == _norm_attr("白色上衣")
+    assert _norm_attr("正骑行的") == _norm_attr("骑行")
+
+    labels = set()
+    for i in range(60):
+        ctx.rng = random.Random(i)
+        ctx.used = set()
+        out = ground_attribute(ctx)
+        if out:
+            labels.add(out["label"])
+    assert labels == {"摩托车"}, f"撞车的行人不该出样本：{labels}"
+
+
+def test_prompt_forbids_inventing_details():
+    """实测出现过「正拉着行李箱向前走」，而图里根本没有行李箱。
+    编造比笼统糟糕得多 —— 笼统只是没信息，编造是错误信息，
+    而且训练时模型会把它当成事实学下去。"""
+    import prompts
+    text = prompts.load("vlm_select")
+    assert "行李箱" in text, "反面例子要写具体，泛泛地说「不要编造」拦不住"
+    assert "不要补全成一个合理的场景" in text
+    assert "区分开" in text, "提示词里要要求 attribute 能区分同类目标"
 
 
 

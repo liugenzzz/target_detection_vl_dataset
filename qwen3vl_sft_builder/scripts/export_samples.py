@@ -84,12 +84,56 @@ def main() -> int:
 
 
 def _markdown(picked, src, n) -> str:
-    by_task = defaultdict(list)
-    for r in picked:
-        by_task[(r.get("metadata") or {}).get("task_type", "?")].append(r)
     out = [f"# 各任务样本预览（每任务 {n} 条）", "",
            f"来源 `{src.name}`，共 {len(picked)} 条。"
            f"完整数据在同目录的 `preview.jsonl`。", ""]
+    out += _provenance(src)
+    return "\n".join(out + _task_blocks(picked))
+
+
+def _provenance(src: Path) -> list:
+    """把【哪个模型生成的】写进头部。
+
+    问法同质化、属性跟图对不上，这两件事在桩服务上是必然的、在真模型上才是问题。
+    分不清的话看的人会拿桩数据的表现去评判真模型 —— 这已经误导过两次了。
+    与其猜，不如直接把模型名写出来：确定、不需要判据。
+    """
+    report = src.with_name("build_report.json")
+    if not report.exists():
+        return ["> 找不到 `build_report.json`，无法确认是哪个模型生成的。", ""]
+    try:
+        eps = json.loads(report.read_text(encoding="utf-8")).get("vlm_endpoints") or {}
+    except (ValueError, OSError):
+        return []
+    models = sorted({v.get("model", "?") for v in eps.values() if v.get("calls")})
+    if not models:
+        return [
+            "> ⚠️ **这份没有调用任何模型，文字全部来自模板兜底。**",
+            "> 主线三个任务需要 VLM 给描述，`vlm.enabled` 为 false 时它们一条都出不来。",
+            "",
+        ]
+    line = f"> **生成用的模型：{'、'.join(models)}**"
+    if any(m.lower() in ("fake", "stub", "mock", "test") for m in models):
+        return [
+            line + "　←　这是桩服务，不是真模型。",
+            ">",
+            "> 桩服务不读提示词，句式和属性都是硬编码的几种 —— 所以问法看着同质化、",
+            "> 属性（颜色等）跟图完全对不上。**这是桩的必然结果，不代表真模型的表现。**",
+            "> 它能验的只有「代码通不通、格式对不对、闸拦不拦得住」。",
+            ">",
+            "> 要看真实质量，接上模型服务重跑：",
+            "> `python scripts/build.py --limit 400 && python scripts/export_samples.py`",
+            "",
+        ]
+    return [line, ""]
+
+
+
+def _task_blocks(picked):
+    by_task = defaultdict(list)
+    for r in picked:
+        by_task[(r.get("metadata") or {}).get("task_type", "?")].append(r)
+    out = []
     for task in TASKS:
         group = by_task.get(task, [])
         if not group:
@@ -109,7 +153,7 @@ def _markdown(picked, src, n) -> str:
                 val = str(t.get("value", "")).replace("<image>\n", "")
                 out.append(f"- {who} {val}")
             out.append("")
-    return "\n".join(out)
+    return out
 
 
 if __name__ == "__main__":
