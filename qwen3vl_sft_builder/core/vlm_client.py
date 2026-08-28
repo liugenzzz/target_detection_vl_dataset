@@ -77,9 +77,11 @@ def _endpoints_from(v: dict) -> List[Endpoint]:
 
 @dataclass
 class VlmResult:
-    referring: str
+    """一次调用的返回。description 存的是模型输出的【原始文本】，
+    怎么解析由调用方决定 —— 挑对象那次要解析成 {框号: 属性}，
+    质检那次要解析成评分，客户端本身不关心。"""
     description: str
-    source: str          # "vlm" | "template" | "cache"
+    source: str          # "vlm" | "cache"
 
 
 class VlmClient:
@@ -117,7 +119,6 @@ class VlmClient:
         # 挑对象那次调用要顺带生成多样的问句，温度低了三句会写得几乎一样。
         self.temperature_select = float(v.get("temperature_select", 0.85))
         # 改写要保真不要发挥，用低温
-        self.temperature_rewrite = float(v.get("temperature_rewrite", 0.3))
         cache = v.get("cache_dir") or ""
         # 按角色分子目录。两个理由：
         #   1. 缓存键是 (图, 一串整数)，构建用的是 bbox / 图片尺寸，质检用的是
@@ -137,7 +138,9 @@ class VlmClient:
         # 预取结果的内存副本。磁盘缓存是「跨进程复用」，内存是「本次运行的取用通道」——
         # 只靠磁盘的话，cache_dir 未配置或写盘失败时预取结果会被静默丢弃，
         # 白烧一整轮 API 却产出纯模板数据集。
-        self._memory: Dict[str, VlmResult] = {}
+        # 存的是模型输出的【原始文本】，跟磁盘缓存里 description 字段一致。
+        # 解析放到取用时做 —— 挑对象和质检解析成不同的形状。
+        self._memory: Dict[str, str] = {}
         self._cancel = threading.Event()
         self._fatal: Optional[str] = None      # 命中配置错误后记在这里，供 prefetch 中止
 
@@ -156,7 +159,7 @@ class VlmClient:
             return None
         try:
             d = json.loads(path.read_text(encoding="utf-8"))
-            return VlmResult(d.get("referring", ""), d.get("description", ""), "cache")
+            return VlmResult(d.get("description", ""), "cache")
         except (json.JSONDecodeError, OSError):
             return None
 
@@ -168,7 +171,7 @@ class VlmClient:
         tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
         try:
             tmp.write_text(json.dumps(
-                {"referring": result.referring, "description": result.description},
+                {"description": result.description},
                 ensure_ascii=False), encoding="utf-8")
             os.replace(tmp, path)
         except OSError as exc:
@@ -218,7 +221,7 @@ class VlmClient:
             with self._lock:
                 self._memory[key] = raw        # 内存优先，磁盘只是跨进程复用
             self._write_cache(self._cache_path(image_path, bbox),
-                              VlmResult("", raw, "vlm"))
+                              VlmResult(raw, "vlm"))
             return key
 
         # 不用 with：ThreadPoolExecutor 的 __exit__ 是 shutdown(wait=True)，
@@ -271,59 +274,15 @@ class VlmClient:
         只保留仍在 valid_indices 里的编号 —— 模型可能返回被质量过滤掉的框，
         或者干脆编一个不存在的编号。
         """
-        raw = self._memory.get(self._key(image_path, key))
-        if raw is None:
-            cached = self._read_cache(self._cache_path(image_path, key))
-            raw = cached.description if cached else None
+        raw = self.raw_result(image_path, key)
         if not raw:
             return {}
-        parsed = _parse_scene_json(raw) if isinstance(raw, str) else raw
-        if not isinstance(parsed, dict):
+        parsed = _parse_scene_json(raw)
+        if not parsed:
             return {}
         return {i: v for i, v in parsed.items() if i in valid_indices}
 
-    def describe(self, image_path: Path, bbox: Sequence[int], label: str,
-                 prompt_text: str, fallback: VlmResult) -> VlmResult:
-        """给一个目标生成指代与描述。任何失败都回落 fallback，不抛异常。"""
-        key = self._key(image_path, bbox)
-        in_mem = self._memory.get(key)
-        if in_mem:
-            with self._lock:
-                self.stats["cache"] += 1
-            return self._fill_blanks(in_mem, fallback)
 
-        cache_path = self._cache_path(image_path, bbox)
-        cached = self._read_cache(cache_path)
-        if cached:
-            with self._lock:
-                self.stats["cache"] += 1
-            return self._fill_blanks(cached, fallback)
-
-        if not self.enabled or self._prefetch_done:
-            with self._lock:
-                self.stats["template"] += 1
-            return fallback
-
-        result = self._request(image_path, prompt_text)
-        if result is None:
-            with self._lock:
-                self.stats["failed"] += 1
-            return fallback
-
-        result = self._fill_blanks(result, fallback)
-        with self._lock:
-            self.stats["vlm"] += 1
-        self._write_cache(cache_path, result)
-        return result
-
-    @staticmethod
-    def _fill_blanks(result: VlmResult, fallback: VlmResult) -> VlmResult:
-        """VLM 某一项返回空时，用模板补上那一项。"""
-        return VlmResult(
-            referring=result.referring or fallback.referring,
-            description=result.description or fallback.description,
-            source=result.source,
-        )
 
     def _request_raw(self, image_path: Path, prompt_text: str) -> Optional[str]:
         """发一次请求，返回模型输出的原始文本（不解析）。"""
@@ -418,65 +377,6 @@ class VlmClient:
                 time.sleep(min(2 ** attempt, 10))
         return None
 
-    def prefetch_text(self, tasks, progress_every: int = 200) -> None:
-        """并发跑一批【纯文本】调用（口语化改写不需要图片，省掉 base64 传输）。
-
-        tasks 每项为 (key, prompt_text)，结果按 key 存进内存与磁盘缓存，
-        取用时用 text_result(key)。
-        """
-        if not self.enabled or not tasks:
-            return
-        todo = [t for t in tasks
-                if self._key(Path(t[0]), []) not in self._memory
-                and not self._read_cache(self._cache_path(Path(t[0]), []))]
-        if not todo:
-            logger.info("改写全部命中缓存")
-            return
-        logger.info("并发改写：%d 条，并发 %d 路", len(todo), self.concurrency)
-
-        def work(task):
-            key_src, prompt_text = task
-            if self._cancel.is_set() or self._fatal:
-                return None
-            raw = self._post({
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt_text}],
-                "temperature": self.temperature_rewrite,
-                "max_tokens": 128,
-            })
-            if raw is None:
-                return None
-            k = self._key(Path(key_src), [])
-            with self._lock:
-                self._memory[k] = raw
-            self._write_cache(self._cache_path(Path(key_src), []), VlmResult("", raw, "vlm"))
-            return k
-
-        pool = ThreadPoolExecutor(max_workers=self.concurrency)
-        done = 0
-        try:
-            futures = [pool.submit(work, t) for t in todo]
-            for fut in as_completed(futures):
-                done += 1
-                try:
-                    ok = fut.result() is not None
-                except Exception as exc:                 # noqa: BLE001
-                    logger.warning("改写任务异常：%s", exc)
-                    ok = False
-                with self._lock:
-                    self.stats["prefetched" if ok else "failed"] += 1
-                if self._fatal:
-                    self._cancel.set()
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    raise FatalVlmError(self._fatal)
-                if done % progress_every == 0 or done == len(todo):
-                    logger.info("改写 %d/%d", done, len(todo))
-        except KeyboardInterrupt:
-            self._cancel.set()
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise
-        else:
-            pool.shutdown(wait=True)
 
     def text_result(self, key_src: str) -> Optional[str]:
         """取一条纯文本调用的结果。"""
@@ -502,9 +402,6 @@ class VlmClient:
         payload = self._payload(image_path, prompt_text, temperature)
         return self._post(payload) if payload else None
 
-    def _request(self, image_path: Path, prompt_text: str) -> Optional[VlmResult]:
-        raw = self._request_raw(image_path, prompt_text)
-        return _parse_vlm_json(raw) if raw else None
 
 
 def _diagnose(status: int, body: str) -> Optional[str]:
@@ -569,25 +466,3 @@ def _parse_scene_json(text: str) -> Optional[Dict[int, Dict[str, str]]]:
     return out or None
 
 
-def _parse_vlm_json(text: str) -> Optional[VlmResult]:
-    """从模型输出里抠出 JSON。模型常会用 ```json 包裹或加解释性前后缀。"""
-    if not text:
-        return None
-    cleaned = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-    if not match:
-        return None
-    try:
-        data = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    referring = str(data.get("referring") or "").strip()
-    description = str(data.get("description") or "").strip()
-    if not referring and not description:
-        # 形状不对的 JSON（键名写错等）会解析成两个空串。若当成功处理，
-        # 会写入一条空缓存，之后每次运行都命中它，把该目标永久钉死在模板文本上，
-        # 而报告里还显示成功。
-        return None
-    return VlmResult(referring=referring, description=description, source="vlm")

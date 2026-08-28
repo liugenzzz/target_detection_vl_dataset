@@ -31,7 +31,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import prompts
 
-from .builder import IMAGE_TOKEN
+from .sample import IMAGE_TOKEN
 
 logger = logging.getLogger(__name__)
 

@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import prompts
 
-from .builder import validate_sample
+from .sample import validate_sample
 from .classes import load_class_table
 from .coords import yolo_to_bbox2d
 from .difficulty import REJECT, Grader

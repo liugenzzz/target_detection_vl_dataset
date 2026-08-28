@@ -135,30 +135,40 @@ def _check_one(ep, timeout, cfg, args) -> int:
     print(f"  单次图片请求约 {el:.1f} 秒 —— 用它估算并发数和总耗时")
 
     # ---------------------------------------------------------- 3 真实提示词
-    print("\n[3/3] 真实提示词（prompts/vlm_describe.txt）")
-    prompt_text = prompts.render("vlm_describe", bbox=[300, 400, 500, 600],
-                                 label="测试目标", siblings_hint="")
+    # 这一步必须验【管道真正在用的那个提示词】。以前验的是 vlm_describe.txt，
+    # 而管道早已改用 vlm_select.txt —— 自检全绿、全量跑起来才发现解析不出来。
+    print("\n[3/3] 真实提示词（prompts/vlm_select.txt，管道实际用的就是它）")
+    box_list = "\n".join(f"  [{i}] 测试目标{i}  位于 [{i * 100}, 200, {i * 100 + 80}, 300]"
+                         for i in range(3))
+    prompt_text = prompts.render("vlm_select", box_list=box_list, max_pick=3)
     msg = [{"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{b64}"}},
            {"type": "text", "text": prompt_text}]
-    r, el = post(url, key, {"model": model, "max_tokens": int(cfg.get_path("vlm.max_tokens", 1024)),
-                            "temperature": float(cfg.get_path("vlm.temperature", 0.35)),
+    r, el = post(url, key, {"model": model,
+                            "max_tokens": int(cfg.get_path("vlm.max_tokens", 1024)),
+                            "temperature": float(cfg.get_path("vlm.temperature_select", 0.85)),
                             "messages": [{"role": "user", "content": msg}]}, timeout)
     if r.status_code != 200:
         print(f"{BAD} HTTP {r.status_code}：{r.text[:300]}")
         return 1
     raw = content_of(r.json())
-    print(f"  模型原始输出：\n    {raw[:300]}")
-    parsed = _parse_vlm_json(raw)
+    print(f"  模型原始输出：\n    {raw[:400]}")
+    parsed = _parse_scene_json(raw)
     if parsed is None:
-        print(f"\n{BAD} 解析不出 JSON。构建时这类会回落模板描述。")
-        print("  排查：改 prompts/vlm_describe.txt 让模型只吐 JSON —— 改提示词不用动代码。")
+        print(f"\n{BAD} 解析不出 JSON。构建时这类会整张图跳过，主线一条都出不来。")
+        print("  排查：改 prompts/vlm_select.txt 让模型只吐 JSON —— 改提示词不用动代码。")
         print("        小模型常见问题是加解释性前后缀，或把键名写错。")
         return 1
-    print(f"\n{OK} 解析成功")
-    print(f"    referring   = {parsed.referring!r}")
-    print(f"    description = {parsed.description!r}")
-    if not parsed.referring:
-        print("  注意：referring 为空，构建时该目标会回落模板空间指代。")
+    print(f"\n{OK} 解析成功，挑中 {len(parsed)} 个目标")
+    for idx, info in list(parsed.items())[:2]:
+        print(f"    [{idx}] attribute={info.get('attribute')!r} "
+              f"color={info.get('color')!r}")
+        print(f"         questions={info.get('questions')}")
+        print(f"         description={info.get('description')!r}")
+    missing = [k for k in ("attribute", "questions", "description")
+               if not any((v.get(k) for v in parsed.values()))]
+    if missing:
+        print(f"  注意：{missing} 全为空。缺 questions 会回落模板问句；"
+              "缺 description 时主线三个任务都出不来（主线要求描述齐全）。")
 
     print("\n" + "=" * 66)
     print("三项全通过，可以跑构建了：")

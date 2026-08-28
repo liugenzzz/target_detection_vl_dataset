@@ -67,7 +67,7 @@ VisDrone 覆盖不到的：全是日间彩色图，**测不了夜视/红外场�
 python scripts/get_visdrone.py --out ./data/visdrone   # 约 78MB
 ```
 
-## 四步走
+## 五步走
 
 ```bash
 # 0. 接入新的模型服务后第一个跑这个，别跳过
@@ -399,98 +399,6 @@ vlm:
   api_url: "http://localhost:1234/v1/chat/completions"    # LM Studio
 ```
 
-## 指代短语不能泄漏答案
-
-第一轮问的是「图中{referring}是什么？」，答案是类别名。**指代短语里绝不能出现
-类别名**，否则等于把答案写进了问题：
-
-```
-问：图中靠近树木的那辆三轮车是什么？      答：是tricycle。
-```
-
-模型学不到任何识别能力，只学会把中文类别名翻译成英文。实测这类样本一度占到
-VLM 指代的一半 —— 用类别名指代是最自然的说法，不明令禁止模型一定会那么写。
-
-两道防线：
-
-1. `prompts/vlm_describe.txt` 里硬禁止，并给出正反例。只写「优先用外观特征」
-   不够，必须写「绝对不能出现类别名」并举反例。
-2. `core/referring.py` 的 `leaks_label()` 兜底。**提示词管不住模型，代码这一层必须拦。**
-   命中就丢弃该指代、回落模板空间指代 —— 宁可指代弱一点，也不能泄漏答案。
-   拦截次数记在构建报告的 `vlm_referring_leaked_label`。
-
-### 三种泄漏形式
-
-**① 字面类别名** —— 「靠近树木的那辆**三轮车**」。检测只对中文类别名生效
-（英文类别名和中文指代没法比对），三档判据：
-
-| 判据 | 例子 |
-|---|---|
-| 类别名整体出现 | 「靠近树木的那辆**三轮车**」/ 三轮车 |
-| 两字以上尾缀出现 | 「穿红色上衣的那个**人员**」/ 军事人员 |
-| 单字尾缀出现在**结尾** | 「画面中部那艘**船**」/ 其它辅助船 |
-
-第三档必须限定在结尾，否则「车」「船」这类高频字会大量误判 ——
-「停在斜坡上、**车**头朝左的那个目标」并没有泄漏「卡车」。
-
-**② 部件名和动作词**（隐蔽形式，比字面泄漏更难发现）：
-
-```
-车身银色的那个              「车身」把答案限定成车辆，砍掉人员、船舶
-一名穿粉衣的人正骑行的那个    「骑行」限定成自行车/摩托车/三轮车
-停在大石头后方的那个         「停」暗示是可停放的载具
-```
-
-词表在 `config` 的 `quality.category_hint_words`（默认 33 个，含部件名与动作词），
-**按你的类别体系增删**。指代只该用**位置 + 颜色 + 与周围物体的相对关系**，
-这三类都不暗示类别。
-
-**③ 模板兜底自己泄漏** —— 这是曾经的一个严重 bug。模板指代在分区内不唯一时
-会拼「那个{label}」来消歧，生成出「图中上方右侧那个van是什么？」。更糟的是
-检测到 VLM 指代泄漏后回落的正是这个模板，等于原地打转。现在模板**绝不带类别名**，
-分区内不唯一而 VLM 又没给出可用指代时，**整条样本丢弃**（计入
-`dropped_ambiguous_referring`）—— 有歧义的问题是坏数据，但靠泄漏答案来消歧更糟。
-
-指代里提到**其他类别**的物体是允许的（「白色轿车旁边的那个」「戴红帽子的人左边的那个」），
-那是地标式指代 —— 用别的东西定位目标，没有暴露目标自己是什么，正是鼓励的写法。
-
-### 别用「目标」
-
-「目标」是标注术语，正常人不会问「那个目标是什么」。收尾称呼由
-`quality.neutral_noun` 控制，默认光杆的「那个」：
-
-```
-图中画面右下角、银色的那个是什么？        自然、中性
-图中画面右下角、银色的那个目标是什么？     标注腔
-```
-
-不用「物体」是因为类别里有 `人员`，把人叫「那个物体」很别扭。
-
-## 指代短语要短
-
-指代的唯一职责是**把这个目标从图中锁定出来**，能区分就够了。模型倾向于把看到的
-特征全堆上去，实测会写出：
-
-```
-图中画面中上部，停在白色轿车和黑色轿车之间，靠近一棵绿树的那个目标是什么？
-```
-
-三从句 30 字，而它只是问题的主语。多目标样本更糟 —— 三个这样的指代拼起来接近
-80 字，问题读不下去，训练时真正的信号也被淹没在定语里。
-
-三道约束：
-
-1. **提示词**要求「越短越好，不超过 15 字，优先只用一个最显眼的特征」，
-   并给出「太长」的反例。只给字数上限不够，模型会正好写满上限。
-2. **代码兜底** `too_long()`，超过 `quality.max_referring_len`（默认 20 字）
-   就丢弃，回落模板空间指代 —— 模板虽短但足够锁定，强过读不下去的长句。
-   拦截次数记在报告的 `vlm_referring_too_long`。
-3. **多目标样本优先挑显眼、好描述的目标**（`easy` 档：大、孤立、分区内唯一），
-   这类目标一两个特征就能锁定，指代自然短；拼起来仍超长的整条丢弃，
-   这些目标各自出单目标样本。
-
-实测效果：问题长度中位 17 字、最长 29 字。
-
 ## 描述语句
 
 第三轮的描述由 `vlm.api_url` 指向的自建 Qwen 服务生成，**同一次调用还会返回
@@ -512,11 +420,17 @@ VLM 结果按图落盘到 `vlm_cache/`，**支持断点续跑** —— 两万张
 
 | 文件 | 用途 |
 |---|---|
-| `turn1_identify.txt` / `turn1_answer.txt` | 第一轮：指代锁定 + 类别 |
-| `turn2_locate.txt` | 第二轮：要位置 |
-| `turn3_describe.txt` | 第三轮：要描述 |
-| `multi_turn*.txt` | 多目标样本的三轮 |
-| `negative_ask.txt` / `negative_answer.txt` | 拒答样本 |
+| `ground_unique.txt` / `ground_attribute.txt` | 主线的定位问句 |
+| `inv_ask_*.txt` / `inv_answer_what.txt` | 盘点 → 定位 → 描述三轮 |
+| `ask_describe.txt` | 主线最后一轮：要描述 |
+| `detect_class.txt` | 按类别全找出来 |
+| `spatial_ask_lr/ud.txt` / `spatial_answer.txt` | 方位关系，左右和上下分开 |
+| `attribute_qa_color/feature.txt` | 属性问答的两个维度 |
+| `exist_ask.txt` / `exist_*_answer.txt` | 存在性问答与拒答 |
+| `region_identify*.txt` | REG：给框问类别 |
+| `gen_phrases.txt` | 扩充问法库用的提示词 |
+| `review.txt` / `review_sample.txt` | 全量质检 |
+| `measure_words.txt` | 一次性生成量词表 |
 | `inv_ask_*.txt` / `inv_answer_what.txt` | 盘点 → 定位 → 描述三轮的问法池 |
 | `detect_class.txt` | 按类别全找出来的问法池 |
 | `gen_phrases.txt` | 扩充问法库用的提示词，见下节 |
@@ -591,11 +505,12 @@ python scripts/build_phrase_banks.py --target 60 --force  # 重新生成
 config/       default.yaml（进版本控制） + local.yaml（服务器上改，已 gitignore）
 prompts/      提示词纯文本，与代码分离
 core/         classes 类别表与易混检测 / coords 坐标换算 / yolo 标注解析
-              difficulty 难度分级与配额 / grouping 来源分组 / referring 指代生成
-              vlm_client 调 Qwen 服务 / builder 三轮样本组装 / pipeline 编排
-              phrase_bank 扩充问法库的读写与校验
+              difficulty 难度分级与配额 / grouping 来源分组
+              tasks 八个任务的样本生成 / pipeline 编排 / sample 格式契约
+              vlm_client 调模型（含模型池）/ phrase_bank 扩充问法库
               register 语体闸 / consistency 跨任务一致性
               review 主观质检 / stats 客观体检
+              referring 描述成色判定与空间措辞 / cli 脚本入口包装
 scripts/      check_vlm.py 服务自检 / analyze.py 分布分析
               review.py 主观质检 / dataset_stats.py 客观体检
               build.py 构建 / preview.py 验证图
@@ -605,7 +520,7 @@ tests/        回归测试，不依赖外部数据和 VLM 服务
 ```
 
 ```bash
-python tests/test_pipeline.py      # 66 项，服务器上部署后先跑这个
+python tests/test_pipeline.py      # 55 项，服务器上部署后先跑这个
 ```
 
 ---
