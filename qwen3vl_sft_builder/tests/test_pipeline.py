@@ -1244,6 +1244,36 @@ def test_stats_do_not_reference_deleted_prompts():
 
 
 
+
+def test_preview_provenance_reads_results_not_request_count():
+    """预览头部标注「哪个模型生成的」。判断依据必须是【拿到了多少条结果】，
+    不是【发了多少次请求】—— 全部命中缓存时请求数是 0，但文字确实来自模型，
+    说成「没调用任何模型、全部来自模板兜底」是错的。"""
+    import json, os, sys, tempfile
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from export_samples import _provenance
+
+    d = Path(tempfile.mkdtemp())
+    def write(calls):
+        (d / "build_report.json").write_text(json.dumps({
+            "vlm_calls": calls,
+            "vlm_endpoints": {"e": {"model": "Qwen3-VL-8B", "calls": 0}},
+        }), encoding="utf-8")
+        return "\n".join(_provenance(d / "train.jsonl"))
+
+    # 全部命中缓存：请求 0 次，但结果来自模型
+    out = write({"prefetched": 0, "cache": 120, "failed": 0})
+    assert "Qwen3-VL-8B" in out and "没有调用任何模型" not in out, out
+    # 真的没调用
+    out = write({"prefetched": 0, "cache": 0, "failed": 0})
+    assert "没有调用任何模型" in out, out
+    # 有失败要标出来 —— 这批数据不完整
+    out = write({"prefetched": 100, "cache": 0, "failed": 30})
+    assert "30 次调用失败" in out, out
+    os.unlink(d / "build_report.json"); os.rmdir(d)
+
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

@@ -102,17 +102,25 @@ def _provenance(src: Path) -> list:
     if not report.exists():
         return ["> 找不到 `build_report.json`，无法确认是哪个模型生成的。", ""]
     try:
-        eps = json.loads(report.read_text(encoding="utf-8")).get("vlm_endpoints") or {}
+        data = json.loads(report.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return []
-    models = sorted({v.get("model", "?") for v in eps.values() if v.get("calls")})
-    if not models:
+    eps = data.get("vlm_endpoints") or {}
+    calls = data.get("vlm_calls") or {}
+    # 用【拿到了多少条结果】判断，不是【发了多少次请求】—— 全部命中缓存时
+    # 请求数是 0，但文字确实来自模型，说成「没调用任何模型」是错的。
+    got_from_model = (calls.get("prefetched", 0) + calls.get("cache", 0)) > 0
+    models = sorted({v.get("model", "?") for v in eps.values()})
+    if not got_from_model or not models:
         return [
             "> ⚠️ **这份没有调用任何模型，文字全部来自模板兜底。**",
             "> 主线三个任务需要 VLM 给描述，`vlm.enabled` 为 false 时它们一条都出不来。",
             "",
         ]
     line = f"> **生成用的模型：{'、'.join(models)}**"
+    failed = calls.get("failed", 0)
+    if failed:
+        line += f"　⚠️ 但有 {failed} 次调用失败，这批数据不完整"
     if any(m.lower() in ("fake", "stub", "mock", "test") for m in models):
         return [
             line + "　←　这是桩服务，不是真模型。",
