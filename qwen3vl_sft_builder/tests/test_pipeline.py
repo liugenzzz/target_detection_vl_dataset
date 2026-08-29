@@ -1282,30 +1282,48 @@ def test_no_dead_config_keys():
     改了却毫无反应，比没有这个选项更糟。实测积了 6 组：refer_locate.*、
     sampling.multi_target_*、sampling.negative_ratio、split.group_by_source、
     output.format，全是 refer_locate / SampleBuilder 废弃后留下的。
+
+    【local.yaml.example 也要查】——它才是服务器上被复制的那份。只查
+    default.yaml 时，example 里积了四个死键没人发现：temperature_rewrite、
+    max_referring_len、neutral_noun、category_hint_words，全是 refer_locate
+    和改写步骤废弃后留下的。
     """
     import yaml
     root = Path(__file__).resolve().parents[1]
     src = "\n".join(p.read_text(encoding="utf-8")
                      for p in list((root / "core").rglob("*.py"))
                      + list((root / "scripts").rglob("*.py")))
-    cfg = yaml.safe_load((root / "config" / "default.yaml").read_text(encoding="utf-8"))
 
-    dead = []
-    def walk(node, prefix=""):
-        for k, v in (node or {}).items():
-            path = f"{prefix}{k}"
-            if isinstance(v, dict) and v:
-                walk(v, path + ".")
-                continue
-            # 三种读法都算：整条点号路径、叶子名（v.get("api_url") 这种）、
-            # 以及整段取走再遍历（tasks 段就是这么用的）
-            if (f'"{path}"' in src or f"'{path}'" in src
-                    or f'"{k}"' in src or f"'{k}'" in src
-                    or f'"{prefix.rstrip(".")}"' in src):
-                continue
-            dead.append(path)
-    walk(cfg)
-    assert not dead, f"这些配置项没人读，删掉或者接上：{dead}"
+    # 整段被取走再遍历、键名在代码里拼不出来的段。只有 tasks 是这样：
+    # 七个 ground_* 的权重由 f"ground_{k}" 动态生成，源码里找不到字面量。
+    # 【这个豁免只能给这一段】—— 早先它是给所有段的（"段名出现过就整段放行"），
+    # 于是 quality / vlm 段下的键怎么加都查不出来，实测漏掉了四个死键。
+    ENUMERATED_SECTIONS = {"tasks"}
+
+    def dead_keys(cfg):
+        dead = []
+
+        def walk(node, prefix=""):
+            for k, v in (node or {}).items():
+                path = f"{prefix}{k}"
+                if isinstance(v, dict) and v:
+                    walk(v, path + ".")
+                    continue
+                # 两种读法：整条点号路径，或叶子名（v.get("api_url") 这种）
+                if (f'"{path}"' in src or f"'{path}'" in src
+                        or f'"{k}"' in src or f"'{k}'" in src):
+                    continue
+                if prefix.rstrip(".") in ENUMERATED_SECTIONS:
+                    continue
+                dead.append(path)
+
+        walk(cfg)
+        return dead
+
+    for name in ("default.yaml", "local.yaml.example"):
+        cfg = yaml.safe_load((root / "config" / name).read_text(encoding="utf-8"))
+        assert not dead_keys(cfg), \
+            f"config/{name} 里这些配置项没人读，删掉或者接上：{dead_keys(cfg)}"
 
     # local.yaml.example 是给用户复制的，不能带着死键
     ex = yaml.safe_load((root / "config" / "local.yaml.example")
