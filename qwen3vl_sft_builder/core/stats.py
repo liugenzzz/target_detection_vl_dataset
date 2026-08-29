@@ -155,7 +155,7 @@ def box_distribution(samples: Sequence[Dict[str, Any]], scale: int = 1000) -> Di
 
 
 def answer_shape(samples: Sequence[Dict[str, Any]],
-                 opening_kinds: Sequence[str] = ()) -> Dict[str, Any]:
+                 kinds: Sequence[str] = ()) -> Dict[str, Any]:
     """答案侧的形态分布。问句多样性我们一直在盯，答案侧同样会退化 ——
     描述全是「位于画面左下角，一辆…」一个句式，模型学到的就是那个句式。"""
     texts, lens = [], []
@@ -181,15 +181,37 @@ def answer_shape(samples: Sequence[Dict[str, Any]],
         # 开头四个字最集中的几种。一种开头占比过高说明句式在退化
         "top_openings": {k: round(v / len(texts), 4)
                          for k, v in starts.most_common(5)} if texts else {},
-        # 判据：描述的起手方式由 prompts/desc_opening.txt 轮换（当前 N 种），
-        # 均匀的话每种约 1/N。最集中的一种超过 1/N 的两倍，说明模型没照着
-        # 轮换的要求写，而是退回了它自己熟悉的那个套路。
-        "opening_kinds": len(opening_kinds),
+        # 判据：描述分七个子类型（prompts/describe/），每种的答案信息结构不同，
+        # 开头自然也该散开。最集中的一种超过 1/种数 的两倍，说明模型没照着
+        # 子类型的要求写，而是退回了它自己熟悉的那个套路 —— 七种正在退化成一种。
+        "opening_kinds": len(kinds),
         "opening_max_share": round(starts.most_common(1)[0][1] / len(texts), 4)
                              if texts else 0.0,
         "opening_ok": (starts.most_common(1)[0][1] / len(texts)
-                       <= 2.0 / max(1, len(opening_kinds))) if texts else True,
+                       <= 2.0 / max(1, len(kinds))) if texts else True,
     }
+
+
+def describe_kind_mix(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """七种描述子类型各出了多少条，以及各自的答案长度。
+
+    某一种长度明显偏离其他几种，多半是它的 .txt 要求写得不到位 ——
+    比如 position 本该只说方位、句子短，如果它的长度和 full 一样，
+    说明模型没照着写、又滑回三段式了。
+    """
+    by_kind: Dict[str, List[int]] = defaultdict(list)
+    for s in samples:
+        kind = (s.get("metadata") or {}).get("describe_kind")
+        if not kind:
+            continue
+        for t in s.get("conversations", []):
+            v = str(t.get("value", ""))
+            if t.get("from") == "gpt" and not v.startswith(("{", "[", "```")):
+                by_kind[kind].append(len(v))
+    total = sum(len(v) for v in by_kind.values())
+    return {k: {"n": len(v), "share": round(len(v) / total, 4) if total else 0,
+                "len_avg": round(sum(v) / len(v)) if v else 0}
+            for k, v in sorted(by_kind.items())}
 
 
 def pope_balance(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -212,12 +234,13 @@ def pope_balance(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
 def report(samples: Sequence[Dict[str, Any]], truth: Dict[str, set],
            all_labels: Sequence[str], scale: int = 1000,
-           opening_kinds: Sequence[str] = ()) -> Dict[str, Any]:
+           kinds: Sequence[str] = ()) -> Dict[str, Any]:
     return {
         "samples": len(samples),
         "hallucination_chair": chair(samples, truth, all_labels),
         "class_coverage": coverage(samples, all_labels),
         "box_distribution": box_distribution(samples, scale),
-        "answer_shape": answer_shape(samples, opening_kinds),
+        "answer_shape": answer_shape(samples, kinds),
+        "describe_kind_mix": describe_kind_mix(samples),
         "exist_balance": pope_balance(samples),
     }

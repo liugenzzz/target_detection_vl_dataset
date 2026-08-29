@@ -129,9 +129,9 @@ python scripts/get_visdrone.py --out ./data/visdrone   # 约 78MB
 # 0. 接入新的模型服务后第一个跑这个，别跳过
 python scripts/check_vlm.py
 
-# 0.5 一次性生成量词表与扩充问法库，之后长期复用（都是纯文本调用，不发图片）
+# 0.5 一次性生成量词表，长期复用（纯文本调用，不发图片）
 python scripts/build_measure_words.py
-python scripts/build_phrase_banks.py
+# python scripts/build_phrase_banks.py    # 可选，默认关闭，见「问法库默认关闭」一节
 
 # 1. 先看分布，定阈值（COCO 的阈值不适用于你的数据，必须重跑）
 python scripts/analyze.py
@@ -163,6 +163,33 @@ output/
 ├── verify/              验证图 + manifest.json（人工复核看这个）
 └── vlm_cache/           VLM 结果缓存，支持断点续跑
 ```
+
+---
+
+## 十四个任务
+
+| | 配比 | 说明 |
+|---|---:|---|
+| 🔷 `ground_unique` | 15% | 该类在原始标注里仅一个实例，无需修饰 |
+| 🔷 `inventory_locate` | 25% | 盘点 → 定位 → 描述，三轮递进 |
+| 🔷 `ground_appearance` | 7% | 只说物体本身：颜色、形状、部件、载物 |
+| 🔷 `ground_state` | 4% | 只说状态动作：停着 / 行驶 / 装载 |
+| 🔷 `ground_part` | 4% | 聚焦一个部位展开 |
+| 🔷 `ground_position` | 3% | 只说方位 |
+| 🔷 `ground_relation` | 4% | 只说和周围什么挨着 |
+| 🔷 `ground_contrast` | 2% | 和图中同类比有什么不同 |
+| 🔷 `ground_full` | 6% | 综合三段式（占七种的 20%） |
+| 　 `detect_class` | 8% | 框出图中所有的 X（需该类全部框合格） |
+| 　 `attribute_qa` | 5% | [框] 颜色 / 显著特征两个维度 |
+| 　 `spatial_relation` | 3% | X 在 Y 的左边还是右边（纯坐标，零成本） |
+| 　 `exist_negative` | 7% | 图中有没有 X / 拒答（难负样本优先） |
+| 　 `region_identify` | 7% | [框] 这个区域内的是什么（REG） |
+
+**主线合计 70%**（「指代物体 → 坐标 → 描述语句」，招标要的方向），其余 30%。
+
+`ground_*` 七个是**同一条链**的变体：指代 → 框 → 某一种描述。拆开是因为描述的多样性要来自「答案里装的是什么」，不是问句换说法。
+
+**已经砍掉的**：`count`（并进 `inventory_locate` 第一轮）、`image_caption`（描述性任务已够多）、`ground_spatial`、`refer_locate`（指代→反查框，实测太难）、`ground_attribute`（拆成上面七个子类型）。
 
 ---
 
@@ -368,7 +395,8 @@ vlm:
 | 类别覆盖率 + 基尼系数 | 长尾分析 | 347 个类别只练到 40 个，训出来的模型就只认那 40 个 |
 | 九宫格框分布 | — | 85% 的框挤在画面中央的话，模型学到的是「往中间猜」 |
 | `Distinct-2` / `Distinct-3` | Distinct-n (Li 2016) | 词汇多样性 |
-| 答案开头集中度 | — | 描述全是「位于画面…」一个句式。带判据：起手方式由 `desc_opening.txt` 轮换 N 种，最集中的一种超过 `2/N` 就判不合格 |
+| 答案开头集中度 | — | 描述全是一个句式。带判据：描述分 7 个子类型、答案结构本就不同，最集中的一种超过 `2/7` 就是七种在退化成一种 |
+| 各子类型的答案长度 | — | 某一种和 `full` 差不多长，说明它没照着自己的 `.txt` 写 |
 | 正负比 + 难负样本率 | POPE (Li 2023) | 存在性问答失衡会让模型学成「一律答有」 |
 
 两个刻意的取舍：
@@ -452,7 +480,7 @@ train 或整组进 val。构建报告里的 `split.group_overlap` 必须为 0。
 |---|---|---|
 | 1 纯文本 | 地址 / 端口 / model 名 / api_key | 见下表 |
 | 2 图片输入 | 这个部署开没开多模态 | 部署没开视觉，或不认 `image_url` 写法 |
-| 3 真实提示词 | 返回能不能解析成 JSON | 改 `prompts/vlm_describe.txt`，不用动代码 |
+| 3 真实提示词 | 管道真正在用的 `vlm_select.txt` 返回能不能解析成 JSON | 改 `prompts/_vlm/vlm_select.txt`，不用动代码 |
 
 常见状态码的含义与处置：
 
@@ -540,17 +568,21 @@ vlm:
 
 ---
 
-## 描述语句
+## 一张图一次调用
 
-第三轮的描述由 `vlm.api_url` 指向的自建 Qwen 服务生成，**同一次调用还会返回
-视觉指代短语**，所以给同类密集目标消歧不额外增加成本。
+主线的全部文字素材来自**同一次调用**：挑对象、给每个对象写属性和颜色、
+写三句定位问句、按指派的子类型写描述问句和描述。所以给同类密集目标消歧、
+换描述子类型都不额外增加调用。
 
-**`vlm.enabled: false` 时全部回落到模板描述**（形如「中部右侧是一个人员。」）。
-模板只陈述标注本身可确定的事实，绝不编造外观属性 —— 但它非常干瘪，
-**正式构建必须开启 VLM**，模板只是本地调试和单条失败时的兜底。
+坐标**永远由代码填**，模型碰不到 —— 它只负责文字。
+
+**`vlm.enabled: false` 时主线三族任务一条都出不来**（它们要求描述齐全），
+只剩纯坐标计算的那几个。本地不接服务也能把管道跑通，但产出没有意义，
+**正式构建必须开启 VLM**。
 
 VLM 结果按图落盘到 `vlm_cache/`，**支持断点续跑** —— 两万张图跑一遍要几小时，
-中途挂掉从头再来是不可接受的。
+中途挂掉从头再来是不可接受的。缓存键含 `prompts/` 的内容指纹，
+**改任何提示词自动失效**，不用手动清。
 
 ---
 
@@ -561,7 +593,8 @@ VLM 结果按图落盘到 `vlm_cache/`，**支持断点续跑** —— 两万张
 
 | 文件 | 用途 |
 |---|---|
-| `ground_unique.txt` / `ground_attribute.txt` | 主线的定位问句 |
+| `ground_unique.txt` | 主线的定位问句 |
+| `ground_attribute.txt` | 属性指代的兜底问句（正常走 VLM 现场生成） |
 | `inv_ask_*.txt` / `inv_answer_what.txt` | 盘点 → 定位 → 描述三轮 |
 | `ask_describe.txt` | 主线最后一轮：要描述 |
 | `detect_class.txt` | 按类别全找出来 |
@@ -569,7 +602,6 @@ VLM 结果按图落盘到 `vlm_cache/`，**支持断点续跑** —— 两万张
 | `attribute_qa_color/feature.txt` | 属性问答的两个维度 |
 | `exist_ask.txt` / `exist_*_answer.txt` | 存在性问答与拒答 |
 | `region_identify*.txt` | REG：给框问类别 |
-| `desc_opening.txt` | 描述的起手方式，每张图轮换一条 —— 见下 |
 | `gen_phrases.txt` | 扩充问法库用的提示词 |
 | `review.txt` / `review_sample.txt` | 全量质检 |
 | `measure_words.txt` | 一次性生成量词表 |
@@ -640,33 +672,6 @@ action / location / color / status / attributes 这些内容维度，靠 PACO-LV
 
 ---
 
-### 改了提示词一定要清缓存 —— 或者别管，它自己会失效
-
-VLM 缓存的键里含 **`prompts/` 全部内容的指纹**。改任何一个 `.txt`，
-指纹变，旧缓存自动失效。
-
-这一条是踩出来的：缓存键原先只有（图片，尺寸），改完描述子类型重跑三次，
-输出一字未变、也没有任何提示 —— 缓存的意义是「同一个问题不重复问」，
-改了提示词就不是同一个问题了。
-
-指纹按**内容**算不按修改时间算 —— `git checkout` 会改 mtime 但内容没变，
-按时间算会把好好的缓存全废掉。
-
----
-
-
-
-提示词里给固定的例子，模型会朝那几个例子的句式收敛 —— 例子越少收敛得越死
-（从 1 个例子加到 3 个，描述去重率从 79/142 涨到 111/112）。但只要例子是固定的，
-收敛就只是被削弱、没有消除：十万条描述可能全是「位于画面X角，一辆……」。
-
-`prompts/desc_opening.txt` 是一个「起手方式 ||| 示例」的池子，**每张图随机抽一条**
-塞进 `vlm_select` 的提示词，等于把「例子」这个变量本身也随机化了。
-
-效果**必须在真实服务上验**，用 `scripts/dataset_stats.py` 的「答案开头集中度」：
-轮换 N 种，最集中的一种超过 `2/N` 就是模型没照做、退回了自己的套路。
-那时把 `desc_opening.txt` 里的要求写得更硬，或者换描述能力更强的模型。
-
 ### 问法池与扩充问法库
 
 上表里带「问法池」的文件，每个非空非注释行是一种说法，构建时随机取一句。
@@ -679,9 +684,9 @@ VLM 缓存的键里含 **`prompts/` 全部内容的指纹**。改任何一个 `.
 （全部池子加起来十几次纯文本调用）。
 
 ```bash
-python scripts/build_phrase_banks.py                      # 全部池子
-python scripts/build_phrase_banks.py --pool inv_ask_what --show
-python scripts/build_phrase_banks.py --target 60 --force  # 重新生成
+# python scripts/build_phrase_banks.py    # 可选，默认关闭，见「问法库默认关闭」一节                      # 全部池子
+# python scripts/build_phrase_banks.py    # 可选，默认关闭，见「问法库默认关闭」一节 --pool inv_ask_what --show
+# python scripts/build_phrase_banks.py    # 可选，默认关闭，见「问法库默认关闭」一节 --target 60 --force  # 重新生成
 ```
 
 ### 问法是【指令】，不是聊天
@@ -744,20 +749,23 @@ python scripts/build_phrase_banks.py --target 60 --force  # 重新生成
 
 ```
 config/       default.yaml（进版本控制）+ local.yaml（服务器上改，已 gitignore）
-              measure_words.yaml / phrase_banks.yaml（一次性生成，长期复用）
+              measure_words.yaml（一次性生成，长期复用）
+              phrase_banks.yaml（同义扩充，默认关闭，见上）
 prompts/      提示词纯文本，按【任务】分目录 —— 见 prompts/README.md
   ground_unique/ ground_attribute/ inventory_locate/ detect_class/
   spatial_relation/ attribute_qa/ exist_negative/ region_identify/
                 每个任务一个目录，改一个不会误伤别的
   _shared/    多任务共用（主线末轮的描述问法、短答案后缀）
-  _vlm/       调 VLM 用（vlm_select 挑对象 / desc_opening 描述起手方式）
+  describe/   七种描述子类型，各一个文件，可单独改或关掉
+  _vlm/       调 VLM 用（vlm_select：挑对象 + 写问句 + 写描述）
   _tools/     一次性脚本用（量词表 / 扩充问法库 / 质检）
 core/         classes 类别表、易混与上下位检测 / coords 坐标换算 / yolo 标注解析
               difficulty 难度分级与配额 / grouping 来源分组
-              tasks 八个任务的样本生成 / pipeline 编排 / sample 格式契约
+              tasks 十四个任务的样本生成 / pipeline 编排 / sample 格式契约
               vlm_client 调模型（含模型池）/ phrase_bank 扩充问法库
               register 语体闸 / consistency 跨任务一致性
               review 主观质检 / stats 客观体检
+              describe_kinds 七种描述子类型 / colorcheck 像素核对颜色
               referring 描述成色判定与空间措辞 / cli 脚本入口包装
 scripts/      check_vlm.py 服务自检（逐路）/ analyze.py 分布分析
               build_measure_words.py 量词表 / build_phrase_banks.py 扩充问法库
@@ -765,9 +773,31 @@ scripts/      check_vlm.py 服务自检（逐路）/ analyze.py 分布分析
               review.py 主观质检 / dataset_stats.py 客观体检
               export_samples.py 每任务抽 N 条合成预览
               get_visdrone.py 下载测试数据集
-samples/      preview.jsonl + preview.md，各任务样本各 10 条（进版本控制）
+samples/      preview.jsonl + preview.md，各任务样本各 N 条（进版本控制）
+              头部会写明是哪个模型生成的 —— 桩服务的产物不能当真模型的表现看
 tests/        回归测试，不依赖外部数据和 VLM 服务
 ```
+
+## 回归测试
+
+```bash
+python tests/test_pipeline.py      # 76 项，不依赖外部数据和 VLM 服务
+```
+
+不需要模型服务、不需要数据集，几秒钟跑完。**服务器上部署后第一件事就跑它** ——
+它验的是坐标换算、来源分组、格式契约、各种闸（语体 / 语义 / 句法 / 颜色 /
+指代唯一性 / 跨任务一致性），这些错了后面全白跑。
+
+几条值得知道的：
+
+- 每个任务的问法池必须过得了它自己声明的规则（`#! forbid` / `#! require-any`），
+  规则和种子互相打架会当场挂
+- `tasks.py` 里每个用作人类问话的提示词都必须登记进 `phrase_banks.pools` ——
+  防止「新加了个任务忘了登记问法池」
+- 脚本里写死的提示词名必须都还存在 —— 删提示词漏掉下游引用，
+  用户会在跑到那一步才炸（实测踩过）
+
+---
 
 ## 参考实现
 

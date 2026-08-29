@@ -1224,6 +1224,26 @@ def test_prompt_change_invalidates_the_vlm_cache():
 
 
 
+
+def test_stats_do_not_reference_deleted_prompts():
+    """删提示词时漏掉下游引用，脚本会在用户跑到那一步才炸 ——
+    实测 desc_opening.txt 删掉后 dataset_stats.py 直接起不来。
+    这项测试扫所有脚本里写死的提示词名，确认它们都还在。"""
+    import re as _re
+    import prompts
+    root = Path(__file__).resolve().parents[1]
+    available = set(prompts._index())
+    for path in sorted((root / "scripts").glob("*.py")) + \
+                sorted((root / "core").glob("*.py")):
+        src = path.read_text(encoding="utf-8")
+        for name in _re.findall(r'prompts\.(?:load|render|load_variants|'
+                                r'render_choice|forbidden_of|required_any_of|'
+                                r'optional_group_of|max_len_of|path_of)\("(\w+)"',
+                                src):
+            assert name in available, f"{path.name} 引用了不存在的提示词 {name}.txt"
+
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

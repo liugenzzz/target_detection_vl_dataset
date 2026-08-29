@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import load_config                   # noqa: E402
 from core.cli import _cli                        # noqa: E402
-from core import review, stats                   # noqa: E402
+from core import describe_kinds, review, stats   # noqa: E402
 from core.classes import load_class_table        # noqa: E402
 import prompts                                  # noqa: E402
 from core.yolo import iter_annotations           # noqa: E402
@@ -60,7 +60,7 @@ def main() -> int:
 
     rep = stats.report(samples, dict(truth), sorted(table.id2name.values()),
                        int(cfg.get_path("coords.scale", 1000)),
-                       prompts.load_variants("desc_opening"))
+                       list(describe_kinds.load_all()))
     dst = args.out or src.with_name("dataset_stats.json")
     dst.write_text(json.dumps(rep, ensure_ascii=False, indent=2), encoding="utf-8")
     _print(rep, src, dst)
@@ -114,12 +114,20 @@ def _print(r, src, dst) -> None:
             print(f"    {k!r:12s} {v:>6.1%}  {_bar(v * 3)}")
         n = a.get("opening_kinds") or 1
         mark = "✓" if a.get("opening_ok") else "✗"
-        print(f"    {mark} 起手方式由 prompts/desc_opening.txt 轮换 {n} 种，"
-              f"均匀的话每种约 {1 / n:.1%}；最集中的一种占 "
-              f"{a.get('opening_max_share', 0):.1%}")
+        print(f"    {mark} 描述分 {n} 种子类型，答案结构不同、开头自然也该散开；"
+              f"最集中的一种占 {a.get('opening_max_share', 0):.1%}"
+              f"（均匀约 {1 / n:.1%}）")
         if not a.get("opening_ok"):
-            print("      超过均值两倍 —— 模型没照着轮换的要求写，退回了它自己的套路。")
-            print("      改 prompts/desc_opening.txt 把要求写得更硬，或换个描述能力更强的模型。")
+            print("      超过均值两倍 —— 七种正在退化成一种。")
+            print("      看下面各子类型的答案长度：哪一种和 full 差不多长，")
+            print("      就是它的 prompts/describe/<子类型>.txt 要求写得还不够硬。")
+
+    mix = r.get("describe_kind_mix") or {}
+    if mix:
+        print("\n【描述子类型】各出了多少、答案多长")
+        for k, v in mix.items():
+            print(f"    {k:<12} {v['n']:>5} 条  {v['share']:>6.1%}  平均 {v['len_avg']} 字")
+        print("    某一种的长度和 full 差不多，说明它没照着自己的要求写")
 
     e = r["exist_balance"]
     if e:
