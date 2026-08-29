@@ -708,6 +708,12 @@ action / location / color / status / attributes 这些内容维度，靠 PACO-LV
 三轮车」，加了方位就又滑回三段式。每个子类型的 `#! must-not:` 列出不该出现的
 词，越界的整条丢掉。没有这道闸，七种跑几轮会退化成同一种。
 
+**难度档位也要卡。** `ground_part` 和 `ground_contrast` 要求看清细部，派给
+困难目标（小、糊、密集）模型只能编一个部位出来 —— 而编造从答案文本上看不出来，
+`must-not` 拦不住。这两种在提示词里写了 `#! max-grade: medium`：指派阶段跳过
+没有目标够档的图，生成阶段按 `Grade` 再兜一次底。粗粒度的几种不设上限，
+否则困难目标一条描述都出不来。
+
 构建报告的 `describe_kinds` 记录每种的 ok / declined / out_of_scope：
 `declined` 高说明这个子类型对你的数据不适用（航拍小目标看不清部件），
 `out_of_scope` 高说明那个 `.txt` 的要求还不够硬。

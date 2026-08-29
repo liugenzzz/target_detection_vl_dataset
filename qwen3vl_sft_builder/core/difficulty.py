@@ -29,6 +29,18 @@ EASY, MEDIUM, HARD, REJECT = "easy", "medium", "hard", "reject"
 _ORDER = {EASY: 0, MEDIUM: 1, HARD: 2, REJECT: 3}
 
 
+def grade_at_most(grade: str, limit: str) -> bool:
+    """grade 是否不难于 limit。limit 为空表示不限。
+
+    描述子类型用它来卡适用档位：`part`（聚焦部位）和 `contrast`（同类对比）
+    在困难目标上必然写不出来 —— 看不清部件、也分辨不出和同类的差别，
+    模型硬写就是编。
+    """
+    if not limit:
+        return True
+    return _ORDER.get(grade, 99) <= _ORDER.get(limit, 99)
+
+
 @dataclass
 class Grade:
     box_index: int

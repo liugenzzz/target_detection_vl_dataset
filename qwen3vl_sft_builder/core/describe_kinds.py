@@ -42,6 +42,10 @@ class Kind:
     answer_spec: str     # 答案该装什么
     q_example: str
     a_example: str
+    # 适用的最难档位（easy/medium/hard），空串表示不限。
+    # 困难目标本来就小、糊、密集，`part` 和 `contrast` 这种要求看清细部的
+    # 子类型派给它只会逼模型编 —— 在指派和生成两处都据此跳过。
+    max_grade: str = ""
 
 
 def _directive(text: str, key: str) -> str:
@@ -80,10 +84,16 @@ def load_all() -> Dict[str, Kind]:
             answer_spec=_field(text, "answer-spec"),
             q_example=_field(text, "q-example"),
             a_example=_field(text, "a-example"),
+            max_grade=_directive(text, "max-grade"),
         )
     if not out:
         raise ValueError(f"{prompts.PROMPT_DIR / PROMPT_SUBDIR} 下没有任何子类型文件")
     return out
+
+
+def limits(kinds: Dict[str, Kind]) -> Dict[str, str]:
+    """{子类型名: 最难档位}，只收有限制的。交给生成阶段做兜底。"""
+    return {n: k.max_grade for n, k in kinds.items() if k.max_grade}
 
 
 def render_assignment(kind: Kind, slot: int) -> str:

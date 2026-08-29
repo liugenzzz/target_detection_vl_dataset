@@ -1387,3 +1387,80 @@ if __name__ == "__main__":
                 failed += 1; print(f"  FAIL  {name}  {e}")
     print(f"\n{passed} passed, {failed} failed")
     sys.exit(1 if failed else 0)
+
+def test_fine_grained_kinds_are_not_asked_of_hard_targets():
+    """`part`/`contrast` 要求看清细部，困难目标上必然写不出来。
+
+    档位限制写在 prompts/describe/<子类型>.txt 的 `#! max-grade:` 里，
+    生成阶段据此把不够档的目标从候选里剔掉 —— 否则模型只能编一个部位出来，
+    而这种编造从答案文本上看不出来，闸门都拦不住。
+    """
+    from types import SimpleNamespace
+
+    from core.difficulty import EASY, HARD
+    from core.tasks import TASKS
+
+    def build(grade):
+        ctx = _ctx_with_filtered([_Box(0, "卡车")], {"卡车": 1})
+        ctx.grades[0] = SimpleNamespace(box_index=0, label="卡车", grade=grade)
+        ctx.kind_limits = {"part": "medium"}
+        ctx.vlm[0].update({"attribute": "银灰色", "color": "银灰色",
+                           "describe_kind": "part",
+                           "describe_q": "这辆卡车的货斗是什么样的？",
+                           "description": "货斗是蓝色金属的，后挡板放了下来。"})
+        return ctx
+
+    assert TASKS["ground_part"](build(EASY)) is not None
+    assert TASKS["ground_part"](build(HARD)) is None
+    # 没配限制的子类型不受影响
+    ctx = build(HARD)
+    ctx.kind_limits = {}
+    assert TASKS["ground_part"](ctx) is not None
+
+
+def test_part_and_contrast_declare_a_difficulty_ceiling():
+    """限制是写在提示词文件里的配置，不是代码里的硬编码 ——
+    这一项防的是有人改提示词时把 `#! max-grade:` 顺手删掉。"""
+    from core import describe_kinds
+    kinds = describe_kinds.load_all()
+    limits = describe_kinds.limits(kinds)
+    assert limits.get("part") == "medium"
+    assert limits.get("contrast") == "medium"
+    # 粗粒度的那几种不该有上限，否则困难目标就一条描述都出不来了
+    for name in ("appearance", "position", "relation"):
+        assert not kinds[name].max_grade
+
+
+def test_kind_rotation_skips_kinds_this_image_cannot_support():
+    """全是困难目标的图上派 `part`，模型只会返回空，白占一个槽位。
+    轮转表要跳过去，而不是把槽位浪费掉。"""
+    from types import SimpleNamespace
+
+    from core.difficulty import EASY, HARD
+    from core.pipeline import _next_kind
+
+    table = [SimpleNamespace(name="appearance", max_grade=""),
+             SimpleNamespace(name="part", max_grade="medium"),
+             SimpleNamespace(name="position", max_grade="")]
+
+    # 有简单目标：轮转表一个不跳，part 照派
+    picked = []
+    cursor = 0
+    for _ in range(3):
+        k, cursor = _next_kind(table, cursor, [EASY, HARD])
+        picked.append(k.name)
+    assert picked == ["appearance", "part", "position"]
+
+    # 全是困难目标：part 跳过，槽位让给粗粒度的
+    picked = []
+    cursor = 0
+    for _ in range(3):
+        k, cursor = _next_kind(table, cursor, [HARD, HARD])
+        picked.append(k.name)
+    assert "part" not in picked
+    assert picked == ["appearance", "position", "appearance"]
+
+    # 一圈都不合适也必须给出一个 —— 让模型自己拒绝，不能不指派
+    only_part = [SimpleNamespace(name="part", max_grade="medium")]
+    k, cursor = _next_kind(only_part, 0, [HARD])
+    assert k.name == "part"

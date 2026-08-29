@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, List, Optional
 import prompts
 
 from . import register
+from .difficulty import grade_at_most
 from .referring import is_vacuous_description
 
 # 属性问答目前只问颜色。VLM 返回的 attribute 是「用于指认的最显眼特征」，
@@ -72,9 +73,21 @@ class Ctx:
     confusable: Dict[str, List[str]] = field(default_factory=dict)
     # {类别名: [与它互为上下位的类别名]}。拒答样本必须避开，见 hypernyms_of。
     hypernym: Dict[str, List[str]] = field(default_factory=dict)
+    # {描述子类型: 最难档位}。见 prompts/describe/<子类型>.txt 的 `#! max-grade:`。
+    # 指派阶段已经按这张图的档位跳过了不适用的子类型，这里是兜底：
+    # 缓存里可能还留着改限制之前派下去的结果。
+    kind_limits: Dict[str, str] = field(default_factory=dict)
     # 本张图已经被出过样本的框。同一个目标出多条样本时，答案 bbox 完全相同，
     # 只是问法不同，属于近重复数据 —— 实测同一个框曾在一张图里被出了 4 次。
     used: set = field(default_factory=set)
+
+    def kind_fits(self, kind: str, box) -> bool:
+        """这个框的难度档位配不配做这一种描述。没配限制或没有档位信息就放行。"""
+        limit = self.kind_limits.get(kind, "")
+        if not limit:
+            return True
+        g = self.grades.get(box.index)
+        return g is None or grade_at_most(g.grade, limit)
 
     def unused(self, boxes):
         """过滤掉本图已用过的框；全都用过时返回空列表，任务据此跳过。"""
@@ -357,6 +370,7 @@ def _ground_describe(ctx: Ctx, kind: str):
     """
     cand = [b for b in ctx.unused(ctx.boxes)
             if (ctx.vlm.get(b.index) or {}).get("describe_kind") == kind
+            and ctx.kind_fits(kind, b)
             and _attr_identifies(ctx, b, (ctx.vlm.get(b.index) or {}).get("attribute", ""))]
     if not cand:
         return None

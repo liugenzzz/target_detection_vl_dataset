@@ -15,7 +15,7 @@ import prompts
 from .sample import validate_sample
 from .classes import load_class_table
 from .coords import yolo_to_bbox2d
-from .difficulty import HARD, REJECT, Grader, balance_hard_quota
+from .difficulty import HARD, REJECT, Grader, balance_hard_quota, grade_at_most
 from .grouping import source_group_key
 from .referring import spatial_phrase
 from .tasks import MAIN_LINE, TASKS, Ctx
@@ -45,6 +45,22 @@ logger = logging.getLogger(__name__)
 # 一个样本槽位最多尝试几个任务类型。太小会浪费槽位，太大会让配比偏离权重。
 MAX_TRY = 4
 
+
+
+def _next_kind(kind_list, cursor, grades):
+    """轮转表里下一个【这张图派得下去】的描述子类型，返回 (子类型, 新游标)。
+
+    全是困难目标的图上派 `part`/`contrast`，模型只能返回空，白占一个槽位。
+    一圈都没有合适的就退回轮转表里的那一个 —— 宁可让模型自己拒绝，
+    也不能不给指派，那样描述又会坍缩回它最省力的那种。
+    """
+    k = kind_list[cursor % len(kind_list)]
+    for _ in range(len(kind_list)):
+        k = kind_list[cursor % len(kind_list)]
+        cursor += 1
+        if any(grade_at_most(g, k.max_grade) for g in grades):
+            break
+    return k, cursor
 
 
 def _box_list_text(boxes, bbox2d) -> str:
@@ -86,6 +102,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                  for _ in range(w) if n in kinds]
     if not kind_list:
         kind_list = list(kinds.values())
+    kind_limits = describe_kinds.limits(kinds)
     kind_cursor = 0
     kind_plan: Dict[str, List[str]] = {}    # 图 -> [第1个挑中的子类型, 第2个, ...]
     kind_stats = Counter()
@@ -176,10 +193,10 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
             # （实测过一次：给它「换动词换句式」的自由，它就只换同义词、
             # 骨架一个不动）。代码指派、模型可拒绝，分布才控得住。
             n_slots = min(max_pick, len(kept))
+            grades_here = [sc["gmap"][b.index].grade for b in kept]
             slots, lines = [], []
             for i in range(n_slots):
-                k = kind_list[kind_cursor % len(kind_list)]
-                kind_cursor += 1
+                k, kind_cursor = _next_kind(kind_list, kind_cursor, grades_here)
                 slots.append(k.name)
                 lines.append(describe_kinds.render_assignment(k, i + 1))
             kind_plan[str(ann.image_path)] = slots
@@ -254,7 +271,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                            used=used, min_desc_len=min_desc_len,
                            raw_counts=sc["raw_counts"], forbid_chat=forbid_chat,
                            confusable=confusable, hypernym=hypernym,
-                          json_fence=json_fence)
+                           kind_limits=kind_limits, json_fence=json_fence)
 
             # strict：只试欠账最多的那一个，补不上就空过这个槽位，配比一分不歪。
             # fill：往下顺延，优先填满槽位，配比会偏。数据量的瓶颈从来不在
