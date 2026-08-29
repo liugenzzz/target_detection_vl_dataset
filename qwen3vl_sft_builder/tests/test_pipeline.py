@@ -1274,6 +1274,109 @@ def test_preview_provenance_reads_results_not_request_count():
 
 
 
+
+def test_no_dead_config_keys():
+    """配置文件里不该有没人读的键。
+
+    废弃一个任务时很容易只删代码、忘了删它的配置 —— 留下的键看着像开关，
+    改了却毫无反应，比没有这个选项更糟。实测积了 6 组：refer_locate.*、
+    sampling.multi_target_*、sampling.negative_ratio、split.group_by_source、
+    output.format，全是 refer_locate / SampleBuilder 废弃后留下的。
+    """
+    import yaml
+    root = Path(__file__).resolve().parents[1]
+    src = "\n".join(p.read_text(encoding="utf-8")
+                     for p in list((root / "core").rglob("*.py"))
+                     + list((root / "scripts").rglob("*.py")))
+    cfg = yaml.safe_load((root / "config" / "default.yaml").read_text(encoding="utf-8"))
+
+    dead = []
+    def walk(node, prefix=""):
+        for k, v in (node or {}).items():
+            path = f"{prefix}{k}"
+            if isinstance(v, dict) and v:
+                walk(v, path + ".")
+                continue
+            # 三种读法都算：整条点号路径、叶子名（v.get("api_url") 这种）、
+            # 以及整段取走再遍历（tasks 段就是这么用的）
+            if (f'"{path}"' in src or f"'{path}'" in src
+                    or f'"{k}"' in src or f"'{k}'" in src
+                    or f'"{prefix.rstrip(".")}"' in src):
+                continue
+            dead.append(path)
+    walk(cfg)
+    assert not dead, f"这些配置项没人读，删掉或者接上：{dead}"
+
+    # local.yaml.example 是给用户复制的，不能带着死键
+    ex = yaml.safe_load((root / "config" / "local.yaml.example")
+                        .read_text(encoding="utf-8")) or {}
+    known = set(cfg)
+    assert set(ex) <= known, f"example 里有 default 没有的顶层键：{sorted(set(ex) - known)}"
+
+
+
+
+# --------------------------------------------------------------- 流式与进度
+
+def test_streaming_decodes_utf8_not_latin1():
+    """流式必须自己按 UTF-8 解码。requests 的 iter_lines(decode_unicode=True)
+    用的是 resp.encoding，而服务端 Content-Type 不带 charset 时默认 ISO-8859-1
+    —— 中文会变成「ç\x99½è\x89²」这种乱码，不报错、一路写进数据集。实测踩到。"""
+    import json as _json
+    from config import Config
+    from core.vlm_client import VlmClient
+
+    body = _json.dumps({"choices": [{"delta": {"content": "白色车身"}}]},
+                       ensure_ascii=False)
+    lines = [f"data: {body}".encode("utf-8"), b"", b"data: [DONE]"]
+
+    class _Resp:
+        status_code = 200
+        encoding = "ISO-8859-1"          # 服务端没给 charset 时 requests 的默认
+        def iter_lines(self, decode_unicode=False):
+            for b in lines:
+                yield b.decode(self.encoding) if decode_unicode else b
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    class _Requests:
+        @staticmethod
+        def post(*a, **k): return _Resp()
+
+    c = VlmClient(Config({"vlm": {"api_url": "http://x/v1/c", "model": "m"}}))
+    got = c._post_stream(_Requests, c.endpoints[0], {}, {})
+    assert got == "白色车身", f"流式解码坏了：{got!r}"
+
+
+def test_progress_degrades_outside_tty():
+    """重定向到文件 / nohup 时不能刷回车 —— 几万行 \r 会把日志淹掉。
+    非 TTY 时按百分比打行。"""
+    import io
+    from core.progress import Progress
+    buf = io.StringIO()                    # StringIO 不是 TTY
+    with Progress("测试", 100, stream=buf, min_interval=0) as bar:
+        for _ in range(100):
+            bar.step()
+    out = buf.getvalue()
+    assert "\r" not in out, "非 TTY 不该输出回车"
+    assert out.count("\n") <= 25, f"打了太多行：{out.count(chr(10))}"
+    assert "100/100" in out
+
+
+def test_progress_is_thread_safe():
+    """预取是多线程的，step() 会被并发调用 —— 计数不能丢。"""
+    import io
+    from concurrent.futures import ThreadPoolExecutor
+    from core.progress import Progress
+    buf = io.StringIO()
+    bar = Progress("并发", 2000, stream=buf, min_interval=0)
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(lambda _: bar.step(), range(2000)))
+    bar.close()
+    assert bar.done == 2000, bar.done
+
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

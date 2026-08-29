@@ -15,7 +15,7 @@ import prompts
 from .sample import validate_sample
 from .classes import load_class_table
 from .coords import yolo_to_bbox2d
-from .difficulty import REJECT, Grader
+from .difficulty import HARD, REJECT, Grader, balance_hard_quota
 from .grouping import source_group_key
 from .referring import spatial_phrase
 from .tasks import MAIN_LINE, TASKS, Ctx
@@ -36,7 +36,7 @@ def _load_measure_words(cfg) -> Dict[str, str]:
         return {}
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return {str(k): str(v) for k, v in (data.get("measure_words") or {}).items()}
-from . import colorcheck, consistency, describe_kinds, phrase_bank
+from . import colorcheck, consistency, describe_kinds, phrase_bank, progress
 from .vlm_client import VlmClient
 from .yolo import iter_annotations
 
@@ -78,6 +78,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     require_desc = bool(cfg.get_path("main_line_requires_description", True))
     min_desc_len = int(cfg.get_path("min_description_len", 18))
     all_labels = sorted(table.id2name.values())
+    show_progress = bool(cfg.get_path("vlm.progress", True))
     kinds = describe_kinds.load_all()
     # 按 tasks 里各 ground_* 的权重排出轮转表 —— 权重大的在表里出现次数多，
     # 指派频率就跟着配比走。
@@ -125,11 +126,39 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         kept = [b for b in ann.boxes if gmap[b.index].grade != REJECT]
         if not kept:
             continue
+        # 【困难目标全局配额】。质量过滤只把「糊到没法用」的丢掉，剩下的里面
+        # 困难档仍然很多 —— 实测不做配额时产出里困难目标占 43%，而要求是 10%。
+        # 配额必须【全局】做：逐图做的话，一张全是困难目标的图仍会贡献满额困难
+        # 样本，加起来还是超标（实测逐图配额得到 40.7%）。所以这里先记下候选，
+        # 扫完全部图再统一下采样。
         raw_counts = Counter(b.label for b in ann.boxes)
         scenes.append({"ann": ann, "kept": kept, "gmap": gmap,
                        "raw_counts": dict(raw_counts)})
         if limit and len(scenes) >= limit:
             break
+
+    # 【困难目标全局配额】。质量过滤只把「糊到没法用」的丢掉，剩下的里面困难档
+    # 仍然很多 —— 实测不做配额时产出里困难目标占 43%，而要求是 10%。
+    #
+    # 配额必须【全局】做：逐图做的话，一张全是困难目标的图仍会贡献满额困难样本，
+    # 加起来还是超标（实测逐图配额得到 40.7%）。所以扫完全部图再统一下采样。
+    hard_quota = float(cfg.get_path("difficulty.hard_quota", 0.10))
+    keys = [(si, b.index) for si, sc in enumerate(scenes) for b in sc["kept"]]
+    kept_keys = set(balance_hard_quota(
+        keys, lambda k: scenes[k[0]]["gmap"][k[1]].grade, hard_quota, seed))
+    hard_before = sum(1 for k in keys if scenes[k[0]]["gmap"][k[1]].grade == HARD)
+    for si, sc in enumerate(scenes):
+        sc["kept"] = [b for b in sc["kept"] if (si, b.index) in kept_keys]
+    scenes = [sc for sc in scenes if sc["kept"]]
+    hard_after = sum(1 for sc in scenes for b in sc["kept"]
+                     if sc["gmap"][b.index].grade == HARD)
+    boxes_after = sum(len(sc["kept"]) for sc in scenes)
+    quota_stats = {
+        "hard_before": hard_before, "hard_after": hard_after,
+        "boxes_after": boxes_after,
+        "hard_ratio": round(hard_after / boxes_after, 4) if boxes_after else 0.0,
+        "quota": hard_quota,
+    }
 
     if not scenes:
         raise RuntimeError(f"{labels_dir} 下没有可用场景，检查类别表与阈值配置")
@@ -167,6 +196,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     failed = Counter()
     invalid = 0
 
+    gen_bar = progress.make("生成样本", len(scenes), show_progress)
     for sc in scenes:
         ann, kept, gmap = sc["ann"], sc["kept"], sc["gmap"]
         b2d = bbox2d_for(ann)
@@ -280,6 +310,8 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
             made[name] += 1
             used.update(out.get("focus", []))
             samples.append(sample)
+        gen_bar.step(note=f"{len(samples)} 条")
+    gen_bar.close()
 
     # ---- 阶段四：按来源分组划分 ----
     train, val = _split_by_source(samples, cfg, seed)
@@ -300,6 +332,9 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         "images_scanned": n_images,
         "boxes_total": n_boxes,
         "scenes_usable": len(scenes),
+        # 困难目标下采样前后。hard_ratio 应该贴近 quota ——
+        # 差很多说明简单档本身就不够，配额算式被 min() 截断了。
+        "hard_quota": quota_stats,
         "samples_total": sum(made.values()),
         "by_task_type": {k: made[k] for k in TASKS if made[k]},
         "task_ratio_actual": {k: round(made[k] / total, 4) for k in TASKS if made[k]},

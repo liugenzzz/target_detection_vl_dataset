@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from . import progress
+
 logger = logging.getLogger(__name__)
 
 
@@ -130,6 +132,11 @@ class VlmClient:
         self._rr = 0                      # 轮转游标，_lock 保护
         # prompts/ 全部内容的指纹，进缓存键。改提示词自动让缓存失效。
         self._prompt_fp = _prompt_fingerprint()
+        # 流式：一次调用要几十秒，非流式时它和「卡死」长得一模一样。
+        self.stream = bool(v.get("stream", True))
+        self._on_token = None          # 进度条挂进来，收到 token 就刷新
+        self._last_stream_status = None
+        self.show_progress = bool(v.get("progress", True))
         # 加权轮转表：concurrency=8 的那路在表里出现 8 次
         self._rotation = [e for e in self.endpoints for _ in range(e.concurrency)]
         # 挑对象那次调用要顺带生成多样的问句，温度低了三句会写得几乎一样。
@@ -203,6 +210,7 @@ class VlmClient:
 
     # ------------------------------------------------------ 并发预取
     def prefetch(self, tasks: Sequence[Tuple[Path, Sequence[int], str, str]],
+                 label: str = "VLM 预取",
                  progress_every: int = 200) -> None:
         """并发把所有目标的 VLM 结果灌进缓存，之后 describe() 全部命中缓存。
 
@@ -251,6 +259,14 @@ class VlmClient:
         # 会先把整个队列跑完才让 KeyboardInterrupt 冒出来 —— 10 万条任务时
         # 第一次 Ctrl-C 要等几小时才生效，和「支持断点续跑」自相矛盾。
         pool = ThreadPoolExecutor(max_workers=self.concurrency)
+        bar = progress.make(label, len(todo), self.show_progress)
+        # 流式的 token 回调挂到进度条上：长调用途中也在动，卡住一眼看得出来
+        tokens = [0]
+
+        def on_token(n):
+            tokens[0] += n
+
+        self._on_token = on_token
         try:
             futures = [pool.submit(work, t) for t in todo]
             for fut in as_completed(futures):
@@ -262,24 +278,24 @@ class VlmClient:
                     ok = False
                 with self._lock:
                     self.stats["prefetched" if ok else "failed"] += 1
+                failed = self.stats["failed"]
+                bar.step(note=(f"失败 {failed}" if failed else "") or
+                              (f"{tokens[0] // 1000}k tokens" if tokens[0] else ""))
                 if self._fatal:
                     self._cancel.set()
                     pool.shutdown(wait=False, cancel_futures=True)
+                    bar.close()
                     raise FatalVlmError(self._fatal)
-                if done % progress_every == 0 or done == len(todo):
-                    elapsed = time.time() - started
-                    rate = done / elapsed if elapsed else 0
-                    left = (len(todo) - done) / rate if rate else 0
-                    logger.info("VLM 预取 %d/%d（%.1f 条/秒，剩余约 %.1f 分钟）",
-                                done, len(todo), rate, left / 60)
         except KeyboardInterrupt:
             self._cancel.set()
             pool.shutdown(wait=False, cancel_futures=True)
+            bar.close()
             logger.warning("收到中断：已完成 %d/%d，结果已落盘，重跑从断点继续",
                            done, len(todo))
             raise
         else:
             pool.shutdown(wait=True)
+            bar.close()
         finally:
             failed = self.stats["failed"]
             if failed:
@@ -334,6 +350,50 @@ class VlmClient:
             "max_tokens": self.max_tokens,
         }
 
+    def _post_stream(self, requests, ep, body, headers) -> Optional[str]:
+        """流式发一次请求，边收边攒。返回完整文本；非 200 返回 None 走原路重试。
+
+        流式的意义不是快，是【看得见】：一次调用要几十秒，非流式时它和「卡死」
+        长得一模一样。流式下每收到一个 token 就刷新一次「还活着」，
+        真卡住时也能从「多久没收到新 token」判出来，而不是干等超时。
+        """
+        payload = dict(body, stream=True)
+        try:
+            with requests.post(ep.api_url, json=payload, headers=headers,
+                               timeout=self.timeout, stream=True) as resp:
+                if resp.status_code != 200:
+                    # 让调用方按非流式那套逻辑处理状态码
+                    self._last_stream_status = (resp.status_code, resp.text[:400])
+                    return None
+                # 【必须自己按 UTF-8 解码】。iter_lines(decode_unicode=True) 用的是
+                # resp.encoding，而服务端 Content-Type 不带 charset 时 requests
+                # 默认 ISO-8859-1 —— 中文会变成「ç\x99½è\x89²」这种乱码，
+                # 而且不报错、一路写进数据集。实测踩到。
+                chunks, last = [], time.time()
+                for raw_bytes in resp.iter_lines(decode_unicode=False):
+                    if not raw_bytes:
+                        continue
+                    raw = raw_bytes.decode("utf-8", errors="replace")
+                    line = raw[6:] if raw.startswith("data: ") else raw
+                    if line.strip() in ("[DONE]", ""):
+                        continue
+                    try:
+                        piece = json.loads(line)["choices"][0]
+                    except (ValueError, KeyError, IndexError):
+                        continue
+                    delta = (piece.get("delta") or {}).get("content") or ""
+                    if delta:
+                        chunks.append(delta)
+                        now = time.time()
+                        if now - last > 1.0:      # 每秒最多回调一次，别刷爆
+                            last = now
+                            if self._on_token:
+                                self._on_token(len(delta))
+                return "".join(chunks) or None
+        except Exception as exc:                       # noqa: BLE001
+            logger.warning("%s 流式读取中断：%s", ep.name, exc)
+            return None
+
     def _pick(self) -> Optional[Endpoint]:
         """轮转取一路健康的端点。全都挂了返回 None。
 
@@ -377,8 +437,21 @@ class VlmClient:
             body = dict(payload, model=ep.model)     # 模型名由这一路决定
 
             try:
-                resp = requests.post(ep.api_url, json=body,
-                                     headers=headers, timeout=self.timeout)
+                if self.stream:
+                    text = self._post_stream(requests, ep, body, headers)
+                    if text is not None:
+                        with self._lock:
+                            self.by_endpoint[ep.name] = self.by_endpoint.get(ep.name, 0) + 1
+                        return text
+                    resp = None
+                else:
+                    resp = requests.post(ep.api_url, json=body,
+                                         headers=headers, timeout=self.timeout)
+                if resp is None:
+                    logger.warning("%s 流式返回为空（第 %s 次）", ep.name, attempt)
+                    if attempt < self.max_retries:
+                        time.sleep(min(2 ** attempt, 10))
+                    continue
                 if resp.status_code == 200:
                     with self._lock:
                         self.by_endpoint[ep.name] = self.by_endpoint.get(ep.name, 0) + 1

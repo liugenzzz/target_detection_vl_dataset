@@ -109,7 +109,7 @@ def main() -> int:
             text = prompts.render("review", width=w, height=h,
                                   samples=review.render_samples(group))
             tasks.append((image, _key_of(group), "review", text))
-        client.prefetch(tasks)
+        client.prefetch(tasks, label="质检")
 
     scored = unscored = 0
     for image, group in chunks:
