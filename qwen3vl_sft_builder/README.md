@@ -23,7 +23,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `train.jsonl` / `val.jsonl` | **主产物**。ShareGPT 多轮格式，按来源分组划分，无同源泄漏 |
+| `train.jsonl` / `val.jsonl` / `test.jsonl` | **主产物**。ShareGPT 多轮格式，按来源分组划分，三份之间无同源泄漏 |
 | `build_report.json` | 各任务实得配比、跨任务一致性核对、问法去重率、模型池分发 |
 | `train.reviewed.jsonl` | 质检通过的（跑过 `review.py` 之后） |
 | `train.rejected.jsonl` | 质检没通过的，带驳回原因，**人工扫一眼再决定**，不自动删 |
@@ -158,7 +158,8 @@ python scripts/export_samples.py
 ```
 output/
 ├── train.jsonl          训练集
-├── val.jsonl            验证集
+├── val.jsonl            验证集（训练框架挑 checkpoint 用）
+├── test.jsonl           测试集（全程不进训练，只在评估模型时拆封，恒带 metadata）
 ├── build_report.json    构建报告：难度分布、配比、易混类别、划分校验
 ├── verify/              验证图 + manifest.json（人工复核看这个）
 └── vlm_cache/           VLM 结果缓存，支持断点续跑

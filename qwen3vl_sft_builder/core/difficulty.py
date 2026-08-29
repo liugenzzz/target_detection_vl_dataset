@@ -29,6 +29,11 @@ EASY, MEDIUM, HARD, REJECT = "easy", "medium", "hard", "reject"
 _ORDER = {EASY: 0, MEDIUM: 1, HARD: 2, REJECT: 3}
 
 
+def grade_rank(grade: str) -> int:
+    """难度档位的序，easy < medium < hard。用于「取最难的那个」。"""
+    return _ORDER.get(grade, 0)
+
+
 def grade_at_most(grade: str, limit: str) -> bool:
     """grade 是否不难于 limit。limit 为空表示不限。
 
@@ -39,6 +44,23 @@ def grade_at_most(grade: str, limit: str) -> bool:
     if not limit:
         return True
     return _ORDER.get(grade, 99) <= _ORDER.get(limit, 99)
+
+
+# 报表用的尺寸分档，和难度分档是【两根独立的轴】：
+# 难度还掺了密集度和指代唯一性，尺寸只看框有多大。评估报告要按尺寸拆开看
+# （小目标掉点是不是特别厉害），所以单独给一套阈值。
+# 阈值沿用 COCO 的 32 / 96 边长口径，但作用在 equiv_px 上 —— 那是「面积占比
+# 还原到 1024 基准的等效边长」，对原图分辨率不变，128x128 和 2048x1440
+# 两张图上的同一个占比会落进同一档。直接用原图绝对像素做不到这点。
+SMALL, MEDIUM_SIZE, LARGE = "small", "medium", "large"
+
+
+def size_bucket(equiv_px: float, small_px: float = 32.0, large_px: float = 96.0) -> str:
+    if equiv_px < small_px:
+        return SMALL
+    if equiv_px < large_px:
+        return MEDIUM_SIZE
+    return LARGE
 
 
 @dataclass
@@ -67,9 +89,15 @@ class Grader:
         self.dense_medium = int(d.get("dense_medium", 3))
         self.dense_hard = int(d.get("dense_hard", 8))
         self.hard_quota = float(d.get("hard_quota", 0.10))
+        self.bucket_small = float(d.get("size_bucket_small_px", 32))
+        self.bucket_large = float(d.get("size_bucket_large_px", 96))
         self.min_area = float(q.get("min_area_ratio", 0.001))
         self.max_area = float(q.get("max_area_ratio", 0.5))
         self.min_short_px = float(q.get("min_short_side_px", 16))
+
+    def bucket_of(self, grade: "Grade") -> str:
+        """这个框的尺寸档，供报表按尺寸拆分。"""
+        return size_bucket(grade.equiv_px, self.bucket_small, self.bucket_large)
 
     def equivalent_px(self, area_ratio: float) -> float:
         """面积占比 -> 模型实际看到的等效边长像素。对原图缩放不变。"""

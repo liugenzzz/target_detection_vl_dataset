@@ -1464,3 +1464,74 @@ def test_kind_rotation_skips_kinds_this_image_cannot_support():
     only_part = [SimpleNamespace(name="part", max_grade="medium")]
     k, cursor = _next_kind(only_part, 0, [HARD])
     assert k.name == "part"
+
+
+def test_split_is_three_way_and_leaks_nothing_across_groups():
+    """val 会被训练框架拿去挑 checkpoint，用它报模型成绩等于自己给自己出卷子。
+    test 必须是独立的第三份，而且三份之间同源组一个都不能重叠 ——
+    视频抽帧和 Roboflow 增强会让「同一张图」以几十个文件名出现。"""
+    from core.pipeline import _split_by_source, _split_stats
+
+    class _Cfg:
+        def get_path(self, key, default=None):
+            return {"split.val_ratio": 0.2, "split.test_ratio": 0.2}.get(key, default)
+
+    # 12 个来源组，每组 5 条（同一段视频的连续帧）
+    samples = [{"images": [f"vid{g:02d}_mp4-{f}.jpg"], "id": f"{g}_{f}"}
+               for g in range(12) for f in range(5)]
+    train, val, test = _split_by_source(samples, _Cfg(), seed=7)
+
+    assert len(train) + len(val) + len(test) == 60
+    assert test and val and train
+    stats = _split_stats(train, val, test)
+    assert stats["group_overlap"] == 0
+    # 每一组要么整组进 train，要么整组进 val/test，不能被切开
+    for part in (train, val, test):
+        ids = {s["images"][0].split("_mp4-")[0] for s in part}
+        others = {s["images"][0].split("_mp4-")[0]
+                  for other in (train, val, test) if other is not part
+                  for s in other}
+        assert not (ids & others)
+
+
+def test_split_is_reproducible_for_the_same_seed():
+    """换个种子重跑就换一批 test，等于每次评估都在换卷子，前后数字没法比。"""
+    from core.pipeline import _split_by_source
+
+    class _Cfg:
+        def get_path(self, key, default=None):
+            return {"split.val_ratio": 0.1, "split.test_ratio": 0.1}.get(key, default)
+
+    samples = [{"images": [f"img{i:03d}.jpg"], "id": str(i)} for i in range(50)]
+    a = _split_by_source(samples, _Cfg(), seed=42)
+    b = _split_by_source(samples, _Cfg(), seed=42)
+    assert [s["id"] for s in a[2]] == [s["id"] for s in b[2]]
+
+
+def test_sample_metadata_carries_difficulty_and_size_bucket():
+    """困难目标只占 10%，报表拆不开就会被 90% 的简单目标稀释成「还行」。
+    多框任务取【最小/最难】的那个框 —— 一条样本的难度由它最难的目标决定。"""
+    from types import SimpleNamespace
+
+    from core.difficulty import EASY, HARD
+    from core.pipeline import _focus_difficulty
+
+    grader = SimpleNamespace(bucket_of=lambda g: "small" if g.equiv_px < 32 else "large")
+    gmap = {
+        0: SimpleNamespace(grade=EASY, area_ratio=0.04, equiv_px=204.8),
+        1: SimpleNamespace(grade=HARD, area_ratio=0.0004, equiv_px=20.5),
+    }
+
+    single = _focus_difficulty([0], gmap, grader)
+    assert single["difficulty"] == EASY and single["size_bucket"] == "large"
+
+    # 两个框：难度取最难的 hard，尺寸取最小的那个
+    multi = _focus_difficulty([0, 1], gmap, grader)
+    assert multi["difficulty"] == HARD
+    assert multi["size_bucket"] == "small"
+    assert multi["area_ratio"] == 0.0004
+
+    # 拒答类没有焦点框，四个字段都得是 None，不能拿 0 冒充
+    none = _focus_difficulty([], gmap, grader)
+    assert none == {"difficulty": None, "area_ratio": None,
+                    "equiv_px": None, "size_bucket": None}

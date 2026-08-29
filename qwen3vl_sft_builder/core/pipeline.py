@@ -15,7 +15,8 @@ import prompts
 from .sample import validate_sample
 from .classes import load_class_table
 from .coords import yolo_to_bbox2d
-from .difficulty import HARD, REJECT, Grader, balance_hard_quota, grade_at_most
+from .difficulty import (HARD, REJECT, Grader, balance_hard_quota, grade_at_most,
+                          grade_rank)
 from .grouping import source_group_key
 from .referring import spatial_phrase
 from .tasks import MAIN_LINE, TASKS, Ctx
@@ -310,6 +311,11 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                     "coordinate_mode": f"qwen_relative_{scale}", "bbox_scale": scale,
                     "label": out.get("label"),
                     "focus_box_indices": out.get("focus", []),
+                    # 评估报表要按难度档和尺寸档拆开看。困难目标只占 10%，
+                    # 不能拆就会被 90% 的简单目标稀释成「还行」。
+                    # 多框任务取【最难/最小】的那个框 —— 一条样本的难度由
+                    # 它最难的那个目标决定，取平均会把小目标抹平。
+                    **_focus_difficulty(out.get("focus", []), gmap, grader),
                     "n_turns": len(out["conversations"]) // 2,
                     **{k: v for k, v in out.items()
                        if k in ("attribute", "attribute_kind", "describe_kind",
@@ -331,9 +337,12 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     gen_bar.close()
 
     # ---- 阶段四：按来源分组划分 ----
-    train, val = _split_by_source(samples, cfg, seed)
+    train, val, test = _split_by_source(samples, cfg, seed)
     _write_jsonl(output_dir / "train.jsonl", train, include_meta)
     _write_jsonl(output_dir / "val.jsonl", val, include_meta)
+    # test 永远带 metadata：评估报表要按 task_type / difficulty / size_bucket
+    # 拆分，摘掉就拆不了。它不进训练，多这几个字段没有代价。
+    _write_jsonl(output_dir / "test.jsonl", test, True)
 
     total = sum(made.values()) or 1
     # 跨任务一致性核对：同一张图，八个任务说出来的目标数量必须对得上
@@ -358,6 +367,12 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         "main_line_ratio": round(sum(made[k] for k in MAIN_LINE) / total, 4),
         "short_answer_ratio_actual": round(
             sum(1 for s in samples if s["metadata"]["answer_format"] == "short") / total, 4),
+        # 样本层面的难度/尺寸分布。上面的 hard_quota 数的是【框】，这里数的是
+        # 【样本】—— 一个困难框可能只出一条样本，两个数不必相等。评估报表按这
+        # 两根轴拆分，先在构建期确认每一格都有足够的量，否则评估时会出现
+        # n=3 的格子。
+        "difficulty_mix": _meta_mix(samples, "difficulty"),
+        "size_mix": _meta_mix(samples, "size_bucket"),
         "task_unavailable": {k: v for k, v in failed.items() if v},
         "invalid_dropped": invalid,
         "vlm_calls": dict(vlm.stats),
@@ -389,13 +404,14 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         "consistency": {"checked_images": consist["checked_images"],
                         "violations": len(consist["violations"]),
                         "detail": consist["violations"][:50]},
-        "split": _split_stats(train, val),
+        "split": _split_stats(train, val, test),
         "classes_total": table.count,
     }
     (output_dir / "build_report.json").write_text(
         json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
     stats["output"] = {"train": str(output_dir / "train.jsonl"),
-                       "val": str(output_dir / "val.jsonl")}
+                       "val": str(output_dir / "val.jsonl"),
+                       "test": str(output_dir / "test.jsonl")}
     return stats
 
 
@@ -413,29 +429,70 @@ def _question_variety(samples) -> Dict[str, Any]:
             "most_repeated": {"text": top[:40], "times": n}}
 
 
-def _split_by_source(samples, cfg, seed) -> Tuple[List, List]:
+def _meta_mix(samples, key: str) -> Dict[str, Any]:
+    """某个 metadata 字段的取值分布，含占比。None 归到 "none"（拒答类没有焦点框）。"""
+    counts = Counter(str(s["metadata"].get(key)) for s in samples)
+    total = sum(counts.values()) or 1
+    return {"counts": dict(counts),
+            "ratio": {k: round(v / total, 4) for k, v in counts.items()}}
+
+
+def _focus_difficulty(focus, gmap, grader) -> Dict[str, Any]:
+    """这条样本聚焦的框有多难、有多大。没有聚焦框（拒答类）时全为 None。"""
+    grades = [gmap[i] for i in focus if i in gmap]
+    if not grades:
+        return {"difficulty": None, "area_ratio": None,
+                "equiv_px": None, "size_bucket": None}
+    g = min(grades, key=lambda x: x.area_ratio)     # 最小的那个说了算
+    hardest = max(grades, key=lambda x: grade_rank(x.grade))
+    return {"difficulty": hardest.grade,
+            "area_ratio": round(g.area_ratio, 6),
+            "equiv_px": round(g.equiv_px, 1),
+            "size_bucket": grader.bucket_of(g)}
+
+
+def _split_by_source(samples, cfg, seed) -> Tuple[List, List, List]:
     """按【原始来源】分组划分。数据含视频抽帧与 Roboflow 增强，
-    按图片随机划分会让同源图泄漏进验证集，指标虚高且难以察觉。"""
-    ratio = float(cfg.get_path("split.val_ratio", 0.05))
+    按图片随机划分会让同源图泄漏进验证集，指标虚高且难以察觉。
+
+    切三路而不是两路：val 会被训练框架拿去算 eval loss、挑 checkpoint，
+    等于参与了调参；拿它报模型成绩是在自己给自己出卷子。test 全程不进
+    训练流程，只在评估时拆封。
+    """
+    val_ratio = float(cfg.get_path("split.val_ratio", 0.05))
+    test_ratio = float(cfg.get_path("split.test_ratio", 0.05))
     groups: Dict[str, List] = {}
     for s in samples:
         groups.setdefault(source_group_key(s["images"][0]), []).append(s)
     keys = sorted(groups)
     random.Random(seed).shuffle(keys)
-    target = len(samples) * ratio
+    n = len(samples)
+    test: List = []
     val: List = []
     train: List = []
+    # 先填 test 再填 val：test 是要拿去报成绩的，宁可 val 少一点。
     for k in keys:
-        (val if len(val) < target else train).extend(groups[k])
-    return train, val
+        if len(test) < n * test_ratio:
+            test.extend(groups[k])
+        elif len(val) < n * val_ratio:
+            val.extend(groups[k])
+        else:
+            train.extend(groups[k])
+    return train, val, test
 
 
-def _split_stats(train, val) -> Dict[str, Any]:
-    tg = {source_group_key(s["images"][0]) for s in train}
-    vg = {source_group_key(s["images"][0]) for s in val}
-    return {"train": len(train), "val": len(val),
-            "train_groups": len(tg), "val_groups": len(vg),
-            "group_overlap": len(tg & vg)}
+def _split_stats(train, val, test) -> Dict[str, Any]:
+    def groups(rows):
+        return {source_group_key(s["images"][0]) for s in rows}
+
+    tg, vg, sg = groups(train), groups(val), groups(test)
+    return {"train": len(train), "val": len(val), "test": len(test),
+            "train_groups": len(tg), "val_groups": len(vg), "test_groups": len(sg),
+            # 三个都必须是 0。非 0 说明同源图跨了划分，评估数字不可信。
+            "group_overlap": len(tg & vg) + len(tg & sg) + len(vg & sg),
+            "overlap_train_val": len(tg & vg),
+            "overlap_train_test": len(tg & sg),
+            "overlap_val_test": len(vg & sg)}
 
 
 
