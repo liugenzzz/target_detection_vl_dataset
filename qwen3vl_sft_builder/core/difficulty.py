@@ -95,6 +95,31 @@ class Grader:
         self.max_area = float(q.get("max_area_ratio", 0.5))
         self.min_short_px = float(q.get("min_short_side_px", 16))
 
+    def config_conflicts(self) -> List[str]:
+        """互相打架、导致某个开关静默失效的配置组合。
+
+        典型的一组：quality.min_area_ratio 和 difficulty.size_reject_px 都在管
+        「多小算太小」，但前者先执行。min_area_ratio=0.001 换算成等效边长是
+        32.4px，比 size_reject_px=16 严得多 —— 于是 size_reject_px 这个旋钮
+        完全失效，尺寸维度永远返回不了 hard，改它一点反应都没有。
+        """
+        out: List[str] = []
+        floor_px = self.equivalent_px(self.min_area)
+        if floor_px > self.size_reject:
+            out.append(
+                f"quality.min_area_ratio={self.min_area:g} 换算成等效边长是 "
+                f"{floor_px:.1f}px，严于 difficulty.size_reject_px={self.size_reject:g}，"
+                f"后者失效、尺寸维度永远判不出 hard。"
+                f"想让 size_reject_px 生效，min_area_ratio 要 <= "
+                f"{(self.size_reject / self.equiv_size) ** 2:.6f}")
+        if self.size_medium > self.size_easy:
+            out.append("difficulty.size_medium_px 大于 size_easy_px，分档反了")
+        if self.size_reject > self.size_medium:
+            out.append("difficulty.size_reject_px 大于 size_medium_px，分档反了")
+        if self.dense_medium > self.dense_hard:
+            out.append("difficulty.dense_medium 大于 dense_hard，分档反了")
+        return out
+
     def bucket_of(self, grade: "Grade") -> str:
         """这个框的尺寸档，供报表按尺寸拆分。"""
         return size_bucket(grade.equiv_px, self.bucket_small, self.bucket_large)
@@ -128,11 +153,15 @@ class Grader:
             return HARD
         return REJECT                           # 太密集，无法可靠指代
 
-    @staticmethod
-    def _referring_grade(unique_in_zone: bool) -> str:
-        """3x3 分区内同类唯一 -> 模板空间指代可用（简单）；
-        否则需调 VLM 生成视觉指代（困难）。"""
-        return EASY if unique_in_zone else HARD
+    # 注意：3x3 分区唯一性【不参与】难度评级。它衡量的是「用哪种方法生成指代」
+    # ——同区同类唯一就能用模板拼空间指代，否则要调 VLM 写视觉指代——
+    # 这是生成成本，不是目标本身难不难定位。
+    #
+    # 早先它按「不唯一即 hard」并进了 max()，后果是：部件级标注的数据集
+    # （机头/机翼/机轮/炮管这种，同类在一张图里天然重复）几乎每个框都被判 hard，
+    # 实测 15.4 万框里 easy 只剩 67 个（0.04%）。再经 hard_quota=0.10 下采样，
+    # 最终入库 359 个框 —— 而 VLM 视觉指代这条路本来就是为这些框准备的，
+    # 等于把它存在的理由全筛掉了。
 
     def grade_image(self, boxes: Sequence, img_w: int, img_h: int) -> List[Grade]:
         """给一张图里的所有框定级。boxes 为 core.yolo.Box 列表。"""
@@ -146,13 +175,14 @@ class Grader:
             uniq = zones.count(zones[i]) == 1
             g_size = self._size_grade(area, b.short_side_px(img_w, img_h))
             g_dense = self._density_grade(same)
-            g_ref = self._referring_grade(uniq)
             out.append(Grade(
                 box_index=b.index, label=b.label,
-                grade=max((g_size, g_dense, g_ref), key=lambda g: _ORDER[g]),
+                grade=max((g_size, g_dense), key=lambda g: _ORDER[g]),
                 area_ratio=area, equiv_px=self.equivalent_px(area),
                 same_label_count=same, unique_in_zone=uniq, zone=zones[i][1],
-                reasons={"size": g_size, "density": g_dense, "referring": g_ref},
+                # referring 只作诊断记录，不进 grade —— 见 _referring_grade 处的说明
+                reasons={"size": g_size, "density": g_dense,
+                         "referring": "template" if uniq else "needs_vlm"},
             ))
         return out
 
@@ -170,6 +200,21 @@ def pick_candidates(graded: Sequence[Grade], cap: int, seed: int = 0) -> List[Gr
     return sorted((easy + hard)[:cap], key=lambda g: g.box_index)
 
 
+def hard_kept_under_quota(n_simple: int, n_hard: int, hard_quota: float) -> int:
+    """配额允许保留几个困难目标。
+
+        hard / (simple + hard) = quota  =>  hard = simple * quota / (1 - quota)
+
+    抽成函数是因为 scripts/analyze.py 要用同一个公式预估产出。两边各写一遍
+    必然会漂 —— analyze 早先就没算配额，报出来的产出比真实值高 170 倍。
+    """
+    if hard_quota <= 0:
+        return 0
+    if hard_quota >= 1:
+        return n_hard
+    return min(n_hard, int(round(n_simple * hard_quota / (1 - hard_quota))))
+
+
 def balance_hard_quota(candidates: Sequence, grade_of: Callable,
                        hard_quota: float = 0.10, seed: int = 0) -> List:
     """第二阶段（全局）：把困难目标下采样到 hard_quota 占比。
@@ -181,13 +226,7 @@ def balance_hard_quota(candidates: Sequence, grade_of: Callable,
     easy = [c for c in candidates if grade_of(c) in (EASY, MEDIUM)]
     hard = [c for c in candidates if grade_of(c) == HARD]
 
-    if hard_quota <= 0:
-        keep = 0
-    elif hard_quota >= 1:
-        keep = len(hard)
-    else:
-        keep = min(len(hard), int(round(len(easy) * hard_quota / (1 - hard_quota))))
-
+    keep = hard_kept_under_quota(len(easy), len(hard), hard_quota)
     rng.shuffle(hard)
     result = easy + hard[:keep]
     rng.shuffle(result)

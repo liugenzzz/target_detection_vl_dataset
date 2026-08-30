@@ -1553,3 +1553,78 @@ def test_sample_metadata_carries_difficulty_and_size_bucket():
     none = _focus_difficulty([], gmap, grader)
     assert none == {"difficulty": None, "area_ratio": None,
                     "equiv_px": None, "size_bucket": None}
+
+
+def test_zone_uniqueness_does_not_drive_difficulty():
+    """3x3 分区唯一性衡量的是「用模板还是调 VLM 生成指代」，是生成成本，
+    不是目标难不难定位。它并进 max() 的后果实测过：部件级标注的数据集
+    （机头/机翼/机轮，同类在一张图里天然重复）15.4 万框里 easy 只剩 67 个。"""
+    from core.difficulty import EASY, Grader
+
+    class _Cfg:
+        def get_path(self, key, default=None):
+            return {"difficulty": {}, "quality": {}}.get(key, default)
+
+    class _Box:
+        def __init__(self, index, label, cx, cy):
+            self.index, self.label, self.cx, self.cy = index, label, cx, cy
+            self.area_ratio = 0.02          # 等效 145px，尺寸维度是 easy
+        def short_side_px(self, w, h):
+            return 100
+
+    # 两个不同类别的大目标挤在同一个 3x3 分区里：分区不唯一，但同类各只有一个
+    graded = Grader(_Cfg()).grade_image(
+        [_Box(0, "机翼", 0.1, 0.1), _Box(1, "机轮", 0.15, 0.12)], 1000, 1000)
+    assert [g.grade for g in graded] == [EASY, EASY]
+
+    # 同类两个挤在同一分区：难度由密集度给出 medium，不因分区不唯一变 hard
+    graded = Grader(_Cfg()).grade_image(
+        [_Box(0, "机翼", 0.1, 0.1), _Box(1, "机翼", 0.15, 0.12)], 1000, 1000)
+    assert all(g.grade == "medium" for g in graded)
+    # 但分区信息要留着 —— 它决定这条样本走模板指代还是走 VLM
+    assert all(g.unique_in_zone is False for g in graded)
+    assert all(g.reasons["referring"] == "needs_vlm" for g in graded)
+
+
+def test_min_area_ratio_silently_killing_size_reject_is_reported():
+    """quality.min_area_ratio 和 difficulty.size_reject_px 都在管「多小算太小」，
+    前者先执行。默认的 0.001 换算成等效边长是 32.4px，比 size_reject_px=16 严，
+    于是后者完全失效、尺寸维度永远判不出 hard —— 改它一点反应都没有。"""
+    from core.difficulty import Grader
+
+    class _Cfg:
+        def __init__(self, **q):
+            self.q = q
+        def get_path(self, key, default=None):
+            return {"difficulty": {}, "quality": self.q}.get(key, default)
+
+    conflicts = Grader(_Cfg(min_area_ratio=0.001)).config_conflicts()
+    assert any("size_reject_px" in c for c in conflicts)
+    assert any("0.000244" in c for c in conflicts)      # 给出该改成多少
+
+    # 对齐之后就不该再报
+    assert not Grader(_Cfg(min_area_ratio=0.0002)).config_conflicts()
+
+
+def test_quota_formula_is_shared_between_build_and_analyze():
+    """analyze 预估产出和实际入库必须用同一个公式。早先 analyze 直接拿
+    「没被剔除的框数」报数，忽略了困难配额 —— 简单档只有 323 个框时，
+    它说「每图 4.16 条」，真实值是 0.02 条，差 170 倍，而且要跑完全量才发现。"""
+    from types import SimpleNamespace
+
+    from core.difficulty import EASY, HARD, balance_hard_quota, hard_kept_under_quota
+
+    # 简单档稀少时，配额是全局瓶颈
+    assert hard_kept_under_quota(n_simple=323, n_hard=60930, hard_quota=0.10) == 36
+    assert hard_kept_under_quota(n_simple=0, n_hard=10000, hard_quota=0.10) == 0
+    # 困难档不够时，能留多少留多少
+    assert hard_kept_under_quota(n_simple=9000, n_hard=5, hard_quota=0.10) == 5
+    assert hard_kept_under_quota(n_simple=100, n_hard=100, hard_quota=0) == 0
+    assert hard_kept_under_quota(n_simple=100, n_hard=100, hard_quota=1) == 100
+
+    # balance_hard_quota 必须给出和公式一致的结果
+    cand = [SimpleNamespace(g=EASY) for _ in range(323)] \
+        + [SimpleNamespace(g=HARD) for _ in range(60930)]
+    kept = balance_hard_quota(cand, lambda c: c.g, hard_quota=0.10, seed=1)
+    assert sum(1 for c in kept if c.g == HARD) == 36
+    assert len(kept) == 359

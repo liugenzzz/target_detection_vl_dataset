@@ -79,6 +79,9 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
 
     table = load_class_table(cfg.require("paths.classes_yaml"))
     grader = Grader(cfg)
+    # 互相打架的阈值会让某个开关静默失效，跑完全量才发现就太晚了。
+    for conflict in grader.config_conflicts():
+        logger.warning("配置冲突：%s", conflict)
     vlm = VlmClient(cfg)
 
     seed = int(cfg.get_path("sampling.seed", 20260826))

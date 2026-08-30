@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import load_config                      # noqa: E402
 from core.cli import _cli  # noqa: E402
 from core.classes import load_class_table           # noqa: E402
-from core.difficulty import Grader                  # noqa: E402
+from core.difficulty import Grader, hard_kept_under_quota   # noqa: E402
 from core.yolo import iter_annotations              # noqa: E402
 
 SHORT_SIDE_CANDIDATES = (8, 12, 16, 24)
@@ -30,6 +30,21 @@ AREA_MAX_CANDIDATES = (0.3, 0.5, 0.7, 0.9)
 
 def pct(sorted_values, p):
     return statistics.quantiles(sorted_values, n=100)[p - 1]
+
+
+def _wrap(text: str, width: int = 62):
+    """按显示宽度折行。中文算两格，直接按字符数折会长短不一。"""
+    lines, cur, w = [], "", 0
+    for ch in text:
+        cw = 2 if ord(ch) > 0x2E80 else 1
+        if w + cw > width:
+            lines.append(cur)
+            cur, w = "", 0
+        cur += ch
+        w += cw
+    if cur:
+        lines.append(cur)
+    return lines
 
 
 def main() -> int:
@@ -102,10 +117,45 @@ def main() -> int:
     for k in ("easy", "medium", "hard", "reject"):
         print(f"    {k:>7}  {grades[k]:>6} ({grades[k]/total*100:>5.1f}%)")
 
-    usable = grades["easy"] + grades["medium"] + grades["hard"]
+    # 【必须把困难配额算进去】。usable 只是「没被质量闸剔除」的框数，不是
+    # 最终入库数 —— balance_hard_quota 会把 hard 下采样到 hard_quota 占比，
+    # 简单档少时它是全局瓶颈：easy+medium=323、hard=6 万，配额只允许留 36 个
+    # hard，最终入库 359 个框。早先这里直接拿 usable 报数，会告诉你「每图 4.16
+    # 条」，而真实值是 0.02 条 —— 差 170 倍，且要跑完全量才发现。
+    simple = grades["easy"] + grades["medium"]
+    hard = grades["hard"]
+    quota = grader.hard_quota
+    hard_kept = hard_kept_under_quota(simple, hard, quota)
+    kept = simple + hard_kept
+
     cap = int(cfg.get_path("sampling.samples_per_image_cap", 8))
-    est = min(usable / n_img, cap)
-    print(f"\n  预计每图产出 ~{est:.2f} 条样本，凑 10 万条需约 {-(-100000//est):,.0f} 张图")
+    est = min(kept / n_img, cap) if n_img else 0.0
+    print(f"\n  过困难配额后入库 {kept}/{grades['easy'] + grades['medium'] + hard} 个框"
+          f"（hard 保留 {hard_kept}/{hard}）")
+    if est <= 0:
+        print("  预计产出 0 条样本 —— 见下方告警")
+    else:
+        print(f"  预计每图产出 ~{est:.2f} 条样本，凑 10 万条需约 "
+              f"{-(-100000 // est):,.0f} 张图（你现有 {n_img:,} 张）")
+
+    # ---- 告警：配置和这份数据不匹配时，上面的数字会小得离谱 ----
+    warns = list(grader.config_conflicts())
+    if hard and hard_kept < hard * 0.5:
+        warns.append(
+            f"困难配额是当前瓶颈：简单档只有 {simple} 个框，按 hard_quota="
+            f"{quota:.2f} 只能配 {hard_kept} 个 hard，{hard - hard_kept} 个被丢弃。"
+            f"先把简单档做上去（放宽 quality/difficulty 阈值），"
+            f"不要直接调大 hard_quota —— 那是把「困难目标只占 10%」这条指标关掉。")
+    if n_img and est * n_img < 100000:
+        warns.append(
+            f"按当前阈值全量跑完约 {est * n_img:,.0f} 条，够不到 10 万条。"
+            f"需要过滤后可用框 >= 100000，即 reject 率 <= "
+            f"{(1 - 100000 / n_box) * 100:.0f}%（当前 "
+            f"{grades['reject'] / n_box * 100:.0f}%）。")
+    if warns:
+        print("\n【告警】")
+        for w in warns:
+            print("  ! " + "\n    ".join(_wrap(w)))
 
     conf = table.confusable_summary()
     if conf:
