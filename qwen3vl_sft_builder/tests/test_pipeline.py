@@ -1680,3 +1680,63 @@ def test_every_render_call_supplies_the_placeholders_its_template_needs():
                                f"render({name!r}) 缺 {sorted(gap)}")
 
     assert not missing, "这些调用点漏传占位符，运行时才会崩：\n  " + "\n  ".join(missing)
+
+
+def test_scheduler_does_not_deadlock_on_a_failing_task():
+    """缺口排序只在 made 变化时才变。任务失败时 made 不变 —— 下一个槽位
+    又会选中同一个任务，strict 模式只试第一个，就此锁死在它身上。
+
+    实测后果：500 张图里 inventory_locate 试了 384 次成功 1 次，之后锁死在
+    ground_unique 上失败 2515 次，另外【12 个任务一次都没被调用过】——
+    报告里它们的失败计数是 0，和「这个任务很健康」长得一模一样。
+    """
+    import random
+    from collections import Counter
+
+    from core.pipeline import _deficit_order
+
+    target = {"inventory_locate": 0.27, "ground_unique": 0.16,
+              "detect_class": 0.09, "exist_negative": 0.08}
+    made = Counter({k: 0 for k in target})
+    rng = random.Random(0)
+
+    # 模拟一张图上的 8 个槽位，每个任务都失败
+    failed_here: set = set()
+    tried = []
+    for _ in range(8):
+        order = _deficit_order(target, made, failed_here, rng)
+        if not order:
+            break
+        pick = order[0]
+        tried.append(pick)
+        failed_here.add(pick)          # 失败
+
+    # 每个任务都得到过一次机会，而且没有重复空转
+    assert sorted(tried) == sorted(target)
+    assert len(tried) == len(set(tried))
+    # 全试完之后返回空，调用方据此跳出，不再空转
+    assert _deficit_order(target, made, failed_here, rng) == []
+
+
+def test_deficit_order_still_follows_the_configured_ratio():
+    """去掉死锁不能把配比也弄丢：欠账最多的仍然排最前。"""
+    import random
+    from collections import Counter
+
+    from core.pipeline import _deficit_order
+
+    target = {"a": 0.7, "b": 0.2, "c": 0.1}
+    rng = random.Random(1)
+
+    # 一条都没产出时，权重最大的欠得最多
+    assert _deficit_order(target, Counter({"a": 0, "b": 0, "c": 0}), set(), rng)[0] == "a"
+    # a 已经超发，就该轮到别人
+    order = _deficit_order(target, Counter({"a": 10, "b": 0, "c": 0}), set(), rng)
+    assert order[0] == "b" and order[-1] == "a"
+
+    # 长跑一遍：产出比例应当贴近配比
+    made = Counter({k: 0 for k in target})
+    for _ in range(1000):
+        made[_deficit_order(target, made, set(), rng)[0]] += 1
+    for k, want in target.items():
+        assert abs(made[k] / 1000 - want) < 0.02, f"{k} 实得 {made[k] / 1000}"

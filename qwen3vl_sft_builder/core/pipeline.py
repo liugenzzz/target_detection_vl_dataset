@@ -64,6 +64,23 @@ def _next_kind(kind_list, cursor, grades):
     return k, cursor
 
 
+def _deficit_order(target, made, failed_here, rng):
+    """按【产出缺口】排任务，欠得最多的在前；本图已证明出不了的排除掉。
+
+    缺口 = 已产出 - 应产出 = made[t] - target[t] * (总产出 + 1)。越负欠得越多。
+
+    【failed_here 是必须的】。缺口只在 made 变化时才变，任务失败时 made 不变 ——
+    排序结果一模一样，下一个槽位又选中同一个任务，再失败，再选中。strict 模式
+    只试缺口最大的那一个，就此死锁。实测 500 张图：inventory_locate 试 384 次
+    成功 1 次，之后锁死在 ground_unique 上失败 2515 次，另外 12 个任务一次都没
+    被调用过，报告里连它们的失败计数都是 0，看不出任何异常。
+    """
+    done_all = sum(made.values())
+    order = sorted(target, key=lambda t: (made[t] - target[t] * (done_all + 1),
+                                          rng.random()))
+    return [t for t in order if t not in failed_here]
+
+
 def _box_list_text(boxes, bbox2d) -> str:
     lines = [f"图中共 {len(boxes)} 个已标注目标："]
     for b in boxes:
@@ -217,6 +234,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     failed = Counter()
     invalid = 0
 
+    vlm_cov: Counter = Counter()
     gen_bar = progress.make("生成样本", len(scenes), show_progress)
     for sc in scenes:
         ann, kept, gmap = sc["ann"], sc["kept"], sc["gmap"]
@@ -246,7 +264,35 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         if color_gate:
             color_stats["checked"] += _drop_bad_colors(
                 ann, kept, vlm_info, color_stats, color_dropped)
+        # 【VLM 覆盖率】。主线九个任务都要求 VLM 挑中了目标并写出了描述，
+        # 覆盖率低时它们会集体失败，而失败计数只会告诉你「出不了」，不会告诉你
+        # 是模型没挑中、还是挑了但没写描述、还是任务自己的闸太严。
+        vlm_cov["图片数"] += 1
+        if vlm_info:
+            vlm_cov["模型挑中过目标的图"] += 1
+        vlm_cov["挑中的目标数"] += len(vlm_info)
+        vlm_cov["其中写了描述的"] += sum(
+            1 for v in vlm_info.values() if v.get("description"))
+        vlm_cov["其中写了描述问句的"] += sum(
+            1 for v in vlm_info.values() if v.get("describe_q"))
+        vlm_cov["其中写了指代属性的"] += sum(
+            1 for v in vlm_info.values() if v.get("attribute"))
+        vlm_cov["过滤后的框数"] += len(kept)
+        # ground_unique 要求「该类在原始标注里只有一个实例」——
+        # 部件级标注下同类天然重复，这一条可能一张图都满足不了。
+        vlm_cov["满足单实例的类别数"] += sum(
+            1 for l, c in collections.Counter(b.label for b in kept).items()
+            if c == 1 and sc["raw_counts"].get(l, c) == c)
+
         used: set = set()          # 本图已出过样本的框，避免同一目标反复出样本
+        # 【本图已经证明出不了的任务】。缺口排序只在 made 变化时才会变，
+        # 任务失败时 made 不变 —— 于是下一个槽位又选中同一个任务，再失败，
+        # 再选中……strict 模式只试缺口最大的那一个，就此死锁在它身上。
+        # 实测：500 张图里 inventory_locate 试了 384 次成功 1 次，之后锁死在
+        # ground_unique 上失败 2515 次，另外 12 个任务【一次都没被调用过】。
+        # 同一张图上同一个任务的输入是同一份，失败一次就不必再试。
+        # 这个集合每张图重置，所以概率性失败的任务在下一张图还有机会。
+        failed_here: set = set()
         # 指代骨架按图算一次：全图唯一性校验需要看到该图全部目标
         label_counts = collections.Counter(b.label for b in kept)
         n_want = min(cap, max(1, len(kept)))
@@ -261,10 +307,9 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
             # 改成每个槽位挑【当前欠账最多】的任务：欠得越多越优先，一旦补上
             # 就轮到别人。这是个自校正的反馈，任何任务的可用率再低也不会被
             # 别人挤掉份额，也不会有任务超发。缺口相同时随机打散，避免固定顺序。
-            done_all = sum(made.values())
-            deficit = sorted(target,
-                             key=lambda t: (made[t] - target[t] * (done_all + 1),
-                                            rng.random()))
+            deficit = _deficit_order(target, made, failed_here, rng)
+            if not deficit:
+                break                    # 这张图上所有任务都试过了，别空转
 
             def make_ctx():
                 return Ctx(annotation=ann, boxes=kept, grades=gmap, vlm=vlm_info,
@@ -291,6 +336,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                 if out is not None:
                     break
                 failed[name] += 1
+                failed_here.add(name)
             if out is None:
                 continue
 
@@ -376,6 +422,10 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         # n=3 的格子。
         "difficulty_mix": _meta_mix(samples, "difficulty"),
         "size_mix": _meta_mix(samples, "size_bucket"),
+        # 主线九个任务都要求 VLM 挑中目标并写出描述。这一段区分三种失败：
+        # 模型没挑中 / 挑了但没写描述 / 写了但任务自己的闸拦下了。
+        # 只看 task_unavailable 分不出来，会往错误方向调。
+        "vlm_coverage": dict(vlm_cov),
         "task_unavailable": {k: v for k, v in failed.items() if v},
         "invalid_dropped": invalid,
         "vlm_calls": dict(vlm.stats),
