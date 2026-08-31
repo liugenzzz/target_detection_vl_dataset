@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import prompts                                   # noqa: E402
 from config import load_config
+from core import describe_kinds                  # noqa: E402
 from core.cli import _cli  # noqa: E402
 from core.vlm_client import _diagnose, _endpoints_from, _parse_scene_json  # noqa: E402
 from core.yolo import IMAGE_EXTS                 # noqa: E402
@@ -181,7 +182,13 @@ def _check_one(ep, timeout, cfg, args) -> int:
     print("\n[3/3] 真实提示词（prompts/vlm_select.txt，管道实际用的就是它）")
     box_list = "\n".join(f"  [{i}] 测试目标{i}  位于 [{i * 100}, 200, {i * 100 + 80}, 300]"
                          for i in range(3))
-    prompt_text = prompts.render("vlm_select", box_list=box_list, max_pick=3)
+    # 描述子类型的指派段也要一起发过去 —— 管道就是这么拼的，少一段就等于
+    # 验了一个和线上不一样的提示词。（这里曾经漏传，check_vlm 直接崩在 render。）
+    kinds = list(describe_kinds.load_all().values())
+    kind_assignments = "\n\n".join(
+        describe_kinds.render_assignment(kinds[i % len(kinds)], i + 1) for i in range(3))
+    prompt_text = prompts.render("vlm_select", box_list=box_list, max_pick=3,
+                                 kind_assignments=kind_assignments)
     msg = [{"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{b64}"}},
            {"type": "text", "text": prompt_text}]
     r, el = post(url, key, {"model": model,

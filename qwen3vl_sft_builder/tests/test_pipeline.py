@@ -1628,3 +1628,51 @@ def test_quota_formula_is_shared_between_build_and_analyze():
     kept = balance_hard_quota(cand, lambda c: c.g, hard_quota=0.10, seed=1)
     assert sum(1 for c in kept if c.g == HARD) == 36
     assert len(kept) == 359
+
+
+def test_every_render_call_supplies_the_placeholders_its_template_needs():
+    """静态扫所有 prompts.render(...) / render_choice(...) 调用点，
+    确认传的关键字覆盖了那个 .txt 真正需要的占位符。
+
+    实测踩过：给 vlm_select.txt 加了 {kind_assignments}，改了 pipeline.py 却漏了
+    scripts/check_vlm.py —— 自检脚本直接崩在 render 上，而且是在服务器上、
+    前两步都跑绿之后才炸。提示词和调用点分开维护就一定会漏，得有东西守着。
+    """
+    import ast
+    import string
+
+    import prompts
+
+    root = Path(__file__).resolve().parents[1]
+    missing = []
+    for path in sorted(list((root / "core").rglob("*.py"))
+                       + list((root / "scripts").rglob("*.py"))):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr not in ("render", "render_choice"):
+                continue
+            if not node.args or not isinstance(node.args[0], ast.Constant):
+                continue                      # 名字是变量拼的，静态查不了
+            name = node.args[0].value
+            if not isinstance(name, str):
+                continue
+            if any(kw.arg is None for kw in node.keywords):
+                continue                      # **kwargs 展开，静态查不了
+            supplied = {kw.arg for kw in node.keywords}
+            try:
+                if node.func.attr == "render":
+                    texts = [prompts.load(name)]
+                else:
+                    texts = list(prompts.variants(name))
+            except Exception:                 # noqa: BLE001  找不到的文件另有测试管
+                continue
+            needed = {f for t in texts
+                      for _, f, _, _ in string.Formatter().parse(t) if f}
+            gap = needed - supplied
+            if gap:
+                missing.append(f"{path.relative_to(root)}:{node.lineno} "
+                               f"render({name!r}) 缺 {sorted(gap)}")
+
+    assert not missing, "这些调用点漏传占位符，运行时才会崩：\n  " + "\n  ".join(missing)
