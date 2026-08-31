@@ -26,6 +26,7 @@ from core.yolo import iter_annotations              # noqa: E402
 SHORT_SIDE_CANDIDATES = (8, 12, 16, 24)
 AREA_MIN_CANDIDATES = (0.0005, 0.001, 0.002, 0.005)
 AREA_MAX_CANDIDATES = (0.3, 0.5, 0.7, 0.9)
+DENSE_CANDIDATES = (10, 25, 50, 100, 200)
 
 
 def pct(sorted_values, p):
@@ -33,15 +34,36 @@ def pct(sorted_values, p):
 
 
 def _wrap(text: str, width: int = 62):
-    """按显示宽度折行。中文算两格，直接按字符数折会长短不一。"""
-    lines, cur, w = [], "", 0
+    """按显示宽度折行。中文算两格，直接按字符数折会长短不一。
+
+    ASCII 连续段（quality/difficulty、hard_quota 这种）当成一个整体，
+    不从中间劈开 —— 劈开的配置名读者没法直接搜。
+    """
+    tokens, buf = [], ""
     for ch in text:
-        cw = 2 if ord(ch) > 0x2E80 else 1
-        if w + cw > width:
+        if ch.isascii() and not ch.isspace():
+            buf += ch
+        else:
+            if buf:
+                tokens.append(buf)
+                buf = ""
+            tokens.append(ch)
+    if buf:
+        tokens.append(buf)
+
+    def w_of(t):
+        return sum(2 if ord(c) > 0x2E80 else 1 for c in t)
+
+    lines, cur, w = [], "", 0
+    for t in tokens:
+        tw = w_of(t)
+        if w + tw > width and cur:
             lines.append(cur)
             cur, w = "", 0
-        cur += ch
-        w += cw
+        if t == " " and not cur:
+            continue
+        cur += t
+        w += tw
     if cur:
         lines.append(cur)
     return lines
@@ -60,6 +82,11 @@ def main() -> int:
     box_counts, shorts, areas, sizes = [], [], [], []
     grades = Counter()
     label_counts = Counter()
+    # 【同类目标数】—— 密集度维度真正判的是这个数，不是「每图框数」。
+    # 之前只印每图框数，调 dense_* 时等于蒙着眼睛调。
+    same_counts = []
+    # reject 归因。不分解的话，看到 reject 37% 也不知道该动尺寸阈值还是密集度阈值。
+    why_reject = Counter()
 
     for ann in iter_annotations(cfg.require("paths.labels_dir"),
                                 cfg.require("paths.images_dir"), table,
@@ -72,11 +99,17 @@ def main() -> int:
             label_counts[b.label] += 1
         for g in grader.grade_image(ann.boxes, ann.width, ann.height):
             grades[g.grade] += 1
+            same_counts.append(g.same_label_count)
+            if g.grade == "reject":
+                by_size = g.reasons["size"] == "reject"
+                by_dense = g.reasons["density"] == "reject"
+                why_reject["尺寸和密集度都不过" if by_size and by_dense
+                           else "只因尺寸" if by_size else "只因密集度"] += 1
 
     if not box_counts:
         raise SystemExit("没有解析出任何标注，检查 paths 配置和类别表")
 
-    shorts.sort(); areas.sort(); box_counts.sort()
+    shorts.sort(); areas.sort(); box_counts.sort(); same_counts.sort()
     n_img, n_box = len(box_counts), len(areas)
     uniq_sizes = sorted(set(sizes))
 
@@ -107,6 +140,17 @@ def main() -> int:
         print(f"    面积 <{t*100:>5.2f}%   剔除 {d:>6}/{n_box} ({d/n_box*100:>4.1f}%)  "
               f"等效 {grader.equivalent_px(t):.0f}px")
 
+    print("\n【同类目标数】（密集度维度判的就是这个数，dense_* 按它定）")
+    print(f"  中位 {statistics.median(same_counts):.0f}  p75 {pct(same_counts,75):.0f}  "
+          f"p90 {pct(same_counts,90):.0f}  p95 {pct(same_counts,95):.0f}  "
+          f"p99 {pct(same_counts,99):.0f}  最大 {max(same_counts)}")
+    print("    （同一张图里和它同类的框有几个。部件级标注天然偏高："
+          "一架飞机 2 个机翼、3 个以上机轮）")
+    print("\n  密集度候选阈值：")
+    for t in DENSE_CANDIDATES:
+        d = sum(1 for v in same_counts if v > t)
+        print(f"    dense_hard ={t:>4}   超出即剔除 {d:>6}/{n_box} ({d / n_box * 100:>4.1f}%)")
+
     print("\n  剔除全图框（候选阈值）：")
     for t in AREA_MAX_CANDIDATES:
         d = sum(1 for a in areas if a > t)
@@ -116,6 +160,11 @@ def main() -> int:
     total = sum(grades.values())
     for k in ("easy", "medium", "hard", "reject"):
         print(f"    {k:>7}  {grades[k]:>6} ({grades[k]/total*100:>5.1f}%)")
+
+    if why_reject:
+        print("\n  剔除原因分解（决定该动哪个阈值）：")
+        for reason, cnt in why_reject.most_common():
+            print(f"    {reason:<16} {cnt:>6} ({cnt / n_box * 100:>4.1f}%)")
 
     # 【必须把困难配额算进去】。usable 只是「没被质量闸剔除」的框数，不是
     # 最终入库数 —— balance_hard_quota 会把 hard 下采样到 hard_quota 占比，
@@ -147,11 +196,17 @@ def main() -> int:
             f"先把简单档做上去（放宽 quality/difficulty 阈值），"
             f"不要直接调大 hard_quota —— 那是把「困难目标只占 10%」这条指标关掉。")
     if n_img and est * n_img < 100000:
-        warns.append(
-            f"按当前阈值全量跑完约 {est * n_img:,.0f} 条，够不到 10 万条。"
-            f"需要过滤后可用框 >= 100000，即 reject 率 <= "
-            f"{(1 - 100000 / n_box) * 100:.0f}%（当前 "
-            f"{grades['reject'] / n_box * 100:.0f}%）。")
+        msg = f"按当前阈值全量跑完约 {est * n_img:,.0f} 条，够不到 10 万条。"
+        if n_box < 100000:
+            # 标注框总数本身就不到 10 万，再怎么放宽阈值也凑不出来 ——
+            # 这时候说「reject 率要降到 x%」是误导，得加数据。
+            msg += (f"这份数据一共才 {n_box:,} 个标注框，"
+                    f"阈值调到极限也不够，只能补图片。")
+        else:
+            msg += (f"需要过滤后可用框 >= 100000，即 reject 率 <= "
+                    f"{(1 - 100000 / n_box) * 100:.0f}%（当前 "
+                    f"{grades['reject'] / n_box * 100:.0f}%）。")
+        warns.append(msg)
     if warns:
         print("\n【告警】")
         for w in warns:
