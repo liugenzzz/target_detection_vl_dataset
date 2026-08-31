@@ -86,13 +86,18 @@ def _deficit_order(target, made, failed_here, rng, strict=True):
 
     缺口 = 已产出 - 应产出 = made[t] - target[t] * (总产出 + 1)。越负欠得越多。
 
-    【strict 时只返回还欠着的任务（缺口 < 0）】。这一条是配比的最后一道保险：
-    一张图上主线的九个任务可能一个都成立不了（VLM 没挑中目标、或挑中的目标
-    没被指派到当前欠账的那种描述子类型），这时如果照样把槽位填给「永远能成功」
-    的非主线任务，它们就会把主线让出的槽位全部接走。
-    实测过一次：主线 63.1% 掉到 34.9%，而 exist_negative / region_identify /
-    detect_class / attribute_qa 四个全部超发到配比的 2.1~2.3 倍。
-    宁可空过这个槽位 —— 数据量的瓶颈在有多少张图，配比歪了却补不回来。
+    【strict 时按「组」卡配额，不按单个任务卡】。真正的硬要求是「主线 70% /
+    其余 30%」；七个 ground_* 之间怎么分是为内容多样性定的，不是硬约束。
+    两头都踩过坑：
+      不卡     —— 主线在某张图上一个都成立不了时，槽位被「永远能成功」的非主线
+                  任务接走。实测主线 63.1% 掉到 34.9%，exist_negative /
+                  region_identify / detect_class / attribute_qa 四个全部超发到
+                  配比的 2.1~2.3 倍。
+      按任务卡 —— 一张图只有 appearance 类型的目标，而 ground_appearance 恰好
+                  刚够它那 16%，槽位就空过 —— 目标明明在那儿却用不上。实测
+                  182 个带描述的目标只用了 50 个，每图产出掉到 0.74 条。
+    按组卡两头都躲开：组内谁先出仍由个体缺口排序（多样性照顾到），但一个子类型
+    不会因为自己那份用完了就被挡在门外，只要主线整体还欠着就能出。
 
     【failed_here 是必须的】。缺口只在 made 变化时才变，任务失败时 made 不变 ——
     排序结果一模一样，下一个槽位又选中同一个任务，再失败，再选中。strict 模式
@@ -105,9 +110,19 @@ def _deficit_order(target, made, failed_here, rng, strict=True):
     def gap(t):
         return made[t] - target[t] * (done_all + 1)
 
+    # 组配额：主线一组，其余一组。组内不设硬上限。
+    groups: Dict[bool, List[str]] = {True: [], False: []}
+    for t in target:
+        groups[t in MAIN_LINE].append(t)
+    group_open = {
+        is_main: (sum(made[t] for t in ts)
+                  - sum(target[t] for t in ts) * (done_all + 1)) < 0
+        for is_main, ts in groups.items() if ts}
+
     order = sorted(target, key=lambda t: (gap(t), rng.random()))
     return [t for t in order
-            if t not in failed_here and (not strict or gap(t) < 0)]
+            if t not in failed_here
+            and (not strict or group_open.get(t in MAIN_LINE, True))]
 
 
 def _box_list_text(boxes, bbox2d) -> str:
