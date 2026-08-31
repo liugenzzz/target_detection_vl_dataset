@@ -81,10 +81,18 @@ def _kinds_absent_here(vlm_info) -> set:
     return {f"ground_{k}" for k in DESCRIBE_KINDS if k not in present}
 
 
-def _deficit_order(target, made, failed_here, rng):
+def _deficit_order(target, made, failed_here, rng, strict=True):
     """按【产出缺口】排任务，欠得最多的在前；本图已证明出不了的排除掉。
 
     缺口 = 已产出 - 应产出 = made[t] - target[t] * (总产出 + 1)。越负欠得越多。
+
+    【strict 时只返回还欠着的任务（缺口 < 0）】。这一条是配比的最后一道保险：
+    一张图上主线的九个任务可能一个都成立不了（VLM 没挑中目标、或挑中的目标
+    没被指派到当前欠账的那种描述子类型），这时如果照样把槽位填给「永远能成功」
+    的非主线任务，它们就会把主线让出的槽位全部接走。
+    实测过一次：主线 63.1% 掉到 34.9%，而 exist_negative / region_identify /
+    detect_class / attribute_qa 四个全部超发到配比的 2.1~2.3 倍。
+    宁可空过这个槽位 —— 数据量的瓶颈在有多少张图，配比歪了却补不回来。
 
     【failed_here 是必须的】。缺口只在 made 变化时才变，任务失败时 made 不变 ——
     排序结果一模一样，下一个槽位又选中同一个任务，再失败，再选中。strict 模式
@@ -93,9 +101,13 @@ def _deficit_order(target, made, failed_here, rng):
     被调用过，报告里连它们的失败计数都是 0，看不出任何异常。
     """
     done_all = sum(made.values())
-    order = sorted(target, key=lambda t: (made[t] - target[t] * (done_all + 1),
-                                          rng.random()))
-    return [t for t in order if t not in failed_here]
+
+    def gap(t):
+        return made[t] - target[t] * (done_all + 1)
+
+    order = sorted(target, key=lambda t: (gap(t), rng.random()))
+    return [t for t in order
+            if t not in failed_here and (not strict or gap(t) < 0)]
 
 
 def _box_list_text(boxes, bbox2d) -> str:
@@ -331,7 +343,8 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
             # 改成每个槽位挑【当前欠账最多】的任务：欠得越多越优先，一旦补上
             # 就轮到别人。这是个自校正的反馈，任何任务的可用率再低也不会被
             # 别人挤掉份额，也不会有任务超发。缺口相同时随机打散，避免固定顺序。
-            deficit = _deficit_order(target, made, failed_here, rng)
+            deficit = _deficit_order(target, made, failed_here, rng,
+                                     strict=strict_ratio)
             if not deficit:
                 break                    # 这张图上所有任务都试过了，别空转
 

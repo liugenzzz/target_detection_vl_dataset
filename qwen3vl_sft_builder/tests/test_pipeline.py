@@ -1730,9 +1730,13 @@ def test_deficit_order_still_follows_the_configured_ratio():
 
     # 一条都没产出时，权重最大的欠得最多
     assert _deficit_order(target, Counter({"a": 0, "b": 0, "c": 0}), set(), rng)[0] == "a"
-    # a 已经超发，就该轮到别人
+    # a 已经超发：strict 下直接【排除】，不只是排最后
     order = _deficit_order(target, Counter({"a": 10, "b": 0, "c": 0}), set(), rng)
-    assert order[0] == "b" and order[-1] == "a"
+    assert order[0] == "b" and "a" not in order
+    # 非 strict（fill 模式）仍然保留它，只是排最后
+    order = _deficit_order(target, Counter({"a": 10, "b": 0, "c": 0}), set(), rng,
+                           strict=False)
+    assert order[-1] == "a"
 
     # 长跑一遍：产出比例应当贴近配比
     made = Counter({k: 0 for k in target})
@@ -1775,3 +1779,37 @@ def test_ground_tasks_whose_kind_is_absent_are_skipped_up_front():
 
     # 一个目标都没挑中时，七个 ground_* 全排除，槽位全留给非主线任务
     assert _kinds_absent_here({}) == {f"ground_{k}" for k in DESCRIBE_KINDS}
+
+
+def test_overquota_tasks_cannot_take_slots_the_main_line_gave_up():
+    """一张图上主线九个任务可能一个都成立不了（VLM 没挑中目标，或挑中的目标
+    没被指派到当前欠账的那种描述子类型）。这时如果照样把槽位填给「永远能成功」
+    的非主线任务，它们就会把主线让出的槽位全部接走。
+
+    实测踩过：主线 63.1% 掉到 34.9%，exist_negative / region_identify /
+    detect_class / attribute_qa 四个全部超发到配比的 2.1~2.3 倍。
+    宁可空过这个槽位 —— 数据量的瓶颈在有多少张图，配比歪了却补不回来。
+    """
+    import random
+    from collections import Counter
+
+    from core.pipeline import _deficit_order
+
+    target = {"主线": 0.7, "拒答": 0.3}
+    rng = random.Random(2)
+
+    # 拒答已经拿到 30 条、主线 0 条：拒答超发，不该再给它槽位
+    made = Counter({"主线": 0, "拒答": 30})
+    assert _deficit_order(target, made, set(), rng) == ["主线"]
+    # 主线在这张图上出不来 -> 没有任何任务可选 -> 调用方空过这个槽位
+    assert _deficit_order(target, made, {"主线"}, rng) == []
+
+    # 长跑：主线只有一半的图能成立，配比仍要守住 70/30
+    made = Counter({"主线": 0, "拒答": 0})
+    for i in range(2000):
+        blocked = {"主线"} if i % 2 else set()      # 一半的图主线出不来
+        order = _deficit_order(target, made, blocked, rng)
+        if order:
+            made[order[0]] += 1
+    total = sum(made.values())
+    assert abs(made["主线"] / total - 0.7) < 0.02, made
