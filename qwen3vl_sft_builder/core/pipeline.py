@@ -19,7 +19,7 @@ from .difficulty import (HARD, REJECT, Grader, balance_hard_quota, grade_at_most
                           grade_rank)
 from .grouping import source_group_key
 from .referring import spatial_phrase
-from .tasks import MAIN_LINE, TASKS, Ctx
+from .tasks import DESCRIBE_KINDS, MAIN_LINE, TASKS, Ctx
 
 
 def _load_measure_words(cfg) -> Dict[str, str]:
@@ -62,6 +62,23 @@ def _next_kind(kind_list, cursor, grades):
         if any(grade_at_most(g, k.max_grade) for g in grades):
             break
     return k, cursor
+
+
+def _kinds_absent_here(vlm_info) -> set:
+    """这张图上【不可能成立】的 ground_* 任务名。
+
+    每个目标在预取阶段只被指派一种描述子类型，而调度器按缺口选任务时看不到
+    这张图上有哪些子类型。一张图平均只有 1.7 个带描述的目标，却有 7 个
+    ground_* 在抢 —— 十有八九点到这张图上不存在的那种，槽位直接作废。
+    实测 100 张图有 169 个带描述的目标，主线只出了 70 条，99 个白白浪费。
+
+    这【不是新增闸门】：没有对应子类型的目标，任务本来也必然返回 None。
+    只是把「注定失败」提前算出来，省下的槽位留给能成的任务。
+    描述或问句缺一不可 —— 主线要求三段齐全，缺一段一样出不来。
+    """
+    present = {info.get("describe_kind") for info in vlm_info.values()
+               if info.get("description") and info.get("describe_q")}
+    return {f"ground_{k}" for k in DESCRIBE_KINDS if k not in present}
 
 
 def _deficit_order(target, made, failed_here, rng):
@@ -293,6 +310,13 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         # 同一张图上同一个任务的输入是同一份，失败一次就不必再试。
         # 这个集合每张图重置，所以概率性失败的任务在下一张图还有机会。
         failed_here: set = set()
+        # 【预先排除这张图上不可能成立的 ground_* 】。每个目标在预取阶段只被
+        # 指派一种描述子类型，而调度器按缺口选任务时看不到这张图上有哪些子类型。
+        # 一张图平均只有 1.7 个带描述的目标，却有 7 个 ground_* 在抢 ——
+        # 十有八九点到这张图上不存在的那种，槽位直接作废。
+        # 实测：100 张图有 169 个带描述的目标，主线只出了 70 条，99 个白白浪费。
+        # 这里不是新增闸门，是把「注定失败」提前算出来，省下的槽位留给能成的。
+        failed_here |= _kinds_absent_here(vlm_info)
         # 指代骨架按图算一次：全图唯一性校验需要看到该图全部目标
         label_counts = collections.Counter(b.label for b in kept)
         n_want = min(cap, max(1, len(kept)))

@@ -1740,3 +1740,38 @@ def test_deficit_order_still_follows_the_configured_ratio():
         made[_deficit_order(target, made, set(), rng)[0]] += 1
     for k, want in target.items():
         assert abs(made[k] / 1000 - want) < 0.02, f"{k} 实得 {made[k] / 1000}"
+
+
+def test_ground_tasks_whose_kind_is_absent_are_skipped_up_front():
+    """每个目标在预取阶段只被指派一种描述子类型，而调度器按缺口选任务时
+    看不到这张图上有哪些子类型。一张图平均只有 1.7 个带描述的目标，却有
+    7 个 ground_* 在抢，十有八九点到不存在的那种，槽位直接作废。
+
+    实测 100 张图有 169 个带描述的目标，主线只出了 70 条 —— 99 个浪费在
+    这上面。这里把「注定失败」提前算出来，不是新增闸门。
+    """
+    from core.pipeline import _kinds_absent_here
+    from core.tasks import DESCRIBE_KINDS
+
+    vlm_info = {
+        0: {"describe_kind": "appearance", "description": "深红色车身",
+            "describe_q": "这辆车本身长什么样？"},
+        1: {"describe_kind": "relation", "description": "紧挨着一堵砖墙",
+            "describe_q": "它和周围什么挨着？"},
+        # 有子类型但描述为空 —— 模型拒绝了，这个任务照样出不来
+        2: {"describe_kind": "part", "description": "", "describe_q": ""},
+        # 有描述但缺问句 —— 主线要三段齐全，缺一段一样出不来
+        3: {"describe_kind": "contrast", "description": "比另外两辆长",
+            "describe_q": ""},
+    }
+    absent = _kinds_absent_here(vlm_info)
+    assert "ground_appearance" not in absent
+    assert "ground_relation" not in absent
+    assert "ground_part" in absent          # 描述为空
+    assert "ground_contrast" in absent      # 缺问句
+    # 其余没出现的子类型全部排除
+    assert absent == {f"ground_{k}" for k in DESCRIBE_KINDS
+                      if k not in ("appearance", "relation")}
+
+    # 一个目标都没挑中时，七个 ground_* 全排除，槽位全留给非主线任务
+    assert _kinds_absent_here({}) == {f"ground_{k}" for k in DESCRIBE_KINDS}
