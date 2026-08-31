@@ -317,7 +317,7 @@ class VlmClient:
         if not raw:
             return {}
         parsed = _parse_scene_json(raw)
-        if not parsed:
+        if parsed is None:
             return {}
         return {i: v for i, v in parsed.items() if i in valid_indices}
 
@@ -536,7 +536,15 @@ def _diagnose(status: int, body: str) -> Optional[str]:
 def _parse_scene_json(text: str) -> Optional[Dict[int, Dict[str, str]]]:
     """解析「挑对象」调用的返回：{"picked":[{"id":0,"attribute":..,"color":..,"description":..}]}
 
-    返回 {box_index: {attribute, color, description}}。解析不出返回 None。
+    返回 {box_index: {attribute, color, description}}。
+
+    【区分两种空】：
+      None  —— 真的解析不出（不是 JSON、键名写错、picked 不是列表）。
+                这是格式问题，要去改提示词。
+      {}    —— 解析成功，但模型一个目标都没挑（"picked": []）。
+                这是模型看图后的正常判断，不是故障。
+    早先两种都返回 None，自检和构建报告就分不出「提示词坏了」和「模型看了图
+    决定不挑」—— 这两件事的修法完全相反，混在一起会往错误的方向排查。
     """
     if not text:
         return None
@@ -548,7 +556,9 @@ def _parse_scene_json(text: str) -> Optional[Dict[int, Dict[str, str]]]:
         data = json.loads(m.group(0))
     except json.JSONDecodeError:
         return None
-    picked = data.get("picked") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or "picked" not in data:
+        return None                      # 键名写错，属于格式问题
+    picked = data.get("picked")
     if not isinstance(picked, list):
         return None
     out: Dict[int, Dict[str, str]] = {}
@@ -570,6 +580,6 @@ def _parse_scene_json(text: str) -> Optional[Dict[int, Dict[str, str]]]:
             "describe_q": str(item.get("describe_q") or "").strip(),
             "questions": questions,
         }
-    return out or None
+    return out                           # 空字典是「没挑中」，不是「解析失败」
 
 

@@ -170,7 +170,11 @@ def test_empty_json_is_not_success():
     from core.vlm_client import _parse_scene_json
     assert _parse_scene_json("") is None
     assert _parse_scene_json("模型今天不想干活") is None
-    assert _parse_scene_json('{"picked": []}') is None
+    # 空选 != 解析失败。合法 JSON、键名也对，只是模型没挑中任何目标 ——
+    # 返回 {} 而不是 None，调用方才分得出「提示词坏了」和「模型看了图决定不挑」。
+    # 这两件事的修法完全相反。
+    assert _parse_scene_json('{"picked": []}') == {}
+    assert _parse_scene_json('```json\n{"picked": []}\n```') == {}
     assert _parse_scene_json('{"picked": "不是列表"}') is None
     assert _parse_scene_json('{"选中": [{"id": 0}]}') is None        # 键名写错
     ok = _parse_scene_json('{"picked":[{"id":0,"attribute":"银灰色",'

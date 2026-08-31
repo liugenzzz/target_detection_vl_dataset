@@ -32,6 +32,41 @@ from core.yolo import IMAGE_EXTS                 # noqa: E402
 OK, BAD = "  [通过]", "  [失败]"
 
 
+def _real_box_list(cfg, img: Path):
+    """按管道同样的格式，拼出这张图【真实标注】的目标清单。返回 (文本, 框数)。
+
+    找不到标注时退回假标注 —— 那样只能验 JSON 格式，验不了模型挑不挑得中。
+    """
+    from core.classes import load_class_table
+    from core.coords import yolo_to_bbox2d
+    from core.yolo import iter_annotations
+
+    labels_dir = Path(cfg.get_path("paths.labels_dir", "") or "")
+    label_file = labels_dir / f"{img.stem}.txt"
+    if labels_dir.is_dir() and label_file.is_file():
+        try:
+            table = load_class_table(cfg.require("paths.classes_yaml"))
+            scale = int(cfg.get_path("coords.scale", 1000))
+            origin = int(cfg.get_path("coords.origin", 0))
+            for ann in iter_annotations(labels_dir, img.parent, table,
+                                        int(cfg.get_path("quality.sanity_max_boxes", 1000))):
+                if ann.image_path.stem != img.stem:
+                    continue
+                boxes = ann.boxes[:8]
+                lines = [f"图中共 {len(boxes)} 个已标注目标："]
+                for b in boxes:
+                    xy = yolo_to_bbox2d(b.cx, b.cy, b.w, b.h,
+                                        ann.width, ann.height, scale, origin)
+                    lines.append(f"  [{b.index}] {b.label}  位于 {xy}")
+                if boxes:
+                    return "\n".join(lines), len(boxes)
+        except Exception as exc:                      # noqa: BLE001
+            print(f"  注意：读真实标注失败（{exc}），退回假标注")
+    fake = "\n".join(f"  [{i}] 测试目标{i}  位于 [{i * 100}, 200, {i * 100 + 80}, 300]"
+                      for i in range(3))
+    return fake, 0
+
+
 def post(url, key, payload, timeout):
     import requests
     headers = {"Content-Type": "application/json"}
@@ -180,14 +215,21 @@ def _check_one(ep, timeout, cfg, args) -> int:
     # 这一步必须验【管道真正在用的那个提示词】。以前验的是 vlm_describe.txt，
     # 而管道早已改用 vlm_select.txt —— 自检全绿、全量跑起来才发现解析不出来。
     print("\n[3/3] 真实提示词（prompts/vlm_select.txt，管道实际用的就是它）")
-    box_list = "\n".join(f"  [{i}] 测试目标{i}  位于 [{i * 100}, 200, {i * 100 + 80}, 300]"
-                         for i in range(3))
+    # 【用这张图的真实标注】。以前拼的是「测试目标0 位于 [0,200,80,300]」这种
+    # 假框：模型看图后发现图里根本没有「测试目标0」，老实返回 "picked": []，
+    # 自检却把这个正确行为报成失败。用真标注，验的才是构建时真正发出去的东西。
+    box_list, n_real = _real_box_list(cfg, img)
+    if n_real == 0:
+        print("  注意：这张图没有对应的标注文件，退回假标注 —— "
+              "只能验格式，验不了模型挑不挑得中目标。用 --image 换一张有标注的。")
     # 描述子类型的指派段也要一起发过去 —— 管道就是这么拼的，少一段就等于
     # 验了一个和线上不一样的提示词。（这里曾经漏传，check_vlm 直接崩在 render。）
     kinds = list(describe_kinds.load_all().values())
     kind_assignments = "\n\n".join(
-        describe_kinds.render_assignment(kinds[i % len(kinds)], i + 1) for i in range(3))
-    prompt_text = prompts.render("vlm_select", box_list=box_list, max_pick=3,
+        describe_kinds.render_assignment(kinds[i % len(kinds)], i + 1)
+        for i in range(min(max(n_real, 1), 3)))
+    max_pick = min(max(n_real, 1), 3)
+    prompt_text = prompts.render("vlm_select", box_list=box_list, max_pick=max_pick,
                                  kind_assignments=kind_assignments)
     msg = [{"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{b64}"}},
            {"type": "text", "text": prompt_text}]
@@ -206,6 +248,22 @@ def _check_one(ep, timeout, cfg, args) -> int:
         print("  排查：改 prompts/vlm_select.txt 让模型只吐 JSON —— 改提示词不用动代码。")
         print("        小模型常见问题是加解释性前后缀，或把键名写错。")
         return 1
+    if not parsed:
+        # 【空选不是故障】。JSON 解析成功就说明提示词和输出格式没问题；
+        # 挑不挑得中是模型看图后的判断。以前这里连同解析失败一起报 [失败]，
+        # 会把人往「改提示词」的方向带，而实际上格式一点问题都没有。
+        print(f"\n{OK} 格式通过：返回的是合法 JSON，键名也对")
+        if n_real == 0:
+            print("  模型一个都没挑 —— 用的是假标注，图里本来就没有这些目标，"
+                  "这是正确行为。")
+            print("  想连「挑目标」一起验，把 --image 指向 images_dir 里"
+                  "有对应标注文件的图。")
+        else:
+            print(f"  但这张图的 {n_real} 个真实目标一个都没挑中。构建时这类图会跳过，"
+                  "主线出不来。")
+            print("  排查：多半是目标太小/太密模型看不清 —— 换一张目标大的图再试；"
+                  "换几张都这样，说明这个模型的视觉能力撑不住这份数据。")
+        return 0 if n_real == 0 else 1
     print(f"\n{OK} 解析成功，挑中 {len(parsed)} 个目标")
     for idx, info in list(parsed.items())[:2]:
         print(f"    [{idx}] attribute={info.get('attribute')!r} "
