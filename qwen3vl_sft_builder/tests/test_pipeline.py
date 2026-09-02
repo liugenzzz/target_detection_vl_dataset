@@ -2040,3 +2040,72 @@ def test_merge_lets_the_superset_task_evict_the_duplicate():
         test_ids = {json.loads(l)["id"] for l in
                     (base / "test.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()}
         assert test_ids == {"3_detect_describe_卡车"}
+
+
+def test_migrate_vlm_cache_discovers_the_fingerprint_the_cache_was_written_under():
+    """缓存跑完之后新增了一个提示词文件 —— 指纹一变，十万张图的缓存全对不上。
+
+    这是真实踩过的事故。迁移脚本得能自己认出「当时那个指纹」，否则只能靠
+    人肉猜，而 md5 前缀是猜不出来的。
+    """
+    import hashlib
+    import subprocess
+    import prompts as _p
+
+    root = Path(__file__).resolve().parents[1]
+
+    pd = _p.PROMPT_DIR
+    victim = next(p for p in sorted(pd.rglob("*.txt")))   # 假装它是后加的
+    h = hashlib.md5()
+    for p in sorted(pd.rglob("*.txt")):
+        if p == victim:
+            continue
+        h.update(p.name.encode())
+        h.update(p.read_bytes())
+    old_fp = h.hexdigest()[:12]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        imgs, cache = Path(tmp) / "images", Path(tmp) / "vlm_cache"
+        imgs.mkdir()
+        cache.mkdir()
+        names = [f"img_{i:03d}.jpg" for i in range(40)]
+        for n in names:
+            (imgs / n).write_bytes(b"\xff\xd8\xff")
+            key = hashlib.md5(f"{n}|[]|{old_fp}".encode()).hexdigest()
+            (cache / f"{key}.json").write_text('{"description": "x"}', encoding="utf-8")
+
+        r = subprocess.run(
+            [sys.executable, str(root / "scripts" / "migrate_vlm_cache.py"),
+             "--discover", "--cache-dir", str(cache), "--images-dir", str(imgs)],
+            capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert f"--old-fp {old_fp}" in r.stdout, r.stdout
+
+        # 认出来之后要真的改完名：新指纹下 40 个键必须全在，且没多出文件
+        from core.vlm_client import _prompt_fingerprint
+        new_fp = _prompt_fingerprint()
+        for n in names:
+            key = hashlib.md5(f"{n}|[]|{new_fp}".encode()).hexdigest()
+            assert (cache / f"{key}.json").exists(), n
+        assert len(list(cache.glob("*.json"))) == 40
+
+
+def test_migrate_vlm_cache_refuses_a_wrong_fingerprint_instead_of_reporting_success():
+    """猜错指纹时必须非零退出并说清楚，不能安安静静地「迁移 0 条」。"""
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory() as tmp:
+        imgs, cache = Path(tmp) / "images", Path(tmp) / "vlm_cache"
+        imgs.mkdir()
+        cache.mkdir()
+        (imgs / "a.jpg").write_bytes(b"\xff\xd8\xff")
+        (cache / ("0" * 32 + ".json")).write_text("{}", encoding="utf-8")
+
+        r = subprocess.run(
+            [sys.executable, str(root / "scripts" / "migrate_vlm_cache.py"),
+             "--old-fp", "deadbeef0000", "--cache-dir", str(cache),
+             "--images-dir", str(imgs)],
+            capture_output=True, text=True)
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "一个都没命中" in r.stdout
