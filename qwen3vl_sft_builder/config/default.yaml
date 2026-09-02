@@ -92,6 +92,7 @@ phrase_banks:
     - ask_describe
     - ground_unique
     - detect_class
+    - detect_describe_pick
     - spatial_ask_lr
     - spatial_ask_ud
     - spatial_answer
@@ -202,6 +203,10 @@ tasks:
   inventory_locate:   25    # 盘点 -> 定位 -> 描述（主线，count 已并入第一轮）
   ground_unique:      15    # 定位图中的卡车（主线，该类原始标注里仅一个实例）
   detect_class:        8    # 定位图中所有的人员（需该类全部框合格）
+  # 穷举定位 -> 坐标回指 -> 描述。默认 0：它和 detect_class 抢同一批
+  # (图, 类别)，混跑时先出的那个会占掉该类别。用【单独跑一次再合并】的方式
+  # 产出（tasks 只留它 = 100），合并时用它顶掉 detect_class 的重复条目。
+  detect_describe:     0
   region_identify:     7    # [框] 这个区域内的是什么（REG）
   exist_negative:      7    # 图中有没有直升机 / 拒答
   attribute_qa:        5    # [框] 这个区域内物体的颜色是什么

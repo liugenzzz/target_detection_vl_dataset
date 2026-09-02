@@ -1886,3 +1886,123 @@ def test_merging_extra_samples_keeps_source_groups_in_their_existing_split():
             for row in rows:
                 where.setdefault(source_group_key(row["images"][0]), set()).add(split)
         assert not [k for k, v in where.items() if len(v) > 1]
+
+
+def test_detect_describe_refers_back_by_coordinates_not_text():
+    """第一轮的答案是同类的全部框，用文字说「那辆卡车」指不明是哪一辆 ——
+    这正是 ground_unique 卡死的地方（实测 997 次尝试零成功）。
+    坐标天然无歧义，所以这个任务【不要求】类别在图中唯一，
+    是部件级标注上唯一能成立的「多实例 + 描述」形态。
+    """
+    import json as _json
+    import random
+
+    from core.tasks import TASKS, Ctx
+
+    class _B:
+        def __init__(self, index, label):
+            self.index, self.label = index, label
+
+    boxes = [_B(0, "卡车"), _B(1, "卡车"), _B(2, "卡车")]
+    vlm = {1: {"description": "深红色车身，支着一顶白色遮阳篷，车斗里码着几只木箱。",
+               "attribute": "深红色", "color": "深红色", "describe_q": "", "questions": []}}
+    ctx = Ctx(annotation=None, boxes=boxes, grades={}, vlm=vlm,
+              all_labels=["卡车", "人员"],
+              bbox2d=lambda b: [b.index * 100, 200, b.index * 100 + 80, 300],
+              spatial=lambda b: "下方左侧", rng=random.Random(0),
+              measure_words={"卡车": "辆"}, raw_counts={"卡车": 3}, min_desc_len=18)
+
+    out = TASKS["detect_describe"](ctx)
+    assert out is not None
+    turns = out["conversations"]
+    assert len(turns) == 4, "两轮 = 四条消息"
+
+    # 第一轮：穷举问句 + 全部三个框
+    assert "所有" in turns[0]["value"]
+    assert len(_json.loads(turns[1]["value"])) == 3
+
+    # 第二轮：问句里必须【带坐标】回指，且不能再出现穷举词
+    q2 = turns[2]["value"]
+    assert "bbox_2d" in q2, "第二轮必须用坐标回指，不能用文字指代"
+    assert "所有" not in q2 and "全部" not in q2
+    # 回指的坐标必须是第一轮答案里的某一个
+    first_round = {_json.dumps(b, ensure_ascii=False, separators=(",", ":"))
+                   for b in _json.loads(turns[1]["value"])}
+    assert any(box in q2 for box in first_round)
+    assert turns[3]["value"] == vlm[1]["description"]
+    assert out["described_box"] == 1
+
+
+def test_detect_describe_needs_a_describable_box():
+    """一个框都拿不到描述时，第二轮会退化成 detect_class ——
+    那还不如让 detect_class 自己出，不必多这一个任务。"""
+    import random
+
+    from core.tasks import TASKS, Ctx
+
+    class _B:
+        def __init__(self, index, label):
+            self.index, self.label = index, label
+
+    ctx = Ctx(annotation=None, boxes=[_B(0, "卡车"), _B(1, "卡车")], grades={},
+              vlm={},                      # 一条描述都没有
+              all_labels=["卡车"], bbox2d=lambda b: [0, 0, 10, 10],
+              spatial=lambda b: "下方左侧", rng=random.Random(0),
+              measure_words={"卡车": "辆"}, raw_counts={"卡车": 2}, min_desc_len=18)
+    assert TASKS["detect_describe"](ctx) is None
+
+
+def test_merge_lets_the_superset_task_evict_the_duplicate():
+    """detect_describe 的第一轮和 detect_class 一字不差，只是多一轮描述。
+    单独跑时 used 是空的，两者会覆盖同一批 (图, 类别) —— 合并后就是一批
+    第一轮完全相同的近重复样本。同图同类保留超集、丢弃被覆盖的那条。
+    """
+    import json
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+
+    def sample(gid, task, label):
+        return {"id": f"{gid}_{task}_{label}",
+                "images": [f"vid{gid}_mp4-1_jpg.rf.{'a' * 32}.jpg"],
+                "conversations": [], "metadata": {"task_type": task, "label": label}}
+
+    def write(path, rows):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
+                        encoding="utf-8")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base, add = Path(tmp) / "base", Path(tmp) / "add"
+        write(base / "train.jsonl", [sample(0, "detect_class", "卡车"),
+                                     sample(0, "detect_class", "人员"),
+                                     sample(2, "ground_full", "卡车")])
+        write(base / "val.jsonl", [])
+        write(base / "test.jsonl", [sample(3, "detect_class", "卡车")])
+        write(add / "train.jsonl", [sample(0, "detect_describe", "卡车"),
+                                    sample(3, "detect_describe", "卡车")])
+        write(add / "val.jsonl", [])
+        write(add / "test.jsonl", [])
+
+        r = subprocess.run(
+            [sys.executable, str(root / "scripts" / "merge_by_group.py"),
+             "--into", str(base), "--add", str(add)],
+            capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+
+        rows = [json.loads(l) for s in ("train", "val", "test")
+                for l in (base / f"{s}.jsonl").read_text(encoding="utf-8").splitlines()
+                if l.strip()]
+        ids = {row["id"] for row in rows}
+        # 同图同类：超集留下，被覆盖的丢弃
+        assert "0_detect_describe_卡车" in ids
+        assert "0_detect_class_卡车" not in ids
+        # 同图【不同类】不受影响
+        assert "0_detect_class_人员" in ids
+        # 别的任务不受影响
+        assert "2_ground_full_卡车" in ids
+        # 顶掉的那条原本在 test，替换进来的也必须还在 test
+        test_ids = {json.loads(l)["id"] for l in
+                    (base / "test.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()}
+        assert test_ids == {"3_detect_describe_卡车"}

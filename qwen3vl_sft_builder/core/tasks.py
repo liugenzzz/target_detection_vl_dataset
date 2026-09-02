@@ -430,6 +430,57 @@ def detect_class(ctx: Ctx):
             "focus": [b.index for b in boxes], "label": label, "n_boxes": len(boxes)}
 
 
+def detect_describe(ctx: Ctx):
+    """穷举定位 -> 坐标回指 -> 区域描述。
+
+        用户 │ 框出图中所有的卡车。
+        模型 │ [{"bbox_2d": [..]}, {"bbox_2d": [..]}, {"bbox_2d": [..]}]
+        用户 │ 描述一下 {"bbox_2d": [..]} 这辆卡车。
+        模型 │ 深红色车身，支着一顶白色遮阳篷……
+
+    【第二轮用坐标回指，不用文字】第一轮的答案是同类的全部框，用文字说
+    「那辆卡车」指不明是哪一辆 —— 这正是 ground_unique 卡死的地方
+    （实测 997 次尝试零成功）。坐标天然无歧义，所以这个任务【不要求】
+    类别在图中唯一，是部件级标注上唯一能成立的「多实例 + 描述」形态。
+
+    第一轮的约束和 detect_class 完全一致（该类全部框合格、都没被用过），
+    因为它就是 detect_class 的超集：同样的第一轮，多一轮描述。
+    合并数据时同一个 (图, 类别) 保留本任务、丢弃 detect_class 那条，
+    见 scripts/merge_by_group.py。
+    """
+    # 条件与 detect_class 一致 —— 少一条都会让第一轮的答案不完整或重复
+    cand = [l for l in {b.label for b in ctx.boxes}
+            if len(_same_label(ctx, l)) >= 2
+            and ctx.all_kept(l)                       # 有一个被过滤掉，答案就不完整
+            and all(b.index not in ctx.used for b in _same_label(ctx, l))]
+    if not cand:
+        return None
+
+    # 只保留「至少有一个框拿得到描述」的类别 —— 第二轮没描述就退化成 detect_class，
+    # 那还不如让 detect_class 自己出，不必多这一个任务。
+    usable = [(l, [b for b in _same_label(ctx, l) if _describe(ctx, b)])
+              for l in sorted(cand)]
+    usable = [(l, bs) for l, bs in usable if bs]
+    if not usable:
+        return None
+
+    label, describable = ctx.rng.choice(usable)
+    boxes = _same_label(ctx, label)
+    target = ctx.rng.choice(describable)
+    desc = _describe(ctx, target)
+
+    return {"conversations": _turns(
+                (_ask(ctx, prompts.render_choice("detect_class", ctx.rng, label=label),
+                      box_answer=True),
+                 _j([_box_of(ctx, b) for b in boxes], ctx.json_fence)),
+                (prompts.render_choice("detect_describe_pick", ctx.rng,
+                                       bbox=_j(_box_of(ctx, target), False),
+                                       mw=ctx.mw(label), label=label),
+                 desc)),
+            "focus": [b.index for b in boxes], "label": label,
+            "n_boxes": len(boxes), "described_box": target.index}
+
+
 def attribute_qa(ctx: Ctx):
     """[框] 这个区域内物体是什么颜色 / 有什么特征？—— Osprey-724K 里属性是
     最大一类（207K，29%）。用坐标指向目标，不存在把答案写进问题的可能。
@@ -613,11 +664,14 @@ TASKS: Dict[str, Callable[[Ctx], Optional[Dict[str, Any]]]] = {
     "inventory_locate": inventory_locate,
     **{f"ground_{k}": _make_ground_task(k) for k in DESCRIBE_KINDS},
     "detect_class": detect_class,
+    "detect_describe": detect_describe,
     "attribute_qa": attribute_qa,
     "spatial_relation": spatial_relation,
     "exist_negative": exist_negative,
     "region_identify": region_identify,
 }
 
-MAIN_LINE = ("ground_unique", "inventory_locate",
+# 主线 = 以【区域描述】收尾的那几个。detect_describe 也在内：它同样是
+# 「锁定目标 -> 坐标 -> 描述」，只是上游换成了单类穷举而不是文字指代。
+MAIN_LINE = ("ground_unique", "inventory_locate", "detect_describe",
              *(f"ground_{k}" for k in DESCRIBE_KINDS))

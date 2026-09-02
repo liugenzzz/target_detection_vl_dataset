@@ -11,6 +11,11 @@
 正确做法：已有划分是【基准】，补跑的每条样本按它的来源组去查基准属于哪一份，
 放进对应文件。基准里没见过的组（补跑覆盖了新图片）按配置比例补分，并单独报数。
 
+【去重】detect_describe 是 detect_class 的超集：第一轮的问句和答案完全一样，
+只是多一轮坐标回指的描述。同一个 (图, 类别) 上两者都存在时，保留
+detect_describe、丢弃 detect_class —— 否则合并后会有一批第一轮一字不差的
+近重复样本。混跑时 used 机制会挡住这种撞车，但单独跑时 used 是空的。
+
 原地改写 --into 目录的三个 jsonl，改前自动备份为 *.jsonl.bak。
 """
 from __future__ import annotations
@@ -28,6 +33,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core.grouping import source_group_key          # noqa: E402
 
 SPLITS = ("train", "val", "test")
+
+# 超集任务 -> 被它顶掉的任务。键任务覆盖了同一个 (图, 类别) 时，值任务那条丢弃。
+SUPERSEDES = {"detect_describe": "detect_class"}
 
 
 def _read(path: Path) -> list:
@@ -47,6 +55,39 @@ def _write(path: Path, rows: list) -> None:
 
 def _group_of(sample: dict) -> str:
     return source_group_key(sample["images"][0])
+
+
+def _task_of(sample: dict) -> str:
+    return (sample.get("metadata") or {}).get("task_type", "")
+
+
+def _coverage_key(sample: dict):
+    """(图, 类别) —— 判断两条样本是不是覆盖同一个目标集合。"""
+    label = (sample.get("metadata") or {}).get("label")
+    return (sample["images"][0], label) if label else None
+
+
+def _drop_superseded(base: dict, incoming: list) -> Counter:
+    """把被超集任务顶掉的旧样本从 base 里删掉，返回按任务计数。"""
+    covered = {}
+    for row in incoming:
+        sup = SUPERSEDES.get(_task_of(row))
+        key = _coverage_key(row)
+        if sup and key:
+            covered.setdefault(sup, set()).add(key)
+    if not covered:
+        return Counter()
+    dropped = Counter()
+    for split in SPLITS:
+        keep = []
+        for row in base[split]:
+            task, key = _task_of(row), _coverage_key(row)
+            if key and key in covered.get(task, ()):
+                dropped[task] += 1
+                continue
+            keep.append(row)
+        base[split] = keep
+    return dropped
 
 
 def main() -> int:
@@ -81,6 +122,13 @@ def main() -> int:
         got = [r for s in SPLITS for r in _read(Path(d) / f"{s}.jsonl")]
         print(f"并入 {d}：{len(got):,} 条")
         incoming.extend(got)
+
+    # 先顶掉被超集任务覆盖的旧样本，再归位新样本 ——
+    # 顺序反过来的话，新样本会先进 base，然后被自己顶掉。
+    dropped = _drop_superseded(base, incoming)
+    for task, n in dropped.items():
+        sup = [k for k, v in SUPERSEDES.items() if v == task][0]
+        print(f"去重：{sup} 顶掉 {task} {n:,} 条（同一 图×类别）")
 
     placed = Counter()
     new_groups = {}
