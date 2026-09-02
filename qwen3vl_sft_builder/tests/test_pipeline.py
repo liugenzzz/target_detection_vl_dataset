@@ -2,6 +2,7 @@
 
     python -m pytest tests/ -q     或     python tests/test_pipeline.py
 """
+import tempfile
 import re
 import sys
 from pathlib import Path
@@ -1824,3 +1825,64 @@ def test_ground_tasks_whose_kind_is_absent_are_skipped_up_front():
 
     # 一个目标都没挑中时，七个 ground_* 全排除，槽位全留给非主线任务
     assert _kinds_absent_here({}) == {f"ground_{k}" for k in DESCRIBE_KINDS}
+
+
+def test_merging_extra_samples_keeps_source_groups_in_their_existing_split():
+    """补跑的样本必须按【已有划分】归位，不能自己重新划分。
+
+    _split_by_source 是按样本总数和 shuffle 后的组顺序填 test/val/train 的。
+    补跑一次样本集不同 -> 每个来源组的落位就不同 -> 第一批 test 里的某个来源组，
+    可能在补跑里落进 train。同一张原图跨了划分，评估数字就废了，
+    而且从结果上完全看不出来。
+    """
+    import json
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+
+    def sample(group, frame, task):
+        return {"id": f"{group}_{frame}_{task}",
+                "images": [f"vid{group}_mp4-{frame}_jpg.rf.{'a' * 32}.jpg"],
+                "conversations": [], "metadata": {"task_type": task}}
+
+    def write(path, rows):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
+                        encoding="utf-8")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base, add = Path(tmp) / "base", Path(tmp) / "add"
+        # 基准：组 0~7 在 train，组 8 在 val，组 9 在 test
+        write(base / "train.jsonl", [sample(g, 1, "ground_full") for g in range(8)])
+        write(base / "val.jsonl", [sample(8, 1, "ground_full")])
+        write(base / "test.jsonl", [sample(9, 1, "ground_full")])
+        # 补跑：每个已有组各一条，外加两个基准没见过的新组
+        write(add / "train.jsonl",
+              [sample(g, 2, "inventory_locate") for g in list(range(10)) + [10, 11]])
+        write(add / "val.jsonl", [])
+        write(add / "test.jsonl", [])
+
+        r = subprocess.run(
+            [sys.executable, str(root / "scripts" / "merge_by_group.py"),
+             "--into", str(base), "--add", str(add)],
+            capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "来源分组无重叠" in r.stdout
+
+        got = {s: [json.loads(l) for l in (base / f"{s}.jsonl").read_text(
+            encoding="utf-8").splitlines() if l.strip()] for s in ("train", "val", "test")}
+
+        # 组 9 的两条都必须在 test，组 8 的两条都必须在 val
+        assert sum(1 for r_ in got["test"] if r_["id"].startswith("9_")) == 2
+        assert sum(1 for r_ in got["val"] if r_["id"].startswith("8_")) == 2
+        # 一条都不能丢
+        assert sum(len(v) for v in got.values()) == 10 + 12
+
+        # 任何来源组只能出现在一份里
+        from core.grouping import source_group_key
+        where = {}
+        for split, rows in got.items():
+            for row in rows:
+                where.setdefault(source_group_key(row["images"][0]), set()).add(split)
+        assert not [k for k, v in where.items() if len(v) > 1]
