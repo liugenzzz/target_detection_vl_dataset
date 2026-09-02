@@ -1212,6 +1212,40 @@ def test_ground_task_skips_when_model_declines():
     assert TASKS["ground_state"](ctx) is None
 
 
+def test_question_pools_do_not_invalidate_the_vlm_cache():
+    """【只有会发给模型的提示词才进缓存键】。
+
+    问法池、答法池只在【组装样本】时用，一个字都不会发给模型。早先是把
+    prompts/ 整棵树都算进指纹，后果是新增一个问法池 —— 一个模型根本看不到的
+    文件 —— 就把 11 万张图的缓存全作废了，等于白跑十个小时。
+    问法池改了该重新组装样本，不该重新调模型。
+    """
+    import importlib
+
+    import core.vlm_client as m
+
+    importlib.reload(m)
+    before = m._prompt_fingerprint()
+
+    # 新增一个问法池：模型看不到，指纹不该动
+    pool = prompts.PROMPT_DIR / "detect_class" / "_tmp_pool_for_test.txt"
+    pool.write_text("框出图中所有的{label}。\n", encoding="utf-8")
+    try:
+        assert m._prompt_fingerprint() == before, "问法池不该让缓存失效"
+    finally:
+        pool.unlink()
+
+    # 改 vlm_select（真正发给模型的那个）：指纹必须变
+    target = prompts.PROMPT_DIR / "_vlm" / "vlm_select.txt"
+    original = target.read_bytes()
+    try:
+        target.write_bytes(original + "\n# 测试用改动\n".encode())
+        assert m._prompt_fingerprint() != before, "改了发给模型的提示词，缓存必须失效"
+    finally:
+        target.write_bytes(original)
+    assert m._prompt_fingerprint() == before
+
+
 def test_prompt_change_invalidates_the_vlm_cache():
     """缓存的意义是「同一个问题不重复问」，改了提示词就不是同一个问题了。
     少了这一项，改完 prompts/ 重跑会全部命中旧缓存、输出一字未变，

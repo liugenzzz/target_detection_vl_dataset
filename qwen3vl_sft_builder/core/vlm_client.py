@@ -86,17 +86,31 @@ class VlmResult:
     source: str          # "vlm" | "cache"
 
 
+# 【只有这几个目录里的提示词会进模型请求】——
+#   _vlm/      vlm_select.txt，构建时那次「挑对象 + 写描述」的调用
+#   _tools/    measure_words.txt（量词表）、review.txt（质检）
+#   describe/  七个描述子类型，被拼进 vlm_select 的 kind_assignments 段
+# 其余目录（ground_unique/ detect_class/ attribute_qa/ _shared/ …）全是
+# 【组装期】的问法池和答法池，只在拼样本时用，一个字都不会发给模型。
+MODEL_FACING_PROMPT_DIRS = ("_vlm", "_tools", "describe")
+
+
 def _prompt_fingerprint() -> str:
-    """prompts/ 下所有 .txt 的内容指纹。
+    """【会发给模型的】提示词的内容指纹。
 
     按内容而不是按修改时间 —— git checkout 会改 mtime 但内容没变，
     按时间算会把好好的缓存全废掉。
+
+    【只算模型看得到的那部分】。早先是把 prompts/ 整棵树都算进去，后果是
+    新增一个问法池 —— 一个模型根本看不到的文件 —— 就把 11 万张图的缓存
+    全作废了，等于白跑十个小时。问法池改了该重新组装样本，不该重新调模型。
     """
     import prompts as _p
     h = hashlib.md5()
-    for path in sorted(_p.PROMPT_DIR.rglob("*.txt")):
-        h.update(path.name.encode())
-        h.update(path.read_bytes())
+    for sub in MODEL_FACING_PROMPT_DIRS:
+        for path in sorted((_p.PROMPT_DIR / sub).rglob("*.txt")):
+            h.update(path.name.encode())
+            h.update(path.read_bytes())
     return h.hexdigest()[:12]
 
 
