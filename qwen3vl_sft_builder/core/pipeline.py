@@ -158,6 +158,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     forbid_chat = tuple(cfg.get_path("phrase_banks.forbid_global", []) or [])
     require_desc = bool(cfg.get_path("main_line_requires_description", True))
     min_desc_len = int(cfg.get_path("min_description_len", 18))
+    count_zero_ratio = float(cfg.get_path("count_zero_ratio", 0.15))
     all_labels = sorted(table.id2name.values())
     show_progress = bool(cfg.get_path("vlm.progress", True))
     kinds = describe_kinds.load_all()
@@ -329,6 +330,9 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
             if c == 1 and sc["raw_counts"].get(l, c) == c)
 
         used: set = set()          # 本图已出过样本的框，避免同一目标反复出样本
+        # 不吃框的任务（count_class）在 used 里不留痕，靠这个记「这张图这个
+        # 类别数过了」，否则同一张图会反复出「有多少辆卡车」，答案一模一样。
+        claimed: set = set()
         # 【本图已经证明出不了的任务】。缺口排序只在 made 变化时才会变，
         # 任务失败时 made 不变 —— 于是下一个槽位又选中同一个任务，再失败，
         # 再选中……strict 模式只试缺口最大的那一个，就此死锁在它身上。
@@ -369,7 +373,8 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                            bbox2d=b2d, spatial=lambda b: spatial_phrase(b.cx, b.cy),
                            rng=rng, short_answer=rng.random() < short_ratio,
                            measure_words=measure_words, require_desc=require_desc,
-                           used=used, min_desc_len=min_desc_len,
+                           used=used, claimed=claimed, min_desc_len=min_desc_len,
+                           count_zero_ratio=count_zero_ratio,
                            raw_counts=sc["raw_counts"], forbid_chat=forbid_chat,
                            confusable=confusable, hypernym=hypernym,
                            kind_limits=kind_limits, json_fence=json_fence)
@@ -421,7 +426,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                     **{k: v for k, v in out.items()
                        if k in ("attribute", "attribute_kind", "describe_kind",
                                 "relation",
-                                "relation_axis", "count", "polarity",
+                                "relation_axis", "count", "counting", "polarity",
                                 "hard_negative", "question_source", "n_boxes",
                                 "inventory")},
                 },
@@ -433,6 +438,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
                 continue
             made[name] += 1
             used.update(out.get("focus", []))
+            claimed.update(out.get("claims", []))
             samples.append(sample)
         gen_bar.step(note=f"{len(samples)} 条")
     gen_bar.close()

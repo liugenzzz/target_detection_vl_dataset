@@ -105,6 +105,11 @@ phrase_banks:
     - region_identify
     - ground_attribute
     - region_identify_answer
+    - count_ask
+    - count_ask_visible
+    - count_answer
+    - count_answer_visible
+    - count_zero_answer
 
 # ---------------------------------------------------------------------------
 # 全量质检。构建阶段的过滤全是结构性的（占位符、类别泄漏、描述长度、坐标越界），
@@ -207,6 +212,10 @@ tasks:
   # (图, 类别)，混跑时先出的那个会占掉该类别。用【单独跑一次再合并】的方式
   # 产出（tasks 只留它 = 100），合并时用它顶掉 detect_class 的重复条目。
   detect_describe:     0
+  # 指定类别的计数（「图中有多少辆卡车」）。默认 0：它不吃框、和谁都不冲突，
+  # 但加进主混跑会把 70/30 的配比冲掉 —— 和另外两个补跑任务一起【单独跑一次
+  # 再合并】即可（tasks 只留这三个），合并用 scripts/merge_by_group.py。
+  count_class:         0
   region_identify:     7    # [框] 这个区域内的是什么（REG）
   exist_negative:      7    # 图中有没有直升机 / 拒答
   attribute_qa:        5    # [框] 这个区域内物体的颜色是什么
@@ -222,6 +231,12 @@ tasks:
 tasks_ratio_mode: strict
 
 short_answer_ratio: 0.14
+
+# 计数任务（count_class）里答 0 的比例。只问图里有的类别，模型会学成
+# 「被问就一定有」，数出来的永远 >= 1。答 0 的那一路优先挑易混类别
+# （图里有卡车，问有多少辆货车），从三百多类里随便抽一个不相干的东西，
+# 模型不看图也能答对，学不到东西。设 0 就只问图里有的类别。
+count_zero_ratio: 0.15
 
 # 主线（指代物体 -> 框 -> 描述语句）是否强制三段齐全。
 # 开启时，VLM 没有为该目标产出描述就不出这条主线样本 —— 主线的定义就是三段，

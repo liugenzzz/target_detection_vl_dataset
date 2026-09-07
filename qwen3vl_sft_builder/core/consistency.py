@@ -1,9 +1,10 @@
-"""跨任务一致性核对：同一张图，八个任务说出来的目标数量必须对得上。
+"""跨任务一致性核对：同一张图，各个任务说出来的目标数量必须对得上。
 
 一张图会被抽出多条样本、分给不同任务。它们各自独立生成，但说的是同一张图：
 
     inventory_locate  「图中有 3 名人员、2 辆卡车。」
     detect_class      「框出图中所有的人员。」-> 必须正好 3 个框
+    count_class       「图中有多少名人员？」-> 必须答 3
     exist_negative    「图中有没有人员？」-> 有，图中有 3 名人员
     exist_negative    「图中有没有直升机？」-> 没有  -> 别的样本里就不能出现直升机
 
@@ -68,6 +69,13 @@ def claims_of(sample: Dict[str, Any]) -> Dict[str, Any]:
                 counts[label] = int(n)
     elif task == "detect_class" and meta.get("n_boxes"):
         counts[meta["label"]] = int(meta["n_boxes"])
+    elif task == "count_class":
+        # 报的数就是过滤后的框数（不管走的是精确问法还是「清晰可见」问法），
+        # 与 detect_class 的框数、inventory_locate 的清单数是同一个口径。
+        if meta.get("counting") == "zero":
+            absent.append(meta["label"])
+        elif isinstance(meta.get("count"), int):
+            counts[meta["label"]] = int(meta["count"])
     elif task == "exist_negative":
         if meta.get("polarity") == "negative":
             absent.append(meta["label"])

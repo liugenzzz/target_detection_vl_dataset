@@ -2109,3 +2109,114 @@ def test_migrate_vlm_cache_refuses_a_wrong_fingerprint_instead_of_reporting_succ
             capture_output=True, text=True)
         assert r.returncode == 1, r.stdout + r.stderr
         assert "一个都没命中" in r.stdout
+
+
+def test_count_reports_the_number_it_can_actually_show():
+    """报的数必须兑现得了。该类有实例被质量过滤掉时，按过滤后的框数报
+    「图中有 1 辆卡车」，而图里明明站着 3 辆，就是错的 —— 那时问法与答法
+    都要带上「清晰可见」的限定，和 inventory_locate 的处理保持一致。"""
+    import random
+    from core.tasks import count_class
+
+    # 3 辆全都留下来了 -> 不带限定，报 3
+    ctx = _ctx_with_filtered([_Box(i, "卡车") for i in range(3)], {"卡车": 3})
+    ctx.rng, ctx.count_zero_ratio = random.Random(0), 0.0
+    out = count_class(ctx)
+    assert out["count"] == 3 and out["counting"] == "exact"
+    q, a = out["conversations"][0]["value"], out["conversations"][1]["value"]
+    assert "清晰" not in q and "可见" not in q, q
+    assert "3" in a, a
+
+    # 原始 7 辆、过滤后剩 3 -> 必须带限定，且报的还是 3（能看清的就这些）
+    ctx = _ctx_with_filtered([_Box(i, "卡车") for i in range(3)], {"卡车": 7})
+    ctx.rng, ctx.count_zero_ratio = random.Random(0), 0.0
+    out = count_class(ctx)
+    assert out["count"] == 3 and out["counting"] == "visible"
+    q, a = out["conversations"][0]["value"], out["conversations"][1]["value"]
+    assert any(w in q for w in ("清晰", "看得清", "可见")), q
+    assert any(w in a for w in ("清晰", "看得清", "可见")), a
+
+
+def test_count_does_not_repeat_the_same_class_on_one_image():
+    """计数任务不吃框，used 挡不住它 —— 没有 claims 这一层，同一张图会反复出
+    「图中有多少辆卡车」，问法不同、答案一模一样，是近重复数据。"""
+    import random
+    from core.tasks import count_class
+
+    ctx = _ctx_with_filtered([_Box(0, "卡车"), _Box(1, "人员")],
+                             {"卡车": 1, "人员": 1})
+    # 关掉答 0 那一路，剩下的就只有图里这两个类别
+    ctx.rng, ctx.count_zero_ratio = random.Random(0), 0.0
+    seen = []
+    for _ in range(5):
+        out = count_class(ctx)
+        if out is None:
+            break
+        seen.append(out["label"])
+        ctx.claimed.update(out["claims"])
+    assert sorted(seen) == ["人员", "卡车"], seen      # 两个类各一次，然后就没了
+
+
+def test_count_leaves_the_boxes_for_the_tasks_that_need_them():
+    """focus 必须是空的：答案是一个数不是坐标，占掉这一类的框会把
+    detect_class / detect_describe 挡在门外，而它们才是要输出坐标的。"""
+    import random
+    from core.tasks import count_class, detect_class
+
+    boxes = [_Box(0, "卡车"), _Box(1, "卡车")]
+    ctx = _ctx_with_filtered(boxes, {"卡车": 2})
+    ctx.rng, ctx.count_zero_ratio = random.Random(0), 0.0
+    out = count_class(ctx)
+    assert out["focus"] == []
+    ctx.used.update(out["focus"])
+    assert detect_class(ctx) is not None, "计数占掉了框，穷举定位出不来了"
+
+
+def test_count_zero_never_asks_about_something_that_is_there():
+    """答 0 的那一路必须避开图里有的类别【和它的上下位词】：
+    图里有遮阳三轮车，问「有多少辆三轮车」答 0 是错的。"""
+    import random
+    from core.tasks import count_class
+
+    ctx = _ctx_with_filtered([_Box(0, "遮阳三轮车")], {"遮阳三轮车": 1})
+    ctx.all_labels = ["遮阳三轮车", "三轮车", "卡车", "人员"]
+    ctx.hypernym = {"遮阳三轮车": ["三轮车"]}
+    ctx.count_zero_ratio = 1.0
+    for seed in range(40):
+        ctx.rng = random.Random(seed)
+        ctx.claimed = set()
+        out = count_class(ctx)
+        assert out["counting"] == "zero" and out["count"] == 0
+        assert out["label"] not in ("遮阳三轮车", "三轮车"), out["label"]
+
+
+def test_count_claims_are_cross_checked_against_the_image():
+    """计数说 3、穷举定位给 2 个框，就是同一张图配了两套真值。
+    一致性核对必须把计数的说法也算进去。"""
+    from core import consistency
+
+    def sample(task, meta, answer):
+        return {"images": ["a.jpg"],
+                "conversations": [{"from": "human", "value": "<image>\nQ"},
+                                  {"from": "gpt", "value": answer}],
+                "metadata": {"task_type": task, **meta}}
+
+    truth = {"a.jpg": {"卡车": 2}}
+    ok = consistency.check([sample("count_class",
+                                   {"label": "卡车", "count": 2, "counting": "exact"},
+                                   "图中有 2 辆卡车。")], truth)
+    assert not ok["violations"], ok["violations"]
+
+    bad = consistency.check([sample("count_class",
+                                    {"label": "卡车", "count": 3, "counting": "exact"},
+                                    "图中有 3 辆卡车。")], truth)
+    assert bad["violations"], "数错了却没被核对出来"
+
+    # 说「一辆卡车都没有」，同一张图另一条却把卡车框了出来
+    clash = consistency.check(
+        [sample("count_class", {"label": "卡车", "count": 0, "counting": "zero"},
+                "图中没有卡车。"),
+         sample("detect_class", {"label": "卡车", "n_boxes": 2},
+                '[{"bbox_2d": [1, 2, 3, 4], "label": "卡车"}]')],
+        truth)
+    assert clash["violations"], "答 0 与框出该类没被核对出来"

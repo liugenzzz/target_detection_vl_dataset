@@ -1,4 +1,4 @@
-"""十四个任务的样本生成器。
+"""十五个任务的样本生成器。
 
 每个任务一个函数，签名统一为 (ctx) -> dict | None，返回 None 表示这张图上
 出不了这个任务（条件不满足）。注册在 TASKS 里，配比由 config 的 tasks 段控制，
@@ -80,6 +80,14 @@ class Ctx:
     # 本张图已经被出过样本的框。同一个目标出多条样本时，答案 bbox 完全相同，
     # 只是问法不同，属于近重复数据 —— 实测同一个框曾在一张图里被出了 4 次。
     used: set = field(default_factory=set)
+    # 本张图已经被【主张过】的东西，形如 "count:卡车"。
+    # used 只挡得住吃框的任务；count_class 不吃框（它的答案是一个数，不是坐标，
+    # 占掉框反而会挡住 detect_class / detect_describe），于是在 used 里不留痕，
+    # 同一张图上「有多少辆卡车」会被反复出，问法不同、答案一模一样。
+    claimed: set = field(default_factory=set)
+    # 计数任务里答 0 的比例。只问图里有的类别，模型会学成「被问就一定有」，
+    # 数出来的永远 >= 1 —— 和拒答样本要防的是同一件事。
+    count_zero_ratio: float = 0.15
 
     def kind_fits(self, kind: str, box) -> bool:
         """这个框的难度档位配不配做这一种描述。没配限制或没有档位信息就放行。"""
@@ -319,8 +327,9 @@ def inventory_locate(ctx: Ctx):
         用户 │ 描述一下这艘船。
         模型 │ ...
 
-    每一轮都承接上一轮，是一段真对话，不是拼起来的问答对。计数信息在第一轮
-    自然带出，所以不再单独出「图中有几个 X」的任务。
+    每一轮都承接上一轮，是一段真对话，不是拼起来的问答对。第一轮自然带出全图
+    的计数信息 —— 单个类别的计数由 count_class 单独出，那一路问的是指定类别
+    （「图中有多少辆卡车」），包含答 0 的情形，两者不重复。
 
     第一轮的问法刻意限定为【清晰可见的】目标：实测只有 3.5% 的图片全部标注框
     都能通过质量过滤，其余图片都有被剔除的小目标。不加这个限定就等于给出一份
@@ -479,6 +488,67 @@ def detect_describe(ctx: Ctx):
                  desc)),
             "focus": [b.index for b in boxes], "label": label,
             "n_boxes": len(boxes), "described_box": target.index}
+
+
+def count_class(ctx: Ctx):
+    """图中有多少辆卡车？—— 指定类别的计数。
+
+    COCO-QA 四类里的 Number、TallyQA 的 simple 一路都是这个形态。它逼模型
+    把同类实例逐个数清，而不是看到一个就答，这是定位类任务练不出来的能力。
+
+    三个决定：
+
+    【不占框】focus 返回空。答案是一个数，不是坐标 —— 占掉这一类的框会把
+    detect_class / detect_describe 挡在门外，而它们才是真正要输出坐标的。
+    代价是 used 挡不住重复，所以改用 claims 记一笔「这张图这个类别数过了」。
+
+    【报的数必须能兑现】该类有实例被质量过滤掉时，按过滤后的框数报数就是少报。
+    这时改用「清晰可见」的问法与答法（同 inventory_locate 的处理），问的和答的
+    就都成立；该类一个都没被过滤时才用不带限定的问法。两条路报的都是过滤后的
+    框数，与 detect_class 的答案框数、inventory_locate 的清单数天然对得上。
+
+    【要有答 0 的】只问图里有的类别，模型会学成「被问就一定有」，数出来的
+    永远 >= 1。答 0 那一路优先挑易混类别（图里有卡车，问有多少辆货车），
+    从三百多类里随便抽一个不相干的东西，模型不看图也能答对。
+    """
+    counted = {c.partition(":")[2] for c in ctx.claimed if c.startswith("count:")}
+    present = {b.label for b in ctx.boxes}
+    # 上下位词要排掉：图里有遮阳三轮车，问「有多少辆三轮车」答 0 是错的。
+    banned = present | ctx.hypernyms_of(present) | counted
+    hard_pool = [l for l in ctx.confusable_with(present) if l not in banned]
+    zero_pool = hard_pool or [l for l in ctx.all_labels if l not in banned]
+    pickable = sorted(present - counted)
+
+    # 抽中哪一路就走哪一路；那一路这张图上走不通就走另一路，两路都不通才放弃。
+    # 比例取到 0 或 1 时是明确的开关，不再互相兜底 —— 配了「一条 0 都不要」，
+    # 就不该因为图里的类别都数过了而冒出一条 0 来。
+    go_zero = ctx.rng.random() < ctx.count_zero_ratio
+    can_zero = bool(zero_pool) and ctx.count_zero_ratio > 0
+    can_pick = bool(pickable) and ctx.count_zero_ratio < 1
+    if (go_zero and can_zero) or not can_pick:
+        if not can_zero:
+            return None
+        label = ctx.rng.choice(sorted(zero_pool))
+        q = prompts.render_choice("count_ask", ctx.rng, mw=ctx.mw(label), label=label)
+        a = "0" if ctx.short_answer else prompts.render_choice(
+            "count_zero_answer", ctx.rng, label=label)
+        n, counting, hard = 0, "zero", bool(hard_pool)
+    else:
+        label = ctx.rng.choice(pickable)
+        n = len(_same_label(ctx, label))
+        exact = ctx.all_kept(label)
+        counting, hard = ("exact" if exact else "visible"), False
+        q = prompts.render_choice("count_ask" if exact else "count_ask_visible",
+                                  ctx.rng, mw=ctx.mw(label), label=label)
+        a = str(n) if ctx.short_answer else prompts.render_choice(
+            "count_answer" if exact else "count_answer_visible",
+            ctx.rng, n=n, mw=ctx.mw(label), label=label)
+
+    return {"conversations": _turns((_ask(ctx, q), a)),
+            "focus": [], "claims": [f"count:{label}"], "label": label,
+            "count": n, "counting": counting,
+            "polarity": "negative" if counting == "zero" else "positive",
+            "hard_negative": hard}
 
 
 def attribute_qa(ctx: Ctx):
@@ -665,6 +735,7 @@ TASKS: Dict[str, Callable[[Ctx], Optional[Dict[str, Any]]]] = {
     **{f"ground_{k}": _make_ground_task(k) for k in DESCRIBE_KINDS},
     "detect_class": detect_class,
     "detect_describe": detect_describe,
+    "count_class": count_class,
     "attribute_qa": attribute_qa,
     "spatial_relation": spatial_relation,
     "exist_negative": exist_negative,
