@@ -2220,3 +2220,79 @@ def test_count_claims_are_cross_checked_against_the_image():
                 '[{"bbox_2d": [1, 2, 3, 4], "label": "卡车"}]')],
         truth)
     assert clash["violations"], "答 0 与框出该类没被核对出来"
+
+
+def test_tasks_cap_stops_a_task_at_an_absolute_count():
+    """tasks 控配比、tasks_cap 控条数，补跑时两者都要。
+
+    count_class 不吃框、几乎每张图都成立，放开跑会淹掉整个数据集 —— 而靠
+    --limit 限图数会让整批样本集中在目录靠前的那一批来源上。
+    """
+    import random
+    from core.pipeline import _deficit_order
+
+    target = {"count_class": 0.5, "detect_class": 0.5}
+    rng = random.Random(0)
+
+    made = {"count_class": 10, "detect_class": 0}
+    got = _deficit_order(target, made, set(), rng, strict=False,
+                         caps={"count_class": 10})
+    assert got == ["detect_class"], got          # 到顶了，不再派槽位
+
+    made = {"count_class": 9, "detect_class": 0}
+    got = _deficit_order(target, made, set(), rng, strict=False,
+                         caps={"count_class": 10})
+    assert set(got) == {"count_class", "detect_class"}, got
+
+    # 没写 cap 的任务不受影响；caps 为空等于不限
+    made = {"count_class": 999, "detect_class": 999}
+    got = _deficit_order(target, made, set(), rng, strict=False, caps={})
+    assert set(got) == {"count_class", "detect_class"}, got
+
+
+def test_tasks_cap_survives_a_full_build():
+    """端到端跑一遍：配了上限就不许超，且报告里的数就是上限那个数。"""
+    import json
+    import subprocess
+    import sys
+    import tempfile
+
+    root = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "images").mkdir()
+        (tmp / "labels").mkdir()
+        # 30 张图，每张两个类别各两个框 —— count_class 每张能出两条
+        from PIL import Image
+        for i in range(30):
+            Image.new("RGB", (640, 480), (120, 120, 120)).save(tmp / "images" / f"i{i:03d}.jpg")
+            (tmp / "labels" / f"i{i:03d}.txt").write_text(
+                "0 0.3 0.3 0.2 0.2\n0 0.7 0.3 0.2 0.2\n"
+                "1 0.3 0.7 0.2 0.2\n1 0.7 0.7 0.2 0.2\n", encoding="utf-8")
+        (tmp / "classes.yaml").write_text(
+            "names:\n  0: 卡车\n  1: 人员\n", encoding="utf-8")
+        cfg = tmp / "cfg.yaml"
+        cfg.write_text(
+            f'paths:\n'
+            f'  images_dir: "{tmp / "images"}"\n'
+            f'  labels_dir: "{tmp / "labels"}"\n'
+            f'  classes_yaml: "{tmp / "classes.yaml"}"\n'
+            f'  output_dir: "{tmp / "out"}"\n'
+            f'vlm:\n  enabled: false\n'
+            f'tasks_ratio_mode: fill\n'
+            f'count_zero_ratio: 0.0\n'
+            f'tasks_cap:\n  count_class: 7\n'
+            f'tasks:\n' + "".join(
+                f"  {t}: {100 if t == 'count_class' else 0}\n"
+                for t in __import__("core.tasks", fromlist=["x"]).TASKS),
+            encoding="utf-8")
+
+        r = subprocess.run([sys.executable, str(root / "scripts" / "build.py"),
+                            "--config", str(cfg)],
+                           capture_output=True, text=True, cwd=str(root))
+        assert r.returncode == 0, r.stdout + r.stderr
+        rows = [json.loads(l) for name in ("train", "val", "test")
+                for l in (tmp / "out" / f"{name}.jsonl").read_text(
+                    encoding="utf-8").splitlines() if l.strip()]
+        assert len(rows) == 7, f"配了上限 7，实得 {len(rows)}"
+        assert {r_["metadata"]["task_type"] for r_ in rows} == {"count_class"}

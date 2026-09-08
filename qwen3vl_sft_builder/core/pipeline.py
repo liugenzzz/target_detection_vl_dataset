@@ -81,7 +81,7 @@ def _kinds_absent_here(vlm_info) -> set:
     return {f"ground_{k}" for k in DESCRIBE_KINDS if k not in present}
 
 
-def _deficit_order(target, made, failed_here, rng, strict=True):
+def _deficit_order(target, made, failed_here, rng, strict=True, caps=None):
     """按【产出缺口】排任务，欠得最多的在前；本图已证明出不了的排除掉。
 
     缺口 = 已产出 - 应产出 = made[t] - target[t] * (总产出 + 1)。越负欠得越多。
@@ -98,6 +98,12 @@ def _deficit_order(target, made, failed_here, rng, strict=True):
                   182 个带描述的目标只用了 50 个，每图产出掉到 0.74 条。
     按组卡两头都躲开：组内谁先出仍由个体缺口排序（多样性照顾到），但一个子类型
     不会因为自己那份用完了就被挡在门外，只要主线整体还欠着就能出。
+
+    【caps 是绝对条数上限】，和配比无关，达到就把这个任务从排序里摘掉。
+    补跑单个任务时必须有它：count_class 不吃框、几乎每张图都成立，放开跑 11 万张
+    图能出二十来万条，合并回主数据集会把主线配比从 70% 冲到 22%。要几千条就写
+    几千条 —— 靠 --limit 限图数不行，那只取目录里靠前的那一批，整批样本会集中在
+    同一个来源上，划分和覆盖面都跟着歪。
 
     【failed_here 是必须的】。缺口只在 made 变化时才变，任务失败时 made 不变 ——
     排序结果一模一样，下一个槽位又选中同一个任务，再失败，再选中。strict 模式
@@ -119,9 +125,11 @@ def _deficit_order(target, made, failed_here, rng, strict=True):
                   - sum(target[t] for t in ts) * (done_all + 1)) < 0
         for is_main, ts in groups.items() if ts}
 
+    caps = caps or {}
     order = sorted(target, key=lambda t: (gap(t), rng.random()))
     return [t for t in order
             if t not in failed_here
+            and made[t] < caps.get(t, float("inf"))
             and (not strict or group_open.get(t in MAIN_LINE, True))]
 
 
@@ -153,6 +161,9 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     short_ratio = float(cfg.get_path("short_answer_ratio", 0.14))
     max_pick = int(cfg.get_path("sampling.vlm_max_pick", 6))
     weights = cfg.get_path("tasks", {}) or {}
+    # 每个任务的绝对条数上限（config 的 tasks_cap）。没写或写 0 = 不限。
+    caps = {k: int(v) for k, v in (cfg.get_path("tasks_cap", {}) or {}).items()
+            if int(v) > 0}
     measure_words = _load_measure_words(cfg)
     bank_stats = phrase_bank.install(cfg)
     forbid_chat = tuple(cfg.get_path("phrase_banks.forbid_global", []) or [])
@@ -282,6 +293,11 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     vlm_cov: Counter = Counter()
     gen_bar = progress.make("生成样本", len(scenes), show_progress)
     for sc in scenes:
+        # 所有还在跑的任务都到上限了就收工，别再空转几万张图。
+        if caps and all(made[t] >= caps.get(t, float("inf")) for t in target):
+            logger.info("全部任务已达 tasks_cap 上限，提前结束（共处理 %d 张图）",
+                        gen_bar.done)
+            break
         ann, kept, gmap = sc["ann"], sc["kept"], sc["gmap"]
         b2d = bbox2d_for(ann)
         vlm_info = vlm.scene_info(ann.image_path, [ann.width, ann.height],
@@ -363,7 +379,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
             # 就轮到别人。这是个自校正的反馈，任何任务的可用率再低也不会被
             # 别人挤掉份额，也不会有任务超发。缺口相同时随机打散，避免固定顺序。
             deficit = _deficit_order(target, made, failed_here, rng,
-                                     strict=strict_ratio)
+                                     strict=strict_ratio, caps=caps)
             if not deficit:
                 break                    # 这张图上所有任务都试过了，别空转
 

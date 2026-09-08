@@ -52,18 +52,29 @@ vlm:
 # vlm:
 #   stream: false
 
-# 只跑一个任务看效果时才打开。调完必须注释回去，否则全量跑出来是单一任务。
+# 指定任务单独跑一次（补跑）时才打开。跑完必须注释回去，否则全量跑出来是单一任务。
 # （这里曾经默认就写着单任务配置，复制过去的人不知情，跑出来 100% 一个任务。）
 #
+# 【必须把不要的任务逐个写 0】。配置是深合并的，只写想要的那几个，
+# 其余会保留 default.yaml 里的权重，等于没关。
+#
+# 补跑要配一个不同的 output_dir，跑完用 scripts/merge_by_group.py 按来源分组
+# 合并回主数据集 —— 它不会重新划分，新样本按同源组归到已有的 train/val/test。
+#
+# tasks_ratio_mode: fill      # 补跑要的是量，配比在合并之后算
+# tasks_cap:                  # 绝对条数上限，防止某个任务把数据集淹掉
+#   count_class: 8000
 # tasks:
-#   ground_appearance: 100
+#   inventory_locate:   40
+#   detect_describe:    40
+#   count_class:        20
 #   ground_unique:       0
-#   inventory_locate:    0
 #   detect_class:        0
 #   region_identify:     0
 #   exist_negative:      0
 #   attribute_qa:        0
 #   spatial_relation:    0
+#   ground_appearance:   0
 #   ground_state:        0
 #   ground_part:         0
 #   ground_position:     0
