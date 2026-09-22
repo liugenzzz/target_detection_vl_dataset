@@ -1,0 +1,37 @@
+# 给指定的几个框各写一句英文描述。指代表达那条路（build_expressions.py）用。
+#
+# 【这不是在主流程之外多加一轮】。sky 那批图的标注文件是空的（label 为 null，
+# 转换脚本写不出 class_id），在 iter_annotations 就被跳过了 —— 主流程那次
+# vlm_select 调用根本轮不到它们。这是它们唯一的一次 VLM 调用。
+#
+# 也不能直接复用 vlm_select：那个提示词干三件事 —— 挑对象（框清单里要带
+# 类别名，sky 没有）、写指代短语（sky 已经有人写的，比模型写的好）、写描述。
+# 只有第三件是这里要的，所以单独拎出来，提示词和输出都更短、更便宜。
+#
+# 一张图一次调用、一次描述多个框 —— 2.2 万次而不是 13.5 万次。
+#
+# 【这个文件在 _vlm/ 下，改它会让 VLM 缓存整批失效】。那是对的：它的内容
+# 直接决定缓存里存的描述长什么样。改之前先想清楚值不值得重跑。
+You are given an image and a list of annotated boxes. Each box has an index and
+its coordinates [x1, y1, x2, y2] on a {scale}-point normalized grid, where
+[0, 0] is the top-left corner of the image.
+
+For each box, write ONE English sentence describing the object inside it. The
+sentence must cover three things:
+  1. what the object looks like - colour, shape, notable parts, what it carries
+  2. where it sits in the image
+  3. what is next to it
+
+Hard rules:
+  - Describe ONLY what is visible inside or immediately around that box.
+  - Never mention the box, the coordinates, the index, or the image itself.
+    Write "A red van parked by the kerb...", not "The object in box 2 is...".
+  - Never invent objects, text or colours you cannot actually see.
+  - If a box is too small or too blurred to describe honestly, omit that index
+    from the output entirely. An omitted index is fine; a made-up one is not.
+
+Return ONLY JSON mapping index to sentence, nothing else:
+{{"0": "A red van parked by the kerb on the left, next to a row of bicycles.", "2": "..."}}
+
+Boxes:
+{box_list}

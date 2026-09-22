@@ -2,6 +2,7 @@
 
     python -m pytest tests/ -q     或     python tests/test_pipeline.py
 """
+import collections
 import os
 import tempfile
 import re
@@ -2723,3 +2724,108 @@ def test_extract_missing_images_pulls_only_what_is_missing():
         # 补齐之后再跑：没有要补的
         r = run("--dry-run")
         assert "没有要补的" in r.stdout, r.stdout
+
+
+def test_expression_description_gate_and_fallback():
+    """补描述这一轮有两道必须钉住的行为。
+
+    把关：模型爱写「The object in box 2 is a man.」——那是在讲标注，不是在讲
+    图里的东西；拿去当描述，模型会学到「描述里要提到框」。太短的同理。
+
+    退路：模型漏答某个框、或整条解析失败时，那个框要退回单轮的
+    region_describe，而不是丢掉 —— 人写的短语本身就是可用的描述。
+    """
+    import importlib
+
+    m = importlib.import_module("scripts.build_expressions")
+
+    good = ("A man in a brown leather jacket stands on the left of the plaza, "
+            "next to a parked scooter.")
+    assert m._description_ok(good)
+    assert not m._description_ok("A man."), "太短的要拦下"
+    assert not m._description_ok("The object in box 2 is a man standing there quietly."), \
+        "提到框的要拦下"
+    assert not m._description_ok(
+        "A man standing at [120, 30, 200, 400] on the left side of the road."), \
+        "提到坐标的要拦下"
+
+    # 解析：带 ```json 围栏、前后有多余文字、键是字符串数字
+    raw = 'Sure, here you go:\n```json\n{"0": "%s", "3": "x"}\n```\nhope that helps' % good
+    got = m._parse_descriptions(raw)
+    assert got == {0: good, 3: "x"}, got
+    assert m._parse_descriptions("") == {}
+    assert m._parse_descriptions("no json here") == {}
+
+
+def test_expression_build_falls_back_when_descriptions_are_missing():
+    """端到端：拿不到描述的框退回单轮，拿得到的凑成三段式主线。"""
+    import json
+    import subprocess
+    import sys
+
+    from PIL import Image
+
+    root = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "images").mkdir()
+        (tmp / "cache").mkdir()
+        rows = []
+        for i in range(6):
+            n = f"sky_{i}"
+            Image.new("RGB", (1920, 1080)).save(tmp / "images" / f"{n}.png")
+            rows.append({"selection_id": n, "selected_image": f"/gen/images/{n}.png",
+                         "quality": {"width": 1920, "height": 1080},
+                         "annotations": [
+                             {"label": None, "bbox_xyxy": [300 + j * 200, 400,
+                                                           520 + j * 200, 900],
+                              "expressions": [f"A man standing at spot {j} of the "
+                                              f"plaza, next to a parked scooter."]}
+                             for j in range(3)]})
+        (tmp / "m.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        cfg = tmp / "cfg.yaml"
+        cfg.write_text(
+            f'paths:\n'
+            f'  images_dir: "{tmp / "images"}"\n'
+            f'  labels_dir: "{tmp / "images"}"\n'
+            f'  classes_yaml: "{tmp / "images"}"\n'
+            f'  selection_manifest: "{tmp / "m.jsonl"}"\n'
+            f'  output_dir: "{tmp / "out"}"\n'
+            f'vlm:\n  enabled: true\n  api_url: "http://127.0.0.1:1/x"\n'
+            f'  model: m\n  cache_dir: "{tmp / "cache"}"\n', encoding="utf-8")
+
+        # 预置缓存：只给 0 号框一句好描述，1 号给一句会被拦下的，2 号不给
+        sys.path.insert(0, str(root))
+        from config import load_config
+        from core.vlm_client import VlmClient, VlmResult
+        client = VlmClient(load_config(str(cfg)))
+        for i in range(6):
+            body = json.dumps({
+                "0": "A man in a brown jacket stands on the left, beside a scooter.",
+                "1": "The object in box 1 is a man standing quietly by himself.",
+            })
+            client._write_cache(
+                client._cache_path(tmp / "images" / f"sky_{i}.png", [0, 1, 2]),
+                VlmResult(f"```json\n{body}\n```", "vlm"))
+
+        r = subprocess.run(
+            [sys.executable, str(root / "scripts" / "build_expressions.py"),
+             "--config", str(cfg)], capture_output=True, text=True, cwd=str(root))
+        assert r.returncode == 0, r.stdout + r.stderr
+
+        rows_out = [json.loads(l) for name in ("train", "val", "test")
+                    for l in (tmp / "out_expr" / f"{name}.jsonl").read_text(
+                        encoding="utf-8").splitlines() if l.strip()]
+        kinds = collections.Counter(x["metadata"]["task_type"] for x in rows_out)
+        # 每图 3 个框：0 号 -> 三段式，1 号（被拦）和 2 号（没给）-> 单轮
+        assert kinds["refer_ground"] == 6, kinds
+        assert kinds["region_describe"] == 12, kinds
+        for x in rows_out:
+            meta = x["metadata"]
+            assert meta["expression_source"] == "human"
+            if meta["task_type"] == "refer_ground":
+                assert meta["n_turns"] == 2 and meta["is_main_line"]
+                assert meta["description_source"] == "vlm"
+            else:
+                assert meta["n_turns"] == 1 and not meta["is_main_line"]

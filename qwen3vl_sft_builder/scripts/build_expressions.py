@@ -27,8 +27,17 @@ exist_negative 挑易混类别。给这些框编一个假类别名，上面每�
 短语时，可以一条当指代、另一条当描述，凑成完整的三段式主线，仍然零成本。
 
 产出两个任务：
-    refer_ground     该框有 >= 2 条短语：短语A -> 框 -> 短语B（三段式，主线）
-    region_describe  只有 1 条短语：框 -> 短语（单轮）
+    refer_ground     短语 -> 框 -> 描述（三段式，主线）。描述那一轮由 VLM 补 ——
+                     实测每个框只有 1 条短语，凑不出「一条当指代、另一条当描述」，
+                     所以缺的那一截只能生成。指代仍是人写的，比主线现在用的
+                     VLM 生成指代质量高。
+    region_describe  拿不到描述时的退路：框 -> 短语（单轮，非主线）。
+                     模型漏答、解析失败、或 vlm.enabled=false 时走这条。
+
+【描述这一轮不是在主流程之外多加的】sky 那批图的标注文件是空的，在
+iter_annotations 就被跳过，主流程那次 vlm_select 调用根本轮不到它们 ——
+这是它们唯一的一次 VLM 调用。一张图一次、一次描述多个框，2.2 万次而不是
+13.5 万次，并且有独立缓存，中途断了重跑只补没跑完的。
 
 输出目录单独配，跑完用 scripts/merge_by_group.py 合并进主数据集。
 """
@@ -38,6 +47,7 @@ import argparse
 import collections
 import json
 import random
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -53,6 +63,7 @@ from core.pipeline import (                             # noqa: E402
     _focus_difficulty, _image_value, _split_by_source, _write_jsonl,
 )
 from core.sample import IMAGE_TOKEN, validate_sample    # noqa: E402
+from core.vlm_client import VlmClient                   # noqa: E402
 from core.yolo import Box, index_images                 # noqa: E402
 
 # 这条路产出的两个任务名。主线的定义是「指代 -> 坐标 -> 描述」三段齐全，
@@ -105,6 +116,50 @@ def _boxes(row: dict):
     return boxes, exprs
 
 
+_COORD = re.compile(r"\[\s*\d+\s*,")
+# 模型爱写「The object in box 2 is…」——那是在讲标注，不是在讲图里的东西，
+# 拿去当描述，模型会学到「描述里要提到框」。
+_META_DESC = ("box ", "boxes", "bounding", "index ", "the image shows",
+              "in this image", "coordinates")
+
+
+def _parse_descriptions(raw: str) -> Dict[int, str]:
+    """解析 {"0": "…", "2": "…"}。剥 ```json 围栏，容忍前后多余文字。"""
+    if not raw:
+        return {}
+    text = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not m:
+        return {}
+    try:
+        data = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return {}
+    out: Dict[int, str] = {}
+    for k, v in (data or {}).items():
+        try:
+            idx = int(str(k).strip())
+        except ValueError:
+            continue
+        if isinstance(v, str) and v.strip():
+            out[idx] = v.strip()
+    return out
+
+
+def _description_ok(text: str) -> bool:
+    """这句描述能不能用。
+
+    英文按【词数】卡而不是字数 —— 主流程那套 min_description_len 是按中文
+    汉字数定的，18 个字符在英文里连一个短句都不到，形同虚设。
+    """
+    low = text.lower()
+    if len(text.split()) < 8:
+        return False
+    if _COORD.search(text):
+        return False
+    return not any(w in low for w in _META_DESC)
+
+
 def _turns(*pairs):
     out = []
     for i, (q, a) in enumerate(pairs):
@@ -149,12 +204,17 @@ def main() -> int:
     print(f"问句语言：{lang}（指代短语与描述一律保留原文，不翻译）")
 
     index = index_images(images_dir)
+    describe_max = int(cfg.get_path("expressions.describe_max_boxes", 8))
+    vlm = VlmClient(cfg)
+
     samples: List[Dict[str, Any]] = []
     made = collections.Counter()
     skip = collections.Counter()
     n_img = n_box = 0
 
+    # ---- 阶段一：扫清单，挑出可用的图和框 ----
     rows = list(_rows(manifest))
+    scenes: List[Dict[str, Any]] = []
     bar = progress.make("扫描清单", len(rows), True)
     for row in rows:
         bar.step()
@@ -169,36 +229,78 @@ def main() -> int:
         if not boxes:
             skip["没有带短语的框"] += 1
             continue
-        n_img += 1
-        n_box += len(boxes)
-
         q = row.get("quality") or {}
-        img_w, img_h = int(q["width"]), int(q["height"])
+        img_w, img_h = int(q.get("width") or 0), int(q.get("height") or 0)
+        if img_w <= 0 or img_h <= 0:
+            skip["清单里没有图片尺寸"] += 1
+            continue
         gmap = {g.box_index: g for g in grader.grade_image(boxes, img_w, img_h)}
         usable = [b for b in boxes if gmap[b.index].grade != REJECT]
         if not usable:
             skip["框全被质量过滤"] += 1
             continue
+        n_img += 1
+        n_box += len(boxes)
+        scenes.append({"stem": stem, "image_path": image_path, "w": img_w, "h": img_h,
+                       "exprs": exprs, "gmap": gmap, "usable": usable})
+    bar.close()
 
+    # ---- 阶段二：并发预取描述 ----
+    # 【要描述哪几个框必须是确定的】—— 缓存键里带着框号，出样本时再 shuffle。
+    # 按框号排序取前 N，同一张图每次跑都问同一批，重跑才命中得了缓存。
+    described: Dict[str, Dict[int, str]] = {}
+    if vlm.enabled:
+        tasks = []
+        for sc in scenes:
+            idx = sorted(b.index for b in sc["usable"])[:describe_max]
+            sc["ask"] = idx
+            lines = []
+            for b in sc["usable"]:
+                if b.index in idx:
+                    bb = yolo_to_bbox2d(b.cx, b.cy, b.w, b.h, sc["w"], sc["h"], scale, origin)
+                    lines.append(f"  [{b.index}] {json.dumps(bb)}")
+            tasks.append((sc["image_path"], idx, "",
+                          prompts.render("describe_boxes", scale=scale,
+                                         box_list="\n".join(lines))))
+        vlm.prefetch(tasks, label="补描述")
+        bad = 0
+        for sc in scenes:
+            got = _parse_descriptions(vlm.raw_result(sc["image_path"], sc["ask"]) or "")
+            keep = {i: t for i, t in got.items() if _description_ok(t)}
+            bad += len(got) - len(keep)
+            if keep:
+                described[sc["stem"]] = keep
+        if bad:
+            print(f"[把关] 丢掉 {bad:,} 条不合格的描述（太短 / 提到了框或坐标）")
+    else:
+        print("vlm.enabled=false，不补描述 —— 全部退回单轮的 region_describe")
+
+    # ---- 阶段三：出样本 ----
+    for sc in scenes:
+        stem, image_path = sc["stem"], sc["image_path"]
+        img_w, img_h, exprs = sc["w"], sc["h"], sc["exprs"]
+        gmap, usable = sc["gmap"], list(sc["usable"])
+        descs = described.get(stem, {})
         rng.shuffle(usable)
         for b in usable[:cap]:
             es = exprs[b.index]
             bbox = yolo_to_bbox2d(b.cx, b.cy, b.w, b.h, img_w, img_h, scale, origin)
             body = json.dumps({"bbox_2d": bbox}, ensure_ascii=False)
             answer = f"```json\n{body}\n```" if fence else body
-            if len(es) >= 2:
-                # 一条当指代、另一条当描述 —— 三段式主线，零调用成本
-                refer, desc = es[0], es[1]
+            bbox_txt = json.dumps(bbox, ensure_ascii=False)
+            # 一个框上只有一条短语（实测 271,922 个框全是 1 条），所以它只能
+            # 填一个位置。拿它当【指代】，描述那一截由 VLM 补 —— 反过来拿它当
+            # 描述、让模型去编指代，等于把人写的那部分浪费在更容易生成的一端。
+            desc = descs.get(b.index)
+            if desc:
                 task = "refer_ground"
                 convs = _turns(
-                    (prompts.render_choice(p_ground, rng, expr=refer), answer),
-                    (prompts.render_choice(p_describe, rng,
-                                           bbox=json.dumps(bbox, ensure_ascii=False)), desc))
+                    (prompts.render_choice(p_ground, rng, expr=es[0]), answer),
+                    (prompts.render_choice(p_describe, rng, bbox=bbox_txt), desc))
             else:
                 task = "region_describe"
-                convs = _turns((prompts.render_choice(
-                    p_describe, rng,
-                    bbox=json.dumps(bbox, ensure_ascii=False)), es[0]))
+                convs = _turns(
+                    (prompts.render_choice(p_describe, rng, bbox=bbox_txt), es[0]))
 
             sample = {
                 "id": f"{stem}_{task}_{made[task]}",
@@ -217,6 +319,8 @@ def main() -> int:
                     **_focus_difficulty([b.index], gmap, grader),
                     "n_turns": len(convs) // 2,
                     "expression_source": "human",
+                    # 指代是人写的，描述那轮是不是模型补的，评估时要能分开看
+                    "description_source": "vlm" if task == "refer_ground" else "human",
                     "n_expressions": len(es),
                     # 评估和交付都要能按语言拆开看：这批是英文样本，
                     # 主流程那批是中文，混在一张表里算平均没有意义。
