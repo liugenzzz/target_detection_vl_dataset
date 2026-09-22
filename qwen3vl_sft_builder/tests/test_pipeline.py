@@ -2486,7 +2486,12 @@ def test_chat_template_kwargs_reach_every_request():
 
 def test_manifest_accepts_the_shapes_selection_pipelines_actually_emit():
     """各家选片流程吐出来的 jsonl 字段名不统一。与其要求对方改格式，
-    不如都认 —— 而且清单里写绝对路径、相对路径还是裸文件名都要能对上。"""
+    不如都认 —— 而且清单里写绝对路径、相对路径还是裸文件名都要能对上。
+
+    【selected_image 必须压过 id】。真实清单里 id 是【上游源数据集】的编号
+    （"P0002_patch_000040"），和落盘文件名（"aerial_98813e8…"）毫无关系，
+    却又长得像个主名 —— 取错了会静默匹配到 0 条。所以 id 干脆不认。
+    """
     from core.yolo import load_manifest
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -2496,14 +2501,56 @@ def test_manifest_accepts_the_shapes_selection_pipelines_actually_emit():
             '{"image_path": "rel/b.png"}\n'
             '{"file_name": "c.jpeg"}\n'
             '{"images": ["d.jpg"]}\n'
-            '{"id": "e"}\n'
+            # 真实形状：id 是源数据集编号，selected_image 才是落盘文件
+            '{"id": "P0002_patch_000040", "source": "Aerial-D",'
+            ' "selected_image": "/mnt/gen/images/aerial_98813e8.png",'
+            ' "label_path": "/mnt/gen/labels/aerial_98813e8.txt"}\n'
+            '{"id": "只有id没有图片名"}\n'
             "f.jpg\n"
             "\n"
             '{"没有认识的字段": "x"}\n'
             "不是JSON也不是{坏的\n",
             encoding="utf-8")
         got = load_manifest(p)
-        assert got == {"a", "b", "c", "d", "e", "f", "不是JSON也不是{坏的"}, got
+        assert set(got) == {"a", "b", "c", "d", "aerial_98813e8", "f",
+                            "不是JSON也不是{坏的"}, sorted(got)
+        assert "P0002_patch_000040" not in got
+        assert "只有id没有图片名" not in got, "id 不该被当成图片名"
+
+
+def test_manifest_blocks_the_tasks_upstream_says_are_unanswerable():
+    """上游明说这张图的标注不保证穷尽时，穷举类任务在这张图上答不对。
+
+    「图中有多少辆车」「框出所有的车」「有没有 X」全都依赖标注穷尽，而我们的
+    all_kept 只发现得了【被自己过滤掉】的框，发现不了标注员根本没画的。
+    这种错样本看不出错，只能靠上游明说。
+    """
+    from core.yolo import load_manifest
+
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "m.jsonl"
+        p.write_text(
+            '{"selected_image": "/x/a.png",'
+            ' "disallowed_tasks": ["exist_negative", "inventory_locate",'
+            ' "count_class", "detect_class_without_completeness_audit"],'
+            ' "permitted_tasks": ["region_identify"]}\n'
+            '{"selected_image": "/x/b.png"}\n',
+            encoding="utf-8")
+        m = load_manifest(p)
+
+        a = m["a"]
+        assert a.blocks("exist_negative") and a.blocks("count_class")
+        # 带限定词的条目按前缀命中 —— 上游说的是「没做完整性审计之前别出」
+        assert a.blocks("detect_class"), "detect_class_without_completeness_audit 没拦住"
+        # 没被点名的不能误伤
+        assert not a.blocks("ground_appearance")
+        assert not a.blocks("region_identify")
+        assert not a.blocks("detect_describe"), "别名前缀不该扩到别的任务"
+        assert a.permit == frozenset({"region_identify"})
+
+        # 没写禁令的那张图，什么都不挡
+        assert not any(m["b"].blocks(t) for t in
+                       ("exist_negative", "count_class", "detect_class"))
 
 
 def test_manifest_filters_the_scan_and_shouts_when_nothing_matches():
@@ -2561,3 +2608,58 @@ def test_manifest_filters_the_scan_and_shouts_when_nothing_matches():
         assert r.returncode != 0
         assert "没有一条" in (r.stdout + r.stderr)
         assert "别的批次_0001" in (r.stdout + r.stderr)
+
+
+def test_manifest_gate_survives_a_full_build():
+    """端到端：被 disallowed_tasks 点名的任务，在那张图上一条都不许出。"""
+    import json
+    import subprocess
+    import sys
+
+    from PIL import Image
+
+    root = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "images").mkdir()
+        (tmp / "labels").mkdir()
+        rows = []
+        for i in range(20):
+            Image.new("RGB", (640, 480), (120, 120, 120)).save(tmp / "images" / f"i{i:02d}.jpg")
+            (tmp / "labels" / f"i{i:02d}.txt").write_text(
+                "0 0.3 0.3 0.2 0.2\n0 0.7 0.3 0.2 0.2\n", encoding="utf-8")
+            row = {"selected_image": str(tmp / "images" / f"i{i:02d}.jpg")}
+            if i < 10:                       # 前一半禁掉计数
+                row["disallowed_tasks"] = ["count_class"]
+            rows.append(row)
+        (tmp / "m.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        (tmp / "classes.yaml").write_text("names:\n  0: 卡车\n", encoding="utf-8")
+
+        cfg = tmp / "cfg.yaml"
+        cfg.write_text(
+            f'paths:\n'
+            f'  images_dir: "{tmp / "images"}"\n'
+            f'  labels_dir: "{tmp / "labels"}"\n'
+            f'  classes_yaml: "{tmp / "classes.yaml"}"\n'
+            f'  selection_manifest: "{tmp / "m.jsonl"}"\n'
+            f'  output_dir: "{tmp / "out"}"\n'
+            f'vlm:\n  enabled: false\n'
+            f'tasks_ratio_mode: fill\n'
+            f'count_zero_ratio: 0.0\n'
+            f'tasks:\n' + "".join(
+                f"  {t}: {100 if t == 'count_class' else 0}\n"
+                for t in __import__("core.tasks", fromlist=["x"]).TASKS),
+            encoding="utf-8")
+
+        r = subprocess.run([sys.executable, str(root / "scripts" / "build.py"),
+                            "--config", str(cfg)],
+                           capture_output=True, text=True, cwd=str(root))
+        assert r.returncode == 0, r.stdout + r.stderr
+        rows_out = [json.loads(l) for name in ("train", "val", "test")
+                    for l in (tmp / "out" / f"{name}.jsonl").read_text(
+                        encoding="utf-8").splitlines() if l.strip()]
+        assert rows_out, "后一半没禁，应该出得了样本"
+        srcs = {r_["metadata"]["source_image"] for r_ in rows_out}
+        banned = {f"i{i:02d}.jpg" for i in range(10)}
+        assert not (srcs & banned), f"被禁的图上出了 count_class：{sorted(srcs & banned)}"

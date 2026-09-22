@@ -12,7 +12,7 @@ import json
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, List, Optional, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
@@ -135,45 +135,101 @@ def parse_label_file(label_path: Path, table) -> List[Box]:
 
 
 # 清单文件里存图片名的字段，按这个顺序找第一个能用的。
-# 各家选片流程吐出来的 jsonl 字段名不统一，与其要求对方改格式，不如都认。
-MANIFEST_KEYS = ("image", "image_path", "images", "file_name", "filename",
-                 "img", "img_path", "path", "stem", "id")
+# 各家选片流程吐出来的字段名不统一，与其要求对方改格式，不如都认。
+#
+# 【顺序有讲究】selected_image / label_path 排在最前：选片流程通常会把选中的
+# 图另存一份并重新命名，这两个字段指的是【落盘之后】的文件，而 image /
+# source 之类往往还指着原始数据集里的路径。
+#
+# 【不认 id】曾经把 id 放进兜底，结果取到的是上游源数据集的编号
+# （"P0002_patch_000040"），和落盘文件名（"aerial_98813e8..."）毫无关系，
+# 却又长得像个主名，于是静默匹配到 0 条。宁可不认，也不要认错。
+MANIFEST_KEYS = ("selected_image", "label_path", "image_path", "image",
+                 "images", "file_name", "filename", "img", "img_path",
+                 "path", "selection_id", "stem")
+
+# 清单里逐图声明的任务禁令 / 许可。
+MANIFEST_DISALLOW_KEYS = ("disallowed_tasks", "disallow_tasks", "deny_tasks")
+MANIFEST_PERMIT_KEYS = ("permitted_tasks", "permit_tasks", "allow_tasks")
 
 
-def load_manifest(path: Path | str) -> Set[str]:
-    """读选片清单，返回要保留的图片主名（不带目录、不带后缀）的集合。
+@dataclass(frozen=True)
+class ManifestEntry:
+    """清单里关于一张图的信息。
+
+    disallow / permit 存的是【原样】的条目，可能带后缀限定词，
+    例如 "detect_class_without_completeness_audit" —— 匹配见 blocks()。
+    """
+    stem: str
+    disallow: frozenset = frozenset()
+    permit: frozenset = frozenset()
+
+    def blocks(self, task: str) -> bool:
+        """这张图上该不该禁掉这个任务（只看 disallow 那一路）。
+
+        条目可能写成 "<任务名>_<限定词>"（真实见过
+        "detect_class_without_completeness_audit"），所以前缀也算命中 ——
+        上游在说「没做完整性审计之前别出 detect_class」，那就是别出。
+        """
+        return any(d == task or d.startswith(task + "_") for d in self.disallow)
+
+
+def _first_str(row: dict, keys) -> Optional[str]:
+    for key in keys:
+        v = row.get(key)
+        if isinstance(v, list):
+            v = v[0] if v else None
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _str_set(row: dict, keys) -> frozenset:
+    for key in keys:
+        v = row.get(key)
+        if isinstance(v, (list, tuple)):
+            return frozenset(str(x).strip() for x in v if str(x).strip())
+    return frozenset()
+
+
+def load_manifest(path: Path | str) -> Dict[str, ManifestEntry]:
+    """读选片清单，返回 {图片主名: ManifestEntry}。
 
     每行可以是一个 JSON 对象（从 MANIFEST_KEYS 里找图片名），也可以直接是
     一行文件名 —— 两种都认，省得为了格式再写一个转换脚本。
 
     【匹配用主名】清单里写绝对路径、相对路径还是裸文件名都行，一律取
     basename 去后缀。标注文件名和图片主名一致，所以这个键两边都对得上。
+
+    【逐图任务禁令】清单里的 disallowed_tasks 会被原样带出来。选片流程知道
+    一些我们看不出来的事，最典型的是「这张图的标注不保证穷尽」——
+    那时「图中有多少辆车」「框出所有的车」「有没有 X」全都答不对，因为标注
+    可能漏了目标。而我们这边的 all_kept 只发现得了【被自己过滤掉】的框，
+    发现不了标注员根本没画的。这种错样本看不出错，只能靠上游明说。
     """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"找不到选片清单：{path}")
-    out: Set[str] = set()
+    out: Dict[str, ManifestEntry] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
-        value = None
         if line.startswith("{"):
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            for key in MANIFEST_KEYS:
-                v = row.get(key)
-                if isinstance(v, list):
-                    v = v[0] if v else None
-                if isinstance(v, str) and v.strip():
-                    value = v.strip()
-                    break
+            value = _first_str(row, MANIFEST_KEYS)
+            if not value:
+                continue
+            stem = Path(value).stem
+            out[stem] = ManifestEntry(stem,
+                                      _str_set(row, MANIFEST_DISALLOW_KEYS),
+                                      _str_set(row, MANIFEST_PERMIT_KEYS))
         else:
-            value = line
-        if value:
-            out.add(Path(value).stem)
+            stem = Path(line).stem
+            out[stem] = ManifestEntry(stem)
     return out
 
 

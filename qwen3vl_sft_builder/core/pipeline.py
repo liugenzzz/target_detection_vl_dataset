@@ -212,9 +212,16 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     # ---- 阶段一：扫描 + 质量过滤 ----
     # 上游选过片就只跑选中的那批，不必把图单独拷一个目录出来。
     keep_stems = None
+    manifest: Dict[str, Any] = {}
+    # 清单里逐图的任务禁令怎么用：
+    #   disallow（默认）只认 disallowed_tasks —— 上游说这张图出不了的就不出
+    #   permit          额外把 permitted_tasks 当白名单，只出里面列的
+    #   off             完全不看，只拿清单筛图
+    gate_mode = str(cfg.get_path("manifest_task_gate", "disallow"))
     manifest_path = cfg.get_path("paths.selection_manifest") or None
     if manifest_path:
-        keep_stems = load_manifest(manifest_path)
+        manifest = load_manifest(manifest_path)
+        keep_stems = set(manifest)
         have = {p.stem for p in Path(labels_dir).glob("*.txt")}
         hit = len(keep_stems & have)
         logger.info("选片清单 %s：%d 条，与标注目录对上 %d 条",
@@ -231,7 +238,12 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         missing = len(keep_stems) - hit
         if missing:
             logger.warning("清单里有 %d 条在标注目录里找不到对应的 .txt，已跳过", missing)
+        n_gated = sum(1 for e in manifest.values() if e.disallow)
+        if n_gated and gate_mode != "off":
+            logger.info("清单里有 %d 张图声明了 disallowed_tasks，这些任务在那些图上不出",
+                        n_gated)
     n_images = n_boxes = 0
+    gated = Counter()          # 被清单禁令挡掉的次数，按任务统计
     scenes: List[Dict[str, Any]] = []
     for ann in iter_annotations(labels_dir, images_dir, table, sanity, keep_stems):
         n_images += 1
@@ -378,6 +390,19 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         # 同一张图上同一个任务的输入是同一份，失败一次就不必再试。
         # 这个集合每张图重置，所以概率性失败的任务在下一张图还有机会。
         failed_here: set = set()
+        # 【清单里的逐图任务禁令】。上游知道一些我们看不出来的事，最典型的是
+        # 「这张图的标注不保证穷尽」—— 那时「图中有多少辆车」「框出所有的车」
+        # 「有没有 X」全都答不对，因为标注可能漏了目标。而我们的 all_kept 只
+        # 发现得了被自己过滤掉的框，发现不了标注员根本没画的。这种错样本看不
+        # 出错，只能靠上游明说。直接塞进 failed_here，调度器自然就绕开了。
+        entry = manifest.get(ann.stem)
+        if entry is not None and gate_mode != "off":
+            blocked = {t for t in target if entry.blocks(t)}
+            if gate_mode == "permit" and entry.permit:
+                blocked |= {t for t in target if t not in entry.permit}
+            for t in blocked:
+                gated[t] += 1
+            failed_here |= blocked
         # 【预先排除这张图上不可能成立的 ground_* 】。每个目标在预取阶段只被
         # 指派一种描述子类型，而调度器按缺口选任务时看不到这张图上有哪些子类型。
         # 一张图平均只有 1.7 个带描述的目标，却有 7 个 ground_* 在抢 ——
@@ -506,6 +531,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         # 差很多说明简单档本身就不够，配额算式被 min() 截断了。
         "hard_quota": quota_stats,
         "samples_total": sum(made.values()),
+        "manifest_gated": {k: gated[k] for k in TASKS if gated[k]},
         "by_task_type": {k: made[k] for k in TASKS if made[k]},
         "task_ratio_actual": {k: round(made[k] / total, 4) for k in TASKS if made[k]},
         "main_line_ratio": round(sum(made[k] for k in MAIN_LINE) / total, 4),
