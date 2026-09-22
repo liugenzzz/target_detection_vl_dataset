@@ -37,7 +37,7 @@ def _real_box_list(cfg, img: Path):
 
     找不到标注时退回假标注 —— 那样只能验 JSON 格式，验不了模型挑不挑得中。
     """
-    from core.classes import load_class_table
+    from core.classes import table_from_config
     from core.coords import yolo_to_bbox2d
     from core.yolo import iter_annotations
 
@@ -45,7 +45,7 @@ def _real_box_list(cfg, img: Path):
     label_file = labels_dir / f"{img.stem}.txt"
     if labels_dir.is_dir() and label_file.is_file():
         try:
-            table = load_class_table(cfg.require("paths.classes_yaml"))
+            table = table_from_config(cfg)
             scale = int(cfg.get_path("coords.scale", 1000))
             origin = int(cfg.get_path("coords.origin", 0))
             for ann in iter_annotations(labels_dir, img.parent, table,

@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import load_config                      # noqa: E402
 from core.cli import _cli  # noqa: E402
-from core.classes import load_class_table           # noqa: E402
+from core.classes import table_from_config          # noqa: E402
 from core.difficulty import Grader, hard_kept_under_quota   # noqa: E402
 from core.yolo import iter_annotations              # noqa: E402
 
@@ -76,7 +76,7 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    table = load_class_table(cfg.require("paths.classes_yaml"))
+    table = table_from_config(cfg)
     grader = Grader(cfg)
 
     box_counts, shorts, areas, sizes = [], [], [], []

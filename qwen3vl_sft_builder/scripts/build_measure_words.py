@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import prompts                                   # noqa: E402
 from config import load_config                   # noqa: E402
-from core.classes import load_class_table        # noqa: E402
+from core.classes import table_from_config       # noqa: E402
 from core.vlm_client import VlmClient            # noqa: E402
 
 BATCH = 60          # 一次问 60 个，太多模型会漏答
@@ -36,7 +36,7 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    table = load_class_table(cfg.require("paths.classes_yaml"))
+    table = table_from_config(cfg)
     client = VlmClient(cfg)
     if not client.enabled:
         raise SystemExit("vlm.enabled 为 false，无法生成量词表")

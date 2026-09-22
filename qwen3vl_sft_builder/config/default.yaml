@@ -8,6 +8,14 @@ paths:
   images_dir: ""                      # 图片目录
   classes_yaml: ""                    # 类别表 yaml（347 类那份）
   output_dir: "./output"
+  # 【别名表】class_id -> 规范名的映射 + 要丢弃的 class_id，留空表示不用。
+  # 多个数据集合起来的类别表必用：同一种东西常有 2~4 个编号
+  # （Apple / Apples / apple / apples），而所有任务按【名称字符串】分组 ——
+  # 不合并的话「图中有多少个 apple」只数其中一份，「框出所有 Apple」只给
+  # 一份的框，等于教模型漏检。另外 air / sky / bedroom / people 这类没有
+  # 可指代边界的类别也在这里丢掉。
+  # 生成：python scripts/build_class_aliases.py（跑一次，之后手改那个文件即可）
+  class_aliases: ""
 
 # ---------------------------------------------------------------------------
 # 自建 Qwen 服务：用于生成第三轮的描述语句和同类目标的视觉指代

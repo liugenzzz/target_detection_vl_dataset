@@ -92,7 +92,14 @@ class VlmResult:
 #   describe/  七个描述子类型，被拼进 vlm_select 的 kind_assignments 段
 # 其余目录（ground_unique/ detect_class/ attribute_qa/ _shared/ …）全是
 # 【组装期】的问法池和答法池，只在拼样本时用，一个字都不会发给模型。
-MODEL_FACING_PROMPT_DIRS = ("_vlm", "_tools", "describe")
+# 进缓存键的只有【影响那次 scene_info 调用】的提示词：_vlm/vlm_select.txt，
+# 以及被它当成 kind_assignments 嵌进去的 describe/*.txt。
+#
+# _tools/ 不在内，虽然它也是发给模型的。那几个（量词表、质检、扩充问法、
+# 类别译名）都是一次性脚本，各有各的产物文件，跟 scene_info 的结果无关 ——
+# 把它们算进指纹，等于「新加一个一次性工具」就把十几万张图的缓存作废。
+# 这事已经踩过一次：加一个问法池作废了 11 万张图的缓存，白跑十小时。
+MODEL_FACING_PROMPT_DIRS = ("_vlm", "describe")
 
 
 def _prompt_fingerprint() -> str:

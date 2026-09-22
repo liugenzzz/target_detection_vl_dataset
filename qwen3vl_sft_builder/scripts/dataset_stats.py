@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import load_config                   # noqa: E402
 from core.cli import _cli                        # noqa: E402
 from core import describe_kinds, review, stats   # noqa: E402
-from core.classes import load_class_table        # noqa: E402
+from core.classes import table_from_config       # noqa: E402
 import prompts                                  # noqa: E402
 from core.yolo import iter_annotations           # noqa: E402
 
@@ -48,7 +48,7 @@ def main() -> int:
     if not src.exists():
         raise SystemExit(f"找不到 {src}，先跑 python scripts/build.py")
 
-    table = load_class_table(cfg.require("paths.classes_yaml"))
+    table = table_from_config(cfg)
     samples = review.load_jsonl(src)
 
     # 每张图标注里真实出现过的类别 —— CHAIR 的真值

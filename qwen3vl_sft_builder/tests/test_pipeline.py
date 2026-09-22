@@ -1235,6 +1235,16 @@ def test_question_pools_do_not_invalidate_the_vlm_cache():
     finally:
         pool.unlink()
 
+    # 新增一个一次性工具的提示词（_tools/）：也不该动指纹。
+    # 量词表、质检、类别译名这些各有各的产物文件，跟 scene_info 的结果无关 ——
+    # 把它们算进指纹，等于「加一个一次性工具」就作废十几万张图的缓存。
+    tool = prompts.PROMPT_DIR / "_tools" / "_tmp_tool_for_test.txt"
+    tool.write_text("随便什么一次性工具的提示词 {names}\n", encoding="utf-8")
+    try:
+        assert m._prompt_fingerprint() == before, "一次性工具的提示词不该让缓存失效"
+    finally:
+        tool.unlink()
+
     # 改 vlm_select（真正发给模型的那个）：指纹必须变
     target = prompts.PROMPT_DIR / "_vlm" / "vlm_select.txt"
     original = target.read_bytes()
@@ -2296,3 +2306,90 @@ def test_tasks_cap_survives_a_full_build():
                     encoding="utf-8").splitlines() if l.strip()]
         assert len(rows) == 7, f"配了上限 7，实得 {len(rows)}"
         assert {r_["metadata"]["task_type"] for r_ in rows} == {"count_class"}
+
+
+def _alias_fixture(tmp: Path):
+    """一份带「同物多编号 + 非目标类」的类别表，外加对应的别名表。"""
+    (tmp / "classes.yaml").write_text(
+        "names:\n"
+        "  0: Apple\n  1: Apples\n  2: apple\n  3: apples\n"
+        "  4: Pineapple\n  5: air\n  6: 卡车\n",
+        encoding="utf-8")
+    (tmp / "aliases.yaml").write_text(
+        "canonical:\n"
+        '  0: "苹果"\n  1: "苹果"\n  2: "苹果"\n  3: "苹果"\n'
+        '  4: "菠萝"\n  6: "卡车"\n'
+        "drop:\n  - 5\n",
+        encoding="utf-8")
+    return tmp / "classes.yaml", tmp / "aliases.yaml"
+
+
+def test_alias_table_merges_the_same_object_under_one_name():
+    """Apple / Apples / apple / apples 是同一种东西，却是四个编号。
+
+    所有任务按【名称字符串】分组 —— 不合并的话「图中有多少个 apple」只数
+    其中一份、「框出所有 Apple」只给一份的框，等于教模型漏检。
+    """
+    from core.classes import load_class_table
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cls, ali = _alias_fixture(Path(tmp))
+        t = load_class_table(cls, ali)
+        assert [t.get_name(c) for c in (0, 1, 2, 3)] == ["苹果"] * 4
+        assert t.get_name(4) == "菠萝"          # 别被 apple ⊂ pineapple 连坐
+        assert t.merged == 3, t.merged          # 四个编号归一个名 = 冗余 3 个
+
+
+def test_alias_table_drops_classes_that_have_no_boundary():
+    """air / sky / people 这类没有可指代的边界。drop 之后查不到名字，
+    parse_label_file 直接跳过那些框 —— 不需要改标注文件。"""
+    from core.classes import load_class_table
+    from core.yolo import parse_label_file
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cls, ali = _alias_fixture(tmp)
+        t = load_class_table(cls, ali)
+        assert t.get_name(5) is None and t.dropped == 1
+
+        lbl = tmp / "x.txt"
+        lbl.write_text("0 0.5 0.5 0.2 0.2\n5 0.3 0.3 0.2 0.2\n6 0.7 0.7 0.2 0.2\n",
+                       encoding="utf-8")
+        boxes = parse_label_file(lbl, t)
+        assert [b.label for b in boxes] == ["苹果", "卡车"], [b.label for b in boxes]
+
+
+def test_alias_table_refuses_a_self_contradicting_entry():
+    """同一个编号既给了规范名又在 drop 里 —— 静默取其一会让人查半天。"""
+    from core.classes import load_aliases
+
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "a.yaml"
+        p.write_text('canonical:\n  7: "苹果"\ndrop:\n  - 7\n', encoding="utf-8")
+        try:
+            load_aliases(p)
+        except ValueError as exc:
+            assert "自相矛盾" in str(exc)
+        else:
+            raise AssertionError("既 canonical 又 drop，应该报错")
+
+
+def test_every_entry_point_loads_the_class_table_the_same_way():
+    """所有脚本必须走 table_from_config。
+
+    加了别名表之后，只要有一处还在直接 load_class_table(paths.classes_yaml)，
+    analyze 看到的类别表就和 build 用的不是同一份 —— 阈值照着 analyze 调、
+    构建按另一套类别跑，而两边都不报错。
+    """
+    import re as _re
+
+    root = Path(__file__).resolve().parents[1]
+    offenders = []
+    for f in list((root / "scripts").glob("*.py")) + list((root / "core").glob("*.py")):
+        if f.name == "classes.py":
+            continue
+        src = f.read_text(encoding="utf-8")
+        if _re.search(r"load_class_table\s*\(", src):
+            offenders.append(f.name)
+    # build_class_aliases 是唯一的例外：它要的就是没套别名表的原始表
+    assert offenders == ["build_class_aliases.py"], offenders

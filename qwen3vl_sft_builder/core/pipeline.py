@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import prompts
 
 from .sample import validate_sample
-from .classes import load_class_table
+from .classes import table_from_config
 from .coords import yolo_to_bbox2d
 from .difficulty import (HARD, REJECT, Grader, balance_hard_quota, grade_at_most,
                           grade_rank)
@@ -146,7 +146,7 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     output_dir = Path(cfg.get_path("paths.output_dir", "./output"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    table = load_class_table(cfg.require("paths.classes_yaml"))
+    table = table_from_config(cfg)
     grader = Grader(cfg)
     # 互相打架的阈值会让某个开关静默失效，跑完全量才发现就太晚了。
     for conflict in grader.config_conflicts():

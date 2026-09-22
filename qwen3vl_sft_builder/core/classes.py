@@ -9,13 +9,26 @@
 这些类别靠视觉难以可靠区分。构建时不阻塞（标注文件已经指定了 class_id，
 直接查表取名即可），但会在样本 metadata 里打标记，训练后若这几类混淆严重，
 可以据此快速定位到是哪批样本。
+
+【别名表】（config 的 paths.class_aliases，见 scripts/build_class_aliases.py）
+多个数据集合起来的类别表会有三种毛病，一张 class_id -> 规范名的映射全能治：
+
+  同物多编号  Apple(7) / Apples(8) / apple(624) / apples(626) 是同一种东西，
+              但所有任务按【名称字符串】分组，不合并的话「图中有多少个 apple」
+              只数其中一份，「框出所有 Apple」只给一份的框 —— 教模型漏检。
+              四个 id 映射到同一个规范名即可，标注文件一个字都不用改。
+  非目标类别  air / sky / bedroom / people 这类东西没有可指代的边界，
+              进了 drop 名单就查不到名字，框在 parse_label_file 里直接跳过。
+  中英混排    英文原名映射成中文规范名，问句和描述的语言就统一了；
+              顺带把上下位判据救回来 —— 子串判据在中文复合词上成立
+              （人员 ⊂ 军事人员），在英文上是灾难（ear ⊂ bear/beard/earring）。
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import yaml
 
@@ -23,12 +36,16 @@ logger = logging.getLogger(__name__)
 
 
 class ClassTable:
-    def __init__(self, id2name: Dict[int, str]):
+    def __init__(self, id2name: Dict[int, str], dropped: int = 0, merged: int = 0):
         self.id2name = id2name
+        self.dropped = dropped          # 别名表丢弃了多少个 class_id
+        self.merged = merged            # 别名表合并掉多少个冗余 class_id
         self.name2id: Dict[str, int] = {}
         for cid, name in id2name.items():
             key = self._norm(name)
-            if key in self.name2id:
+            # 别名表把多个编号映射到同一个规范名是【刻意的】（Apple/Apples/apple
+            # 本来就是一种东西），那种重名不报警；没上别名表时的重名才是问题。
+            if key in self.name2id and not merged:
                 logger.warning("类别表存在重名：'%s'（编号 %s 和 %s）", name, self.name2id[key], cid)
             self.name2id[key] = cid
         self._confusable, self._hypernym = _detect_confusable(id2name)
@@ -114,7 +131,34 @@ def _one_char_apart(a: str, b: str) -> bool:
     return sum(1 for x, y in zip(a, b) if x != y) == 1
 
 
-def load_class_table(path: str | Path) -> ClassTable:
+def load_aliases(path: str | Path) -> Tuple[Dict[int, str], Set[int]]:
+    """读别名表，返回 ({class_id: 规范名}, {要丢弃的 class_id})。
+
+    格式见 scripts/build_class_aliases.py 生成的 config/class_aliases.yaml：
+
+        canonical:
+          7: 苹果          # Apple
+          624: 苹果        # apple
+        drop:
+          - 601            # air
+
+    两段都可以手改 —— 生成的是初稿，译歪的直接在文件里改，不用重新生成。
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"找不到别名表：{path}")
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    canonical = {int(k): str(v).strip()
+                 for k, v in (data.get("canonical") or {}).items() if str(v).strip()}
+    drop = {int(x) for x in (data.get("drop") or [])}
+    both = sorted(set(canonical) & drop)
+    if both:
+        raise ValueError(f"别名表里这些编号既给了规范名又在 drop 里，自相矛盾：{both[:10]}")
+    return canonical, drop
+
+
+def load_class_table(path: str | Path,
+                     aliases_path: str | Path | None = None) -> ClassTable:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"找不到类别表文件：{path}")
@@ -135,7 +179,36 @@ def load_class_table(path: str | Path) -> ClassTable:
     if declared is not None and int(declared) != len(id2name):
         logger.warning("yaml 里 nc=%s，实际解析出 %s 个类别", declared, len(id2name))
 
-    table = ClassTable(id2name)
+    raw_total = len(id2name)
+    dropped = merged = 0
+    if aliases_path:
+        canonical, drop = load_aliases(aliases_path)
+        unknown = sorted((set(canonical) | drop) - set(id2name))
+        if unknown:
+            logger.warning("别名表里有 %d 个编号不在类别表中（前几个：%s），已忽略",
+                           len(unknown), unknown[:10])
+        id2name = {cid: canonical.get(cid, name)
+                   for cid, name in id2name.items() if cid not in drop}
+        dropped = raw_total - len(id2name)
+        merged = len(id2name) - len({ClassTable._norm(n) for n in id2name.values()})
+
+    table = ClassTable(id2name, dropped=dropped, merged=merged)
+    if aliases_path:
+        logger.info("已套用别名表 %s：丢弃 %d 个编号、合并掉 %d 个冗余编号，"
+                    "%d 个编号归到 %d 个规范类别",
+                    aliases_path, dropped, merged, table.count,
+                    len(set(table.name2id)))
     logger.info("已加载类别表 %s，共 %d 个类别，其中 %d 个属于易混组",
                 path, table.count, sum(1 for c in id2name if table.is_confusable(c)))
     return table
+
+
+def table_from_config(cfg) -> ClassTable:
+    """按配置加载类别表（含别名表）。**所有调用点都要走这里。**
+
+    曾经每个脚本各自 load_class_table(cfg.require("paths.classes_yaml"))，
+    加了别名表之后只要有一处忘了传，analyze 看到的类别表就和 build 用的不是
+    同一份 —— 阈值是照着 analyze 调的，构建却按另一套类别跑，而两边都不报错。
+    """
+    return load_class_table(cfg.require("paths.classes_yaml"),
+                            cfg.get_path("paths.class_aliases") or None)
