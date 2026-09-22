@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import load_config                      # noqa: E402
 from core.cli import _cli  # noqa: E402
+from core import progress                            # noqa: E402
 from core.classes import table_from_config          # noqa: E402
 from core.difficulty import Grader, hard_kept_under_quota   # noqa: E402
 from core.yolo import iter_annotations, load_manifest              # noqa: E402
@@ -135,9 +136,17 @@ def main() -> int:
     # reject 归因。不分解的话，看到 reject 37% 也不知道该动尺寸阈值还是密集度阈值。
     why_reject = Counter()
 
-    for ann in iter_annotations(cfg.require("paths.labels_dir"),
+    labels_dir = Path(cfg.require("paths.labels_dir"))
+    # 【要有进度条】十万张图在网络挂载上扫要十几分钟，中间一声不吭 ——
+    # 和卡死长得一模一样。而且 stdout 走管道时是块缓冲的，报告正文要等进程
+    # 结束才刷出来，只看得到 stderr 的告警，更像挂了。进度条走 stderr。
+    n_labels = sum(1 for _ in labels_dir.glob("*.txt"))
+    bar = progress.make("扫描标注", n_labels, sys.stderr.isatty())
+
+    for ann in iter_annotations(labels_dir,
                                 cfg.require("paths.images_dir"), table,
                                 int(cfg.get_path("quality.sanity_max_boxes", 1000))):
+        bar.step()
         box_counts.append(len(ann.boxes))
         sizes.append((ann.width, ann.height))
         for b in ann.boxes:
@@ -153,8 +162,17 @@ def main() -> int:
                 why_reject["尺寸和密集度都不过" if by_size and by_dense
                            else "只因尺寸" if by_size else "只因密集度"] += 1
 
+    bar.close()
     if not box_counts:
         raise SystemExit("没有解析出任何标注，检查 paths 配置和类别表")
+    skipped = n_labels - len(box_counts)
+    if skipped > 0:
+        # 最常见的原因是图片没落盘（选片流程漏了某个源），
+        # 其次是框全被 sanity_max_boxes 挡掉。不报出来就成了静默丢数据。
+        print(f"\n[注意] {n_labels:,} 个标注文件里有 {skipped:,} 个没进统计"
+              f"（{skipped / n_labels * 100:.1f}%），多半是对应的图片不在 "
+              f"images_dir 里。跑 scripts/extract_missing_images.py 看能不能补。",
+              file=sys.stderr)
 
     shorts.sort(); areas.sort(); box_counts.sort(); same_counts.sort()
     n_img, n_box = len(box_counts), len(areas)
