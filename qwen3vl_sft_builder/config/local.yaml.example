@@ -23,6 +23,12 @@ vlm:
   api_url: "http://192.168.78.36:3012/v1/chat/completions"
   model: "Qwen3.8-27B"
   api_key: ""                         # 建议留空，用环境变量 VLM_API_KEY 注入
+  # 多路池子各路密钥不同时，用 api_key_env 写环境变量【名】，每路各指一个：
+  #   endpoints:
+  #     - {name: "自建", api_url: "...", model: "...", api_key_env: "LOCAL_KEY"}
+  #     - {name: "公有", api_url: "...", model: "...", api_key_env: "PUBLIC_KEY"}
+  # Qwen3 要关思考链（不关的话返回带 <think>…</think>，会把 JSON 解析冲掉）：
+  #   chat_template_kwargs: {enable_thinking: false}
   concurrency: 4                      # 先 4 跑通，再按服务承载往上加
 
   # 多个服务时改用池子。写了 endpoints 就以它为准，上面的 api_url/model 不再生效。

@@ -24,6 +24,15 @@ vlm:
   enabled: true                       # false = 全部回落到模板生成，不调服务
   api_url: "http://192.168.78.36:3012/v1/chat/completions"
   api_key: ""                         # 建议用环境变量 VLM_API_KEY 注入
+  # 或者写环境变量【名】，每一路各指一个（多路池子的密钥常常不是同一把）：
+  #   api_key_env: "SELECTION_LOCAL_API_KEY"
+  # 优先级：本路 api_key > 本路 api_key_env > 外层这两项。
+  api_key_env: ""
+  # 原样透传进每一次请求体的额外字段。Qwen3 系列要靠它关掉思考链：
+  #   chat_template_kwargs: {enable_thinking: false}
+  # 不关的话返回里带一段 <think>…</think>，而输出是按 JSON 解析的 ——
+  # 思考链会把解析冲掉，整批静默回落模板，而且不报错。
+  chat_template_kwargs: {}
   model: "Qwen3.6-27B"
   timeout: 300
   temperature: 0.35
