@@ -12,3 +12,10 @@ output/
 # 样本预览是刻意进版本控制的：拉下来就能看各任务长什么样，
 # 不用先跑一遍构建。由 scripts/export_samples.py 生成。
 !samples/preview.jsonl
+
+# 放在项目目录里的数据集（input_full/ 这类：images/ labels/ classes.yaml）。
+# manifest.jsonl 已被上面的 *.jsonl 挡住，但几万个 .txt 标注和图片不会 ——
+# 不挡的话 git status 会被几万个未跟踪文件淹掉，而 git add -A 会把整个
+# 数据集提交进去。
+input_*/
+data_*/
