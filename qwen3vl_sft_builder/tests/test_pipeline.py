@@ -2663,3 +2663,63 @@ def test_manifest_gate_survives_a_full_build():
         srcs = {r_["metadata"]["source_image"] for r_ in rows_out}
         banned = {f"i{i:02d}.jpg" for i in range(10)}
         assert not (srcs & banned), f"被禁的图上出了 count_class：{sorted(srcs & banned)}"
+
+
+def test_extract_missing_images_pulls_only_what_is_missing():
+    """选片流程把标注落盘了、图片没落盘时，从原始归档里补齐。
+
+    实测踩到：110,150 个标注对 105,299 张图，差的 4,851 张全是同一个源，
+    归档还在只是没解出来。清单里带 image_locator，所以能精确补。
+    """
+    import json
+    import subprocess
+    import sys
+    import tarfile
+
+    from PIL import Image
+
+    root = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "images").mkdir()
+        (tmp / "src" / "inner").mkdir(parents=True)
+        for i in range(8):
+            Image.new("RGB", (32, 32)).save(tmp / "src" / "inner" / f"raw_{i}.png")
+        with tarfile.open(tmp / "a.tar.gz", "w:gz") as tf:
+            tf.add(tmp / "src" / "inner", arcname="inner")
+
+        rows = [{"selected_image": f"/gen/images/fitrs_{i}.png",
+                 "image_locator": {"archive": str(tmp / "a.tar.gz"),
+                                   "member": f"inner/raw_{i}.png"}} for i in range(5)]
+        (tmp / "m.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        # 前两张已经在了，不该被重复解出来覆盖
+        for i in (0, 1):
+            Image.new("RGB", (99, 99)).save(tmp / "images" / f"fitrs_{i}.png")
+
+        cfg = tmp / "cfg.yaml"
+        cfg.write_text(f'paths:\n  images_dir: "{tmp / "images"}"\n'
+                       f'  selection_manifest: "{tmp / "m.jsonl"}"\n', encoding="utf-8")
+
+        def run(*extra):
+            return subprocess.run(
+                [sys.executable, str(root / "scripts" / "extract_missing_images.py"),
+                 "--config", str(cfg), *extra],
+                capture_output=True, text=True, cwd=str(root))
+
+        r = run("--dry-run")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "可补 3 / 3" in r.stdout, r.stdout
+        assert sorted(p.name for p in (tmp / "images").iterdir()) == \
+            ["fitrs_0.png", "fitrs_1.png"], "--dry-run 不该写文件"
+
+        r = run()
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "已补 3 / 3" in r.stdout, r.stdout
+        assert len(list((tmp / "images").iterdir())) == 5
+        # 已存在的那两张没被覆盖（原图 99x99，归档里的是 32x32）
+        assert Image.open(tmp / "images" / "fitrs_0.png").size == (99, 99)
+
+        # 补齐之后再跑：没有要补的
+        r = run("--dry-run")
+        assert "没有要补的" in r.stdout, r.stdout
