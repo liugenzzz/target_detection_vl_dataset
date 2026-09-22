@@ -21,7 +21,7 @@ from config import load_config                      # noqa: E402
 from core.cli import _cli  # noqa: E402
 from core.classes import table_from_config          # noqa: E402
 from core.difficulty import Grader, hard_kept_under_quota   # noqa: E402
-from core.yolo import iter_annotations              # noqa: E402
+from core.yolo import iter_annotations, load_manifest              # noqa: E402
 
 SHORT_SIDE_CANDIDATES = (8, 12, 16, 24)
 AREA_MIN_CANDIDATES = (0.0005, 0.001, 0.002, 0.005)
@@ -67,6 +67,53 @@ def _wrap(text: str, width: int = 62):
     if cur:
         lines.append(cur)
     return lines
+
+
+
+
+def _manifest_report(cfg, n_scanned: int) -> None:
+    """选片清单的覆盖情况。
+
+    清单里逐图的 disallowed_tasks 直接决定 count_class / detect_class /
+    exist_negative / inventory_locate 这几个能出多少 —— 被禁到八成的话，
+    给它们配再大的权重也是空的，配比会全部流给别的任务。这个数必须在
+    跑十万张之前就看到，而不是跑完看报告才发现。
+    """
+    path = cfg.get_path("paths.selection_manifest") or None
+    if not path:
+        return
+    mode = str(cfg.get_path("manifest_task_gate", "disallow"))
+    m = load_manifest(path)
+    if not m:
+        print(f"\n【选片清单】{path}：一条都没解析出来")
+        return
+
+    weights = {k: v for k, v in (cfg.get_path("tasks", {}) or {}).items() if v}
+    blocked = Counter()
+    for entry in m.values():
+        for task in weights:
+            if entry.blocks(task):
+                blocked[task] += 1
+    n_permit = sum(1 for e in m.values() if e.permit)
+
+    print(f"\n【选片清单】{len(m):,} 条   任务闸 manifest_task_gate={mode}")
+    if mode == "off":
+        print("  闸关着，清单只用来筛图")
+    elif not blocked:
+        print("  没有任何一张图声明 disallowed_tasks")
+    else:
+        print("  被逐图禁掉的任务（占清单的比例）：")
+        for task, n in blocked.most_common():
+            bar = "#" * int(n / len(m) * 30)
+            print(f"    {task:20} {n:>7,}  {n / len(m) * 100:5.1f}%  {bar}")
+        worst = blocked.most_common(1)[0]
+        if worst[1] / len(m) > 0.8:
+            print(f"  [注意] {worst[0]} 在 {worst[1] / len(m) * 100:.0f}% 的图上被禁，"
+                  f"给它配权重基本是空的 —— 缺口会流给同组别的任务")
+    if n_permit:
+        note = ("已生效，只出 permitted_tasks 里列的" if mode == "permit"
+                else "【未生效】，要当白名单用得设 manifest_task_gate: permit")
+        print(f"  另有 {n_permit:,} 条写了 permitted_tasks —— {note}")
 
 
 def main() -> int:
@@ -117,6 +164,8 @@ def main() -> int:
     print(f"图片 {n_img}    标注框 {n_box}    每图均 {n_box / n_img:.2f} 个    类别 {table.count}")
     print(f"分辨率 {len(uniq_sizes)} 种，最小 {min(uniq_sizes)}，最大 {max(uniq_sizes)}")
     print("=" * 70)
+
+    _manifest_report(cfg, n_img)
 
     print("\n【每图框数】（参考信息，不作为过滤规则 —— 密集度由难度分级逐目标判断）")
     print(f"  中位 {statistics.median(box_counts):.0f}  p75 {pct(box_counts,75):.0f}  "
