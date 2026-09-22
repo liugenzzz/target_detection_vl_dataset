@@ -141,7 +141,11 @@ def main() -> int:
     # 和卡死长得一模一样。而且 stdout 走管道时是块缓冲的，报告正文要等进程
     # 结束才刷出来，只看得到 stderr 的告警，更像挂了。进度条走 stderr。
     n_labels = sum(1 for _ in labels_dir.glob("*.txt"))
-    bar = progress.make("扫描标注", n_labels, sys.stderr.isatty())
+    # 【不要拿 isatty 决定开不开】。`analyze.py 2> log` 时 stderr 是文件、
+    # isatty 为假，进度条就整个没了 —— 而那恰恰是最需要它的场景。
+    # Progress 自己分 TTY / 非 TTY 两种画法：非 TTY 时按百分比打行，
+    # 重定向进文件里照样看得下去。
+    bar = progress.make("扫描标注", n_labels, True)
 
     for ann in iter_annotations(labels_dir,
                                 cfg.require("paths.images_dir"), table,

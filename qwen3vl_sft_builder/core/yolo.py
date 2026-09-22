@@ -99,11 +99,28 @@ def read_image_size(path: Path) -> Tuple[int, int]:
 
 # ---------------------------------------------------------------- 标注解析
 def find_image(label_path: Path, images_dir: Path) -> Optional[Path]:
+    """单个查找。批量遍历请用 index_images —— 见那里的说明。"""
     for ext in IMAGE_EXTS:
         p = images_dir / f"{label_path.stem}{ext}"
         if p.exists():
             return p
     return None
+
+
+def index_images(images_dir: Path) -> Dict[str, Path]:
+    """{主名: 图片路径}，只列一次目录。
+
+    【为什么不逐个 exists()】原来每个标注都要按 5 个后缀逐个 stat，11 万个
+    标注就是最多 55 万次 stat。网络挂载上一次几毫秒，合计十几分钟，而且
+    全程不吭声，和卡死长得一模一样。列一次目录只是一次操作。
+
+    对完全找不到图的那批更亏：fitrs 那 4,851 个标注每个都要白试满 5 次。
+    """
+    out: Dict[str, Path] = {}
+    for p in images_dir.iterdir():
+        if p.suffix.lower() in IMAGE_EXTS:
+            out.setdefault(p.stem, p)
+    return out
 
 
 def parse_label_file(label_path: Path, table) -> List[Box]:
@@ -241,10 +258,11 @@ def iter_annotations(labels_dir: Path, images_dir: Path, table,
     keep_stems 非空时只处理主名在其中的那些 —— 上游选过片，这里就只跑选中的
     那批，不必把图单独拷一个目录出来。
     """
+    index = index_images(Path(images_dir))
     for label_path in sorted(Path(labels_dir).glob("*.txt")):
         if keep_stems is not None and label_path.stem not in keep_stems:
             continue
-        image_path = find_image(label_path, Path(images_dir))
+        image_path = index.get(label_path.stem)
         if image_path is None:
             continue
         boxes = parse_label_file(label_path, table)
