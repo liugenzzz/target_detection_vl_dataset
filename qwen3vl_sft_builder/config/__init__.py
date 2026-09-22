@@ -98,10 +98,26 @@ class Config(dict):
         return value
 
 
-def load_config(extra_path: str | Path | None = None) -> Config:
-    """加载配置。extra_path 若给出，优先级最高（低于环境变量）。"""
+# 设成 1 时不加载 config/local.yaml。端到端测试要用：那些测试会起一个
+# build.py 子进程去跑临时目录里的数据，而 local.yaml 是【这台机器】的真实
+# 配置 —— 里面的 selection_manifest、quality 阈值、tasks 权重会一路渗进测试，
+# 结果是「在我机器上过、在你机器上挂」，而且挂的原因和被测的东西毫无关系。
+# 实测踩到：local.yaml 配了选片清单之后，端到端测试的 30 张临时图被清单
+# 全筛掉，报的错是「清单一条都没对上」。
+IGNORE_LOCAL_ENV = "SFT_BUILDER_IGNORE_LOCAL"
+
+
+def load_config(extra_path: str | Path | None = None,
+                use_local: bool | None = None) -> Config:
+    """加载配置。extra_path 若给出，优先级最高（低于环境变量）。
+
+    use_local=False（或环境变量 SFT_BUILDER_IGNORE_LOCAL=1）时跳过
+    config/local.yaml，只用 default.yaml + extra_path。
+    """
+    if use_local is None:
+        use_local = os.getenv(IGNORE_LOCAL_ENV, "") not in ("1", "true", "True")
     cfg = _load_yaml(DEFAULT_PATH)
-    if LOCAL_PATH.exists():
+    if use_local and LOCAL_PATH.exists():
         cfg = _deep_merge(cfg, _load_yaml(LOCAL_PATH))
     if extra_path:
         p = Path(extra_path)

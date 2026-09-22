@@ -2,10 +2,20 @@
 
     python -m pytest tests/ -q     或     python tests/test_pipeline.py
 """
+import os
 import tempfile
 import re
 import sys
 from pathlib import Path
+
+# 【测试一律不读 config/local.yaml】。端到端那几项会起 build.py 子进程去跑
+# 临时目录里的数据，而 local.yaml 是【这台机器】的真实配置 —— 里面的
+# selection_manifest、quality 阈值、tasks 权重会一路渗进测试，结果是
+# 「在我机器上过、在你机器上挂」，而且挂的原因和被测的东西毫无关系。
+# 实测踩到：local.yaml 配上选片清单之后，端到端测试那 30 张临时图被清单
+# 全筛掉，报的错是「清单一条都没对上」。
+# 在模块级设环境变量，子进程自动继承，不必在每个 subprocess.run 上加 env=。
+os.environ["SFT_BUILDER_IGNORE_LOCAL"] = "1"
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
