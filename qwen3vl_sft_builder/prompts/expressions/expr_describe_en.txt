@@ -1,0 +1,13 @@
+# 英文版的 expr_describe。答案是数据集里人写的指代短语，它天然带外观 +
+# 方位 + 周边关系，正好是主线末轮要的那种描述。
+#
+# 禁用词不能含 box —— {bbox} 占位符本身就含 box，会把每一条都判掉。
+# 也不能用多词短语，`#! forbid:` 是按空格切词的。详见 expr_ground_en 的说明。
+#! require-any: Describe describe description
+#! forbid: bounding coordinates locate detect many every
+#! max-len: 90
+Describe the object at {bbox}.
+Describe the object inside the region {bbox}.
+Describe what is at {bbox} and how it relates to its surroundings.
+Give a description of the object at {bbox}, including its appearance.
+Describe the object at {bbox}, its appearance and where it is.

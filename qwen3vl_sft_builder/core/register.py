@@ -21,7 +21,10 @@ import re
 from typing import List, Sequence, Tuple
 
 # 句末必须有标点。模型的元话语（「以下是几种写法：」）常常没有。
-_TERMINATED = re.compile(r"[。？！?!]$")
+# 英文半角句点也算：指代表达那条路（build_expressions.py）产出的是整句英文
+# 指令（"Locate the object that matches ..."），句末自然是 "."。这道闸拦的是
+# 「根本没有句末标点」，不是「标点不是中文的」。
+_TERMINATED = re.compile(r"[。？！?!.]$")
 # 模型在讲「我要写几种说法」，而不是在写那句说法本身
 META_WORDS: Tuple[str, ...] = ("以下", "如下", "例如", "比如", "示例", "写法",
                                "说法", "第一句", "这条", "这句", "上面", "下面", "注意")

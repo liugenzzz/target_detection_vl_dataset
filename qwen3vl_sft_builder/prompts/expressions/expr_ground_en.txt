@@ -1,0 +1,19 @@
+# 英文版的 expr_ground。指代短语本身就是英文（人写的），整条链路走英文可以
+# 保留它一个字不动 —— 机翻指代短语的风险是译歪一个方位词，这句话就不再唯一
+# 指向那个框，样本直接变毒。短语仍用引号括起来，模型要分得清哪部分是指令。
+#
+# 【英文的禁用词有两个坑，都踩过】
+#   1. 子串匹配：写 describe 会撞 "described as"，写 box 会撞 "bounding box"，
+#      而 expr_describe_en 里 {bbox} 占位符本身就含 box。
+#   2. 按空格切词：`#! forbid:` 后面是按空格 split 的，存不了多词短语 ——
+#      写 "is there" 会变成 is 和 there 两个词，然后 the/is 撞上每一句。
+# 所以只能挑【不会出现在正常指令里的单词】。语义主要靠 require-any 保住。
+#! require-any: bounding coordinates Locate Detect locate detect
+#! forbid: color many every appearance surroundings
+#! max-len: 90
+Locate the object described as "{expr}" and output its bounding box.
+Output the bounding box of the object that matches "{expr}".
+Find the object matching "{expr}" and give its coordinates.
+Detect the object described as "{expr}" and return its bounding box.
+Give the bounding box for the object described as "{expr}".
+Locate "{expr}" in the image and output the bounding box.

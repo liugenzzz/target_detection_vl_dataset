@@ -137,6 +137,16 @@ def main() -> int:
     rng = random.Random(int(cfg.get_path("sampling.seed", 20260826)))
     forbid = tuple(cfg.get_path("phrase_banks.forbid_global", []) or [])
     style = str(cfg.get_path("output.image_path_style", "filename"))
+    # 问句用哪种语言。指代短语本身是英文，整条链路走英文样本内部语言一致，
+    # 而且短语一个字不用动 —— 机翻指代短语的风险是译歪一个方位词，这句话
+    # 就不再唯一指向那个框，样本直接变毒。zh 则是中文问句 + 英文内容。
+    lang = str(cfg.get_path("expressions.language", "en")).lower()
+    if lang not in ("en", "zh"):
+        print(f"[失败] expressions.language 只能是 en 或 zh，实为 {lang!r}")
+        return 1
+    p_ground = "expr_ground_en" if lang == "en" else "expr_ground"
+    p_describe = "expr_describe_en" if lang == "en" else "expr_describe"
+    print(f"问句语言：{lang}（指代短语与描述一律保留原文，不翻译）")
 
     index = index_images(images_dir)
     samples: List[Dict[str, Any]] = []
@@ -181,13 +191,13 @@ def main() -> int:
                 refer, desc = es[0], es[1]
                 task = "refer_ground"
                 convs = _turns(
-                    (prompts.render_choice("expr_ground", rng, expr=refer), answer),
-                    (prompts.render_choice("expr_describe", rng,
+                    (prompts.render_choice(p_ground, rng, expr=refer), answer),
+                    (prompts.render_choice(p_describe, rng,
                                            bbox=json.dumps(bbox, ensure_ascii=False)), desc))
             else:
                 task = "region_describe"
                 convs = _turns((prompts.render_choice(
-                    "expr_describe", rng,
+                    p_describe, rng,
                     bbox=json.dumps(bbox, ensure_ascii=False)), es[0]))
 
             sample = {
@@ -208,6 +218,9 @@ def main() -> int:
                     "n_turns": len(convs) // 2,
                     "expression_source": "human",
                     "n_expressions": len(es),
+                    # 评估和交付都要能按语言拆开看：这批是英文样本，
+                    # 主流程那批是中文，混在一张表里算平均没有意义。
+                    "language": lang,
                 },
             }
             issues = validate_sample(sample, forbid)
