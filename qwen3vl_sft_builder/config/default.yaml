@@ -222,28 +222,36 @@ tasks:
   # 描述的多样性要来自「答案里装的是什么」，不是问句换说法 —— 每种的答案
   # 信息结构完全不同（只说本体 / 只说方位 / 只说邻接关系……），各自的提示词
   # 在 prompts/describe/<子类型>.txt，可以单独改。不想要哪种就把权重设 0。
-  ground_appearance:   7    # 只说物体本身：颜色、形状、部件、载物
-  ground_state:        4    # 只说状态动作：停着 / 行驶 / 装载 / 门开着
-  ground_part:         4    # 聚焦一个部位展开
-  ground_position:     3    # 只说方位
-  ground_relation:     4    # 只说和周围什么挨着
-  ground_contrast:     2    # 和图中同类比有什么不同
-  ground_full:         6    # 综合三段式（原来唯一的一种，现在占七种的 20%）
-  inventory_locate:   25    # 盘点 -> 定位 -> 描述（主线，count 已并入第一轮）
-  ground_unique:      15    # 定位图中的卡车（主线，该类原始标注里仅一个实例）
-  detect_class:        8    # 定位图中所有的人员（需该类全部框合格）
-  # 穷举定位 -> 坐标回指 -> 描述。默认 0：它和 detect_class 抢同一批
-  # (图, 类别)，混跑时先出的那个会占掉该类别。用【单独跑一次再合并】的方式
-  # 产出（tasks 只留它 = 100），合并时用它顶掉 detect_class 的重复条目。
-  detect_describe:     0
-  # 指定类别的计数（「图中有多少辆卡车」）。默认 0：它不吃框、和谁都不冲突，
-  # 但加进主混跑会把 70/30 的配比冲掉 —— 和另外两个补跑任务一起【单独跑一次
-  # 再合并】即可（tasks 只留这三个），合并用 scripts/merge_by_group.py。
-  count_class:         0
-  region_identify:     7    # [框] 这个区域内的是什么（REG）
-  exist_negative:      7    # 图中有没有直升机 / 拒答
-  attribute_qa:        5    # [框] 这个区域内物体的颜色是什么
-  spatial_relation:    3    # 卡车在人员的哪一侧（纯坐标，零成本）
+  #
+  # 【权重合计 100，主线 70 / 其余 30】。组配额按这两组卡，组内谁先出由个体
+  # 缺口排序决定 —— 所以某个任务在这批数据上出不来时，它那份会流给同组的
+  # 其他任务，两组的 70/30 不会因此走样。
+  ground_appearance:  12    # 只说物体本身：颜色、形状、部件、载物
+  ground_full:         9    # 综合三段式
+  ground_relation:     8    # 只说和周围什么挨着
+  ground_state:        8    # 只说状态动作：停着 / 行驶 / 装载 / 门开着
+  ground_part:         7    # 聚焦一个部位展开
+  ground_position:     7    # 只说方位
+  ground_contrast:     5    # 和图中同类比有什么不同
+  detect_describe:     8    # 穷举定位 -> 坐标回指 -> 描述（主线）
+  # 下面两个【和标注粒度强相关】，跑 --limit 800 试跑时要专门看它们出了几条：
+  #   物体级标注（一张图里同类目标不多）—— 都能出，可以往上调
+  #   部件级标注（机翼/机轮/炮管，同类天然重复）—— 实测 ground_unique 997 次
+  #   0 成功、inventory_locate 可用率 1.4%，那种数据把它们设 0，别白占尝试
+  inventory_locate:    3    # 盘点 -> 指代 -> 定位 -> 描述（主线，三轮）
+  ground_unique:       3    # 定位图中的卡车（主线，该类原始标注里仅一个实例）
+  detect_class:        6    # 定位图中所有的人员（需该类全部框合格）
+  # detect_describe 和 detect_class 抢同一批 (图, 类别)，但【可以混跑】：
+  # 谁先出就把那个类别的框占掉，另一个自动换别的类别，天然不会重复。
+  # 只有「在已有数据上补跑」时才需要单独跑一次再用 merge_by_group.py 合并，
+  # 那时靠 SUPERSEDES 顶掉 detect_class 的重复条目。
+  count_class:         6    # 图中有多少辆卡车（不吃框，和谁都不冲突）
+  attribute_qa:        6    # [框] 这个区域内物体的颜色是什么
+  exist_negative:      6    # 图中有没有直升机 / 拒答 —— 【不可省】，没有它
+                            # 模型会学成「被问就一定有」，推理时凭空编框
+  region_identify:     4    # [框] 这个区域内的是什么（REG）
+  spatial_relation:    2    # 卡车在人员的哪一侧（纯坐标，零成本；同类密集的
+                            # 数据上可用率很低，见上面那条关于标注粒度的说明）
 # image_caption 已移除：描述性内容在主线第二轮已经有了，整图描述靠拼接
 # 各目标描述，读起来断裂重复，不如不要。
 
