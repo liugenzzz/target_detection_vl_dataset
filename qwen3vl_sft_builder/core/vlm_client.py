@@ -55,12 +55,34 @@ class Endpoint:
         return self.fatal is None
 
 
+def _resolve_key(e: dict, v: dict) -> str:
+    """取这一路的密钥。优先级：本路 api_key > 本路 api_key_env > 外层同名两项。
+
+    api_key_env 写的是【环境变量名】而不是密钥本身。多路池子里各路的密钥往往
+    不同（自建的一把、公有服务另一把），而全局那个 VLM_API_KEY 只能表达一把 ——
+    写死在 yaml 里又会把密钥带进版本库。这里让每一路各指一个环境变量名。
+    """
+    for src in (e, v):
+        if src.get("api_key"):
+            return str(src["api_key"])
+        name = src.get("api_key_env")
+        if name:
+            val = os.getenv(str(name), "")
+            if val:
+                return val
+            logger.warning("端点 %s 指定了 api_key_env=%s，但该环境变量是空的",
+                           e.get("name") or e.get("api_url", "?"), name)
+            return ""
+    return ""
+
+
 def _endpoints_from(v: dict) -> List[Endpoint]:
     """解析模型池配置。写了 vlm.endpoints 就用池子，没写就把平铺的
     api_url/model 当成只有一路的池子 —— 老配置不用改。"""
     raw = v.get("endpoints") or []
     if not raw:
         raw = [{"api_url": v.get("api_url", ""), "api_key": v.get("api_key", ""),
+                "api_key_env": v.get("api_key_env", ""),
                 "model": v.get("model", ""), "concurrency": v.get("concurrency", 4)}]
     out = []
     for i, e in enumerate(raw):
@@ -69,8 +91,7 @@ def _endpoints_from(v: dict) -> List[Endpoint]:
         out.append(Endpoint(
             name=str(e.get("name") or f"{e.get('model') or '?'}@{e.get('api_url', '')[:40]}"),
             api_url=str(e.get("api_url") or v.get("api_url", "")),
-            api_key=str(e.get("api_key") if e.get("api_key") is not None
-                        else v.get("api_key", "")),
+            api_key=_resolve_key(e, v),
             model=str(e.get("model") or v.get("model", "")),
             concurrency=max(1, int(e.get("concurrency", v.get("concurrency", 4)))),
         ))
@@ -146,6 +167,11 @@ class VlmClient:
         self.temperature = float(v.get("temperature", 0.35))
         self.max_tokens = int(v.get("max_tokens", 1024))
         self.max_retries = int(v.get("max_retries", 3))
+        # 原样透传进请求体的额外字段。Qwen3 系列要靠
+        # chat_template_kwargs: {enable_thinking: false} 关掉思考链 ——
+        # 不关的话返回里带一段 <think>…</think>，而我们按 JSON 解析输出，
+        # 思考链会把解析冲掉，整批回落模板且不报错。
+        self.chat_template_kwargs = dict(v.get("chat_template_kwargs") or {})
         # 模型池。总并发是各路之和 —— 每一路自己的 concurrency 是它扛得住的量，
         # 加起来才是这台机器能同时压出去的请求数。
         self.endpoints = _endpoints_from(v)
@@ -441,6 +467,11 @@ class VlmClient:
         except ImportError:
             logger.error("未安装 requests，无法调用 VLM 服务")
             return None
+
+        # 在这里加而不是在拼 payload 的地方加：纯文本那几路（量词表、质检、
+        # 类别译名）各自拼自己的 payload，只有 _post 是所有请求的必经之地。
+        if self.chat_template_kwargs and "chat_template_kwargs" not in payload:
+            payload = dict(payload, chat_template_kwargs=self.chat_template_kwargs)
 
         for attempt in range(1, self.max_retries + 1):
             ep = self._pick()

@@ -2393,3 +2393,82 @@ def test_every_entry_point_loads_the_class_table_the_same_way():
             offenders.append(f.name)
     # build_class_aliases 是唯一的例外：它要的就是没套别名表的原始表
     assert offenders == ["build_class_aliases.py"], offenders
+
+
+def test_endpoint_key_can_come_from_a_named_env_var():
+    """多路池子里各路的密钥往往不是同一把（自建一把、公有服务另一把）。
+
+    全局那个 VLM_API_KEY 只能表达一把；写死在 yaml 里又会把密钥带进版本库。
+    api_key_env 写的是【环境变量名】，每一路各指一个。
+    """
+    import os
+
+    from core.vlm_client import _endpoints_from
+
+    os.environ["_TEST_KEY_A"] = "aaa"
+    os.environ["_TEST_KEY_B"] = "bbb"
+    try:
+        eps = _endpoints_from({"endpoints": [
+            {"name": "a", "api_url": "http://a", "model": "m", "api_key_env": "_TEST_KEY_A"},
+            {"name": "b", "api_url": "http://b", "model": "m", "api_key_env": "_TEST_KEY_B"},
+            {"name": "c", "api_url": "http://c", "model": "m", "api_key": "字面值"},
+        ]})
+        assert [e.api_key for e in eps] == ["aaa", "bbb", "字面值"]
+
+        # 外层兜底：单路配置也认
+        assert _endpoints_from({"api_url": "http://x", "model": "m",
+                                "api_key_env": "_TEST_KEY_A"})[0].api_key == "aaa"
+        # 环境变量不存在时给空串而不是把变量名当密钥发出去
+        assert _endpoints_from({"endpoints": [
+            {"api_url": "http://a", "model": "m", "api_key_env": "_NOPE_NOT_SET"}]})[0].api_key == ""
+    finally:
+        os.environ.pop("_TEST_KEY_A", None)
+        os.environ.pop("_TEST_KEY_B", None)
+
+
+def test_chat_template_kwargs_reach_every_request():
+    """Qwen3 要靠 chat_template_kwargs: {enable_thinking: false} 关思考链。
+
+    不关的话返回里带一段 <think>…</think>，而我们按 JSON 解析输出 —— 思考链
+    会把解析冲掉，整批静默回落模板。纯文本那几路（量词表、质检、类别译名）
+    各自拼自己的 payload，所以透传必须加在 _post 这个必经之地。
+    """
+    from core.vlm_client import VlmClient
+
+    class _Cfg(dict):
+        def get_path(self, dotted, default=None):
+            cur = self
+            for part in dotted.split("."):
+                if not isinstance(cur, dict) or part not in cur:
+                    return default
+                cur = cur[part]
+            return cur
+
+    client = VlmClient(_Cfg({"vlm": {
+        "enabled": True, "api_url": "http://x", "model": "m",
+        "chat_template_kwargs": {"enable_thinking": False}}}))
+    assert client.chat_template_kwargs == {"enable_thinking": False}
+
+    sent = {}
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class _Requests:
+        @staticmethod
+        def post(url, json=None, headers=None, timeout=None, **kw):
+            sent.update(json or {})
+            return _Resp()
+
+    import sys
+    sys.modules["requests"] = _Requests
+    try:
+        # 纯文本调用：payload 是调用方自己拼的，里面没有 chat_template_kwargs
+        client._post({"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    finally:
+        del sys.modules["requests"]
+    assert sent.get("chat_template_kwargs") == {"enable_thinking": False}, sent
