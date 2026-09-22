@@ -151,6 +151,8 @@ phrase_banks:
     - count_answer
     - count_answer_visible
     - count_zero_answer
+    - expr_ground
+    - expr_describe
 
 # ---------------------------------------------------------------------------
 # 全量质检。构建阶段的过滤全是结构性的（占位符、类别泄漏、描述长度、坐标越界），
