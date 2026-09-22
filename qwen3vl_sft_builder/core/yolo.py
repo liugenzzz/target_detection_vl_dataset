@@ -8,10 +8,11 @@
 
 from __future__ import annotations
 
+import json
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from typing import Iterator, List, Optional, Set, Tuple
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
@@ -133,10 +134,60 @@ def parse_label_file(label_path: Path, table) -> List[Box]:
     return boxes
 
 
+# 清单文件里存图片名的字段，按这个顺序找第一个能用的。
+# 各家选片流程吐出来的 jsonl 字段名不统一，与其要求对方改格式，不如都认。
+MANIFEST_KEYS = ("image", "image_path", "images", "file_name", "filename",
+                 "img", "img_path", "path", "stem", "id")
+
+
+def load_manifest(path: Path | str) -> Set[str]:
+    """读选片清单，返回要保留的图片主名（不带目录、不带后缀）的集合。
+
+    每行可以是一个 JSON 对象（从 MANIFEST_KEYS 里找图片名），也可以直接是
+    一行文件名 —— 两种都认，省得为了格式再写一个转换脚本。
+
+    【匹配用主名】清单里写绝对路径、相对路径还是裸文件名都行，一律取
+    basename 去后缀。标注文件名和图片主名一致，所以这个键两边都对得上。
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"找不到选片清单：{path}")
+    out: Set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        value = None
+        if line.startswith("{"):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            for key in MANIFEST_KEYS:
+                v = row.get(key)
+                if isinstance(v, list):
+                    v = v[0] if v else None
+                if isinstance(v, str) and v.strip():
+                    value = v.strip()
+                    break
+        else:
+            value = line
+        if value:
+            out.add(Path(value).stem)
+    return out
+
+
 def iter_annotations(labels_dir: Path, images_dir: Path, table,
-                     sanity_max_boxes: int = 1000) -> Iterator[Annotation]:
-    """遍历标注目录，逐条 yield Annotation。找不到图片或无有效框的跳过。"""
+                     sanity_max_boxes: int = 1000,
+                     keep_stems: Optional[Set[str]] = None) -> Iterator[Annotation]:
+    """遍历标注目录，逐条 yield Annotation。找不到图片或无有效框的跳过。
+
+    keep_stems 非空时只处理主名在其中的那些 —— 上游选过片，这里就只跑选中的
+    那批，不必把图单独拷一个目录出来。
+    """
     for label_path in sorted(Path(labels_dir).glob("*.txt")):
+        if keep_stems is not None and label_path.stem not in keep_stems:
+            continue
         image_path = find_image(label_path, Path(images_dir))
         if image_path is None:
             continue

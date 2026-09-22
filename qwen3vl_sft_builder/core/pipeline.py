@@ -39,7 +39,7 @@ def _load_measure_words(cfg) -> Dict[str, str]:
     return {str(k): str(v) for k, v in (data.get("measure_words") or {}).items()}
 from . import colorcheck, consistency, describe_kinds, phrase_bank, progress
 from .vlm_client import VlmClient
-from .yolo import iter_annotations
+from .yolo import iter_annotations, load_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -210,9 +210,30 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
     strict_ratio = str(cfg.get_path("tasks_ratio_mode", "strict")) == "strict"
 
     # ---- 阶段一：扫描 + 质量过滤 ----
-    scenes: List[Dict[str, Any]] = []
+    # 上游选过片就只跑选中的那批，不必把图单独拷一个目录出来。
+    keep_stems = None
+    manifest_path = cfg.get_path("paths.selection_manifest") or None
+    if manifest_path:
+        keep_stems = load_manifest(manifest_path)
+        have = {p.stem for p in Path(labels_dir).glob("*.txt")}
+        hit = len(keep_stems & have)
+        logger.info("选片清单 %s：%d 条，与标注目录对上 %d 条",
+                    manifest_path, len(keep_stems), hit)
+        if not hit:
+            # 清单里的字段名或路径形式对不上时，这里一条都匹配不到，
+            # 而「跑完发现只有 0 条」要等几个小时才看得见。
+            raise RuntimeError(
+                f"选片清单 {manifest_path} 里的 {len(keep_stems)} 条，"
+                f"没有一条和 {labels_dir} 里的标注文件对上。\n"
+                f"清单主名示例：{sorted(keep_stems)[:3]}\n"
+                f"标注主名示例：{sorted(have)[:3]}\n"
+                f"（匹配用的是去掉目录和后缀之后的主名）")
+        missing = len(keep_stems) - hit
+        if missing:
+            logger.warning("清单里有 %d 条在标注目录里找不到对应的 .txt，已跳过", missing)
     n_images = n_boxes = 0
-    for ann in iter_annotations(labels_dir, images_dir, table, sanity):
+    scenes: List[Dict[str, Any]] = []
+    for ann in iter_annotations(labels_dir, images_dir, table, sanity, keep_stems):
         n_images += 1
         n_boxes += len(ann.boxes)
         graded = grader.grade_image(ann.boxes, ann.width, ann.height)

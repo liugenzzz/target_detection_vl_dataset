@@ -2472,3 +2472,82 @@ def test_chat_template_kwargs_reach_every_request():
     finally:
         del sys.modules["requests"]
     assert sent.get("chat_template_kwargs") == {"enable_thinking": False}, sent
+
+
+def test_manifest_accepts_the_shapes_selection_pipelines_actually_emit():
+    """各家选片流程吐出来的 jsonl 字段名不统一。与其要求对方改格式，
+    不如都认 —— 而且清单里写绝对路径、相对路径还是裸文件名都要能对上。"""
+    from core.yolo import load_manifest
+
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "manifest.jsonl"
+        p.write_text(
+            '{"image": "/abs/dir/a.jpg"}\n'
+            '{"image_path": "rel/b.png"}\n'
+            '{"file_name": "c.jpeg"}\n'
+            '{"images": ["d.jpg"]}\n'
+            '{"id": "e"}\n'
+            "f.jpg\n"
+            "\n"
+            '{"没有认识的字段": "x"}\n'
+            "不是JSON也不是{坏的\n",
+            encoding="utf-8")
+        got = load_manifest(p)
+        assert got == {"a", "b", "c", "d", "e", "f", "不是JSON也不是{坏的"}, got
+
+
+def test_manifest_filters_the_scan_and_shouts_when_nothing_matches():
+    """清单字段名或路径形式对不上时，一条都匹配不到 ——
+    而「跑完发现只有 0 条」要等几个小时才看得见，必须当场报错。"""
+    import json
+    import subprocess
+    import sys
+
+    from PIL import Image
+
+    root = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "images").mkdir()
+        (tmp / "labels").mkdir()
+        for i in range(6):
+            Image.new("RGB", (640, 480), (120, 120, 120)).save(tmp / "images" / f"i{i}.jpg")
+            (tmp / "labels" / f"i{i}.txt").write_text(
+                "0 0.3 0.3 0.2 0.2\n0 0.7 0.3 0.2 0.2\n", encoding="utf-8")
+        (tmp / "classes.yaml").write_text("names:\n  0: 卡车\n", encoding="utf-8")
+
+        def run(manifest_lines, out):
+            (tmp / "m.jsonl").write_text(manifest_lines, encoding="utf-8")
+            cfg = tmp / f"{out}.yaml"
+            cfg.write_text(
+                f'paths:\n'
+                f'  images_dir: "{tmp / "images"}"\n'
+                f'  labels_dir: "{tmp / "labels"}"\n'
+                f'  classes_yaml: "{tmp / "classes.yaml"}"\n'
+                f'  selection_manifest: "{tmp / "m.jsonl"}"\n'
+                f'  output_dir: "{tmp / out}"\n'
+                f'vlm:\n  enabled: false\n'
+                f'tasks_ratio_mode: fill\n'
+                f'count_zero_ratio: 0.0\n'
+                f'tasks:\n' + "".join(
+                    f"  {t}: {100 if t == 'count_class' else 0}\n"
+                    for t in __import__("core.tasks", fromlist=["x"]).TASKS),
+                encoding="utf-8")
+            return subprocess.run(
+                [sys.executable, str(root / "scripts" / "build.py"), "--config", str(cfg)],
+                capture_output=True, text=True, cwd=str(root))
+
+        # 只选 3 张 -> 只能出这 3 张的样本
+        r = run('{"image": "i0.jpg"}\n{"image": "i1.jpg"}\n{"image": "i2.jpg"}\n', "a")
+        assert r.returncode == 0, r.stdout + r.stderr
+        rows = [json.loads(l) for name in ("train", "val", "test")
+                for l in (tmp / "a" / f"{name}.jsonl").read_text(
+                    encoding="utf-8").splitlines() if l.strip()]
+        assert {r_["metadata"]["source_image"] for r_ in rows} <= {"i0.jpg", "i1.jpg", "i2.jpg"}
+        assert rows, "选了 3 张却一条都没出"
+
+        # 一条都对不上 -> 必须当场炸，且把两边的主名示例打出来
+        r = run('{"image": "别的批次_0001.jpg"}\n', "b")
+        assert r.returncode != 0
+        assert "没有一条" in (r.stdout + r.stderr)
+        assert "别的批次_0001" in (r.stdout + r.stderr)
