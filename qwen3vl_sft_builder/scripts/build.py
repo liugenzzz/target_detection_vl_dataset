@@ -15,9 +15,42 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from config import load_config          # noqa: E402
+from config import LOCAL_PATH, load_config   # noqa: E402
 from core.cli import _cli  # noqa: E402
 from core.pipeline import build         # noqa: E402
+
+
+def _check_config(cfg, extra) -> int:
+    """开跑前确认配比真的装上了。
+
+    实测踩过两次：local.yaml 的任务权重没生效，跑完几千条样本才从「被禁的任务
+    出了 636 条」里反推出来。自己现敲一行 python 去数也不行 —— 上一次敲的那行
+    按 ground_ 前缀分主线，而 ground_unique 带这个前缀、detect_describe 不带，
+    数出来的 59/41 既不是配的也不是默认的，反而更难判断。主线到底包含哪些，
+    以 core.tasks.MAIN_LINE 为准，这里就是拿它数的。
+    """
+    from core.tasks import MAIN_LINE, TASKS
+
+    weights = cfg.get_path("tasks", {}) or {}
+    total = sum(v for v in weights.values() if v) or 1
+    main = sum(v for k, v in weights.items() if k in MAIN_LINE and v)
+    layers = ["default.yaml"]
+    if LOCAL_PATH.exists():
+        layers.append("local.yaml")
+    if extra:
+        layers.append(str(Path(extra)))
+    print("配置来源（后面的盖前面的）：" + " + ".join(layers))
+    print("\n生效的任务配比：")
+    for name in TASKS:
+        w = weights.get(name, 0) or 0
+        tag = "主线" if name in MAIN_LINE else "    "
+        note = "   ← 不生成" if not w else ""
+        print(f"  {tag} {name:<18} {w:>4}  {w / total * 100:>5.1f}%{note}")
+    print(f"\n  主线 {main / total * 100:.1f}%    非主线 {(total - main) / total * 100:.1f}%"
+          f"    （主线按 core.tasks.MAIN_LINE 数，共 {len(MAIN_LINE)} 个任务）")
+    off = [k for k in TASKS if not (weights.get(k) or 0)]
+    print(f"  权重 0（不生成）：{'、'.join(off) if off else '无'}")
+    return 0
 
 
 def main() -> int:
@@ -29,6 +62,9 @@ def main() -> int:
                          "整批会集中在一个源上，试跑请用 --sample")
     ap.add_argument("--sample", type=int,
                     help="从全部候选里随机抽 N 张再跑（试跑用，各源按占比出现）。抽的是扫描前的张数，过完质量闸剩下的会少一些")
+    ap.add_argument("--check-config", action="store_true",
+                    help="只打印生效的任务配比就退出，不扫图不调模型。"
+                         "开跑前用它确认 local.yaml / --config 真的装上了")
     ap.add_argument("--no-vlm", action="store_true", help="强制关闭 VLM，全部用模板")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
@@ -41,6 +77,10 @@ def main() -> int:
                         format="%(asctime)s [%(levelname)s] %(message)s")
 
     cfg = load_config(args.config)
+
+    if args.check_config:
+        return _check_config(cfg, args.config)
+
     if args.no_vlm:
         cfg.setdefault("vlm", {})["enabled"] = False
 

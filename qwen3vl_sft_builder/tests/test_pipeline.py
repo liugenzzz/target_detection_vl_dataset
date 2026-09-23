@@ -2953,3 +2953,49 @@ def test_report_shows_configured_ratio_next_to_actual():
         zeroed = set(stats["task_ratio_target"]) ^ set(stats["by_task_type"])
         assert not zeroed, f"权重 0 的任务出了样本：{zeroed}"
         assert "[警告] 实得和配比对不上" not in out
+
+
+def test_check_config_reports_the_weights_that_will_actually_be_used():
+    """开跑前确认配比装上了。现敲一行 python 去数不行 —— 敲过一次按 ground_
+    前缀分主线，而 ground_unique 带这个前缀、detect_describe/inventory_locate
+    不带，数出来 59/41 既不是配的也不是默认的，反而更难判断。主线以
+    core.tasks.MAIN_LINE 为准，且 --config 必须盖得过 local.yaml。"""
+    import subprocess
+    import sys
+
+    from core.tasks import MAIN_LINE
+
+    root = Path(__file__).resolve().parents[1]
+
+    def run(*extra):
+        r = subprocess.run(
+            [sys.executable, str(root / "scripts" / "build.py"), "--check-config", *extra],
+            capture_output=True, text=True, cwd=str(root))
+        assert r.returncode == 0, r.stdout + r.stderr
+        return r.stdout
+
+    # 不给 --config：default 的配比，没有权重 0 的任务
+    out = run()
+    assert "主线 70.0%    非主线 30.0%" in out
+    assert "权重 0（不生成）：无" in out
+
+    # 给 --config：preset 盖过 default（服务器上还要盖过 local.yaml），
+    # 六个吃「标注全」前提的任务归零，主线仍是 70%
+    out = run("--config", "config/preset_five_source.yaml")
+    assert "主线 70.0%    非主线 30.0%" in out
+    for t in ("detect_class", "count_class", "inventory_locate",
+              "exist_negative", "detect_describe", "ground_unique"):
+        assert t in out.split("权重 0（不生成）：")[1], f"{t} 应当被归零"
+    assert "config/preset_five_source.yaml" in out
+
+    # 主线那一列是拿 MAIN_LINE 标的，不是拿 ground_ 前缀标的
+    for line in out.splitlines():
+        for name in ("ground_unique", "detect_describe", "inventory_locate"):
+            if f" {name} " in line:
+                assert line.strip().startswith("主线"), \
+                    f"{name} 属于 MAIN_LINE，该标成主线：{line!r}"
+        if " attribute_qa " in line:
+            assert not line.strip().startswith("主线")
+
+    # --check-config 不扫图不调模型，所以没配 paths 也能跑
+    assert "扫描" not in out and "样本" not in out
