@@ -262,7 +262,17 @@ def main() -> int:
             tasks.append((sc["image_path"], idx, "",
                           prompts.render("describe_boxes", scale=scale,
                                          box_list="\n".join(lines))))
-        vlm.prefetch(tasks, label="补描述")
+        if args.dry_run:
+            # 【--dry-run 不许发调用】。「只报数」的意思是便宜 —— 拿它估产量
+            # 却把 2.2 万次调用预算花掉，是最糟糕的惊喜。这里只读已有缓存，
+            # 并报出还差多少次调用。
+            need = sum(1 for sc in scenes
+                       if vlm.raw_result(sc["image_path"], sc["ask"]) is None)
+            print(f"[--dry-run] 不发调用。已缓存 {len(scenes) - need:,} 张，"
+                  f"还需 {need:,} 次调用；下面的产出按【已缓存的那部分】算，"
+                  f"没缓存的会退回单轮，实跑之后主线占比会更高。")
+        else:
+            vlm.prefetch(tasks, label="补描述")
         bad = 0
         for sc in scenes:
             got = _parse_descriptions(vlm.raw_result(sc["image_path"], sc["ask"]) or "")
@@ -276,12 +286,26 @@ def main() -> int:
         print("vlm.enabled=false，不补描述 —— 全部退回单轮的 region_describe")
 
     # ---- 阶段三：出样本 ----
+    # 【主线占比是配出来的，不是撞出来的】。有描述的框既可以出三段式主线
+    # （指代 -> 框 -> 描述），也可以出单轮（框 -> 人写的短语），两种都成立。
+    # 早先靠「描述取框号最小的 N 个、抽样取随机 N 个」这两个集合对不上来
+    # 产生单轮样本，比例纯属巧合 —— 改一下 describe_max_boxes 或
+    # samples_per_image_cap 它就飘。这里按缺口显式卡：主线欠着就出主线，
+    # 够了就把有描述的框也拿去出单轮。
+    want_main = float(cfg.get_path("expressions.main_line_ratio", 0.70))
+    n_main = 0
     for sc in scenes:
         stem, image_path = sc["stem"], sc["image_path"]
         img_w, img_h, exprs = sc["w"], sc["h"], sc["exprs"]
         gmap, usable = sc["gmap"], list(sc["usable"])
         descs = described.get(stem, {})
-        rng.shuffle(usable)
+        # 有描述的框优先进样本 —— 它们两种任务都能出，没描述的只能出单轮。
+        asked = set(sc.get("ask", ()))
+        have, rest = [b for b in usable if b.index in asked and b.index in descs], []
+        rest = [b for b in usable if b not in have]
+        rng.shuffle(have)
+        rng.shuffle(rest)
+        usable = have + rest
         for b in usable[:cap]:
             es = exprs[b.index]
             bbox = yolo_to_bbox2d(b.cx, b.cy, b.w, b.h, img_w, img_h, scale, origin)
@@ -292,7 +316,8 @@ def main() -> int:
             # 填一个位置。拿它当【指代】，描述那一截由 VLM 补 —— 反过来拿它当
             # 描述、让模型去编指代，等于把人写的那部分浪费在更容易生成的一端。
             desc = descs.get(b.index)
-            if desc:
+            # 主线还欠着就出主线；够了就让有描述的框去出单轮，把配比拉回目标
+            if desc and n_main < want_main * (len(samples) + 1):
                 task = "refer_ground"
                 convs = _turns(
                     (prompts.render_choice(p_ground, rng, expr=es[0]), answer),
@@ -332,6 +357,7 @@ def main() -> int:
                 skip["落盘校验不过"] += 1
                 continue
             made[task] += 1
+            n_main += task in MAIN_LINE
             samples.append(sample)
     bar.close()
 
