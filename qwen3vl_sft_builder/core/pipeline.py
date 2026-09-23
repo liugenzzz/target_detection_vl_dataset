@@ -172,7 +172,11 @@ def build(cfg, limit: int | None = None,
     min_desc_len = int(cfg.get_path("min_description_len", 18))
     count_zero_ratio = float(cfg.get_path("count_zero_ratio", 0.15))
     all_labels = sorted(table.id2name.values())
-    show_progress = bool(cfg.get_path("vlm.progress", True))
+    # 扫图和生成的进度条【不归 vlm.progress 管】。这两段跑的是本地磁盘和 CPU，
+    # 和 VLM 一点关系没有，之前却和 VLM 调用进度共用一个开关 —— 服务器上
+    # vlm.progress 关掉之后，全量跑了八分钟一行输出都没有，看上去就是卡死。
+    # 进度条本身在非 TTY（重定向、nohup）下已经自动退化成按百分比打日志行，
+    # 不会刷屏，所以不需要开关。真要静默就 2>/dev/null。
     kinds = describe_kinds.load_all()
     # 按 tasks 里各 ground_* 的权重排出轮转表 —— 权重大的在表里出现次数多，
     # 指派频率就跟着配比走。
@@ -280,7 +284,10 @@ def build(cfg, limit: int | None = None,
         scan_total = sum(1 for _ in Path(labels_dir).glob("*.txt"))
     if limit:
         scan_total = min(scan_total, limit)
-    scan_bar = progress.make("扫描标注", scan_total, show_progress)
+    # 进度条之外再打一行普通日志：进度条走 stderr 且非 TTY 下按百分比打，
+    # 万一哪天又被谁静默掉，至少日志里留得下「这一段开始了、要扫多少张」。
+    logger.info("开始扫描标注：%d 张", scan_total)
+    scan_bar = progress.make("扫描标注", scan_total, True)
     for ann in iter_annotations(labels_dir, images_dir, table, sanity, keep_stems):
         n_images += 1
         scan_bar.step(note=f"{len(scenes)} 张可用 / {n_boxes + len(ann.boxes):,} 个框")
@@ -362,7 +369,7 @@ def build(cfg, limit: int | None = None,
     invalid = 0
 
     vlm_cov: Counter = Counter()
-    gen_bar = progress.make("生成样本", len(scenes), show_progress)
+    gen_bar = progress.make("生成样本", len(scenes), True)
     for sc in scenes:
         # 所有还在跑的任务都到上限了就收工，别再空转几万张图。
         if caps and all(made[t] >= caps.get(t, float("inf")) for t in target):

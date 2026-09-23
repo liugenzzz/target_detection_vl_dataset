@@ -3044,6 +3044,7 @@ def test_scan_phase_reports_progress_and_counts_only_what_it_will_scan():
         err = run()
         assert "扫描标注" in err, "扫描阶段必须有进度输出"
         assert "生成样本" in err
+        assert "开始扫描标注：40 张" in err, "进度条之外还要留一行普通日志"
         # 重定向到文件时退化成百分比日志行，不刷屏 —— 不能出现回车刷新
         assert "\r" not in err
         # 总数 = 目录里的张数
@@ -3053,3 +3054,42 @@ def test_scan_phase_reports_progress_and_counts_only_what_it_will_scan():
         err = run("--sample", "20")
         assert re.search(r"扫描标注 \d+/20", err), err[-500:]
         assert "/40（" not in err.split("生成样本")[0]
+
+
+def test_build_progress_does_not_hang_off_the_vlm_switch():
+    """扫图和生成跑的是本地磁盘和 CPU，和 VLM 一点关系没有，却一度和 VLM 调用
+    进度共用 vlm.progress 这一个开关。服务器上那个开关是关的，于是全量跑了
+    八分钟一行输出都没有，看上去就是卡死 —— 而 VLM 那边照常有进度，
+    从现象上完全联想不到是同一个开关。"""
+    import subprocess
+    import sys
+
+    from PIL import Image
+
+    root = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "images").mkdir()
+        (tmp / "labels").mkdir()
+        for i in range(12):
+            Image.new("RGB", (640, 480), (120, 120, 120)).save(
+                tmp / "images" / f"img{i:03d}.jpg")
+            (tmp / "labels" / f"img{i:03d}.txt").write_text(
+                "0 0.3 0.3 0.2 0.2\n0 0.7 0.3 0.2 0.2\n", encoding="utf-8")
+        (tmp / "classes.yaml").write_text("names:\n  0: 卡车\n", encoding="utf-8")
+        (tmp / "c.yaml").write_text(
+            f'paths:\n'
+            f'  images_dir: "{tmp / "images"}"\n'
+            f'  labels_dir: "{tmp / "labels"}"\n'
+            f'  classes_yaml: "{tmp / "classes.yaml"}"\n'
+            f'  output_dir: "{tmp / "out"}"\n'
+            f'vlm:\n  enabled: false\n  progress: false\n'   # <- 就是这个开关
+            f'tasks_ratio_mode: fill\n'
+            f'count_zero_ratio: 0.0\n', encoding="utf-8")
+        r = subprocess.run(
+            [sys.executable, str(root / "scripts" / "build.py"),
+             "--config", str(tmp / "c.yaml")],
+            capture_output=True, text=True, cwd=str(root))
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "扫描标注" in r.stderr, "vlm.progress=false 不该关掉扫图的进度条"
+        assert "生成样本" in r.stderr, "vlm.progress=false 不该关掉生成的进度条"
