@@ -140,7 +140,8 @@ def _box_list_text(boxes, bbox2d) -> str:
     return "\n".join(lines)
 
 
-def build(cfg, limit: int | None = None) -> Dict[str, Any]:
+def build(cfg, limit: int | None = None,
+          sample: int | None = None) -> Dict[str, Any]:
     labels_dir = Path(cfg.require("paths.labels_dir"))
     images_dir = Path(cfg.require("paths.images_dir"))
     output_dir = Path(cfg.get_path("paths.output_dir", "./output"))
@@ -242,6 +243,25 @@ def build(cfg, limit: int | None = None) -> Dict[str, Any]:
         if n_gated and gate_mode != "off":
             logger.info("清单里有 %d 张图声明了 disallowed_tasks，这些任务在那些图上不出",
                         n_gated)
+    # 【试跑抽样】--limit 是「扫到第 N 张合格的就停」，取的是目录里靠前的那批。
+    # 五源合并数据的文件名带源前缀（aerial_ / fitrs_ / gqa_ / objects_ / sky_），
+    # 排序之后靠前的整整齐齐全是一个源 —— 实测 --limit 800 出来的 320 条样本
+    # 100% 来自 aerial，另外四个源一条没测到，试跑的结论对全量不成立。
+    # --sample 从【全部候选】里随机抽 N 张再扫，各源自然按其占比出现。
+    if sample:
+        if keep_stems is not None:
+            pool = sorted(keep_stems)
+        else:
+            pool = sorted(p.stem for p in Path(labels_dir).glob("*.txt"))
+        if sample < len(pool):
+            keep_stems = set(random.Random(seed).sample(pool, sample))
+        else:
+            keep_stems = set(pool)
+            logger.warning("--sample %d 不小于候选总数 %d，等于没抽", sample, len(pool))
+        by_src = Counter(st.split("_", 1)[0] for st in keep_stems)
+        logger.info("随机抽样 %d 张，各源：%s", len(keep_stems),
+                    "  ".join(f"{k} {v}" for k, v in sorted(by_src.items())))
+
     n_images = n_boxes = 0
     gated = Counter()          # 被清单禁令挡掉的次数，按任务统计
     scenes: List[Dict[str, Any]] = []

@@ -2,7 +2,7 @@
 """构建入口。
 
     python scripts/build.py                    # 用 config/local.yaml
-    python scripts/build.py --limit 200        # 试跑前 200 张图
+    python scripts/build.py --sample 2000      # 试跑：全库随机抽 2000 张
     python scripts/build.py --config other.yaml
 """
 from __future__ import annotations
@@ -24,10 +24,18 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", help="额外的配置文件，覆盖 default/local")
-    ap.add_argument("--limit", type=int, help="只处理前 N 张图（试跑用）")
+    ap.add_argument("--limit", type=int,
+                    help="只处理【目录里靠前的】前 N 张合格图。文件名带源前缀时"
+                         "整批会集中在一个源上，试跑请用 --sample")
+    ap.add_argument("--sample", type=int,
+                    help="从全部候选里随机抽 N 张再跑（试跑用，各源按占比出现）。抽的是扫描前的张数，过完质量闸剩下的会少一些")
     ap.add_argument("--no-vlm", action="store_true", help="强制关闭 VLM，全部用模板")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+    if args.limit and args.sample:
+        ap.error("--limit 和 --sample 是两种截法，同时给会互相削：先随机抽 "
+                 f"{args.sample} 张，再从中取靠前的 {args.limit} 张，等于又抽了一次。"
+                 "试跑用 --sample。")
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s")
@@ -36,7 +44,7 @@ def main() -> int:
     if args.no_vlm:
         cfg.setdefault("vlm", {})["enabled"] = False
 
-    stats = build(cfg, limit=args.limit)
+    stats = build(cfg, limit=args.limit, sample=args.sample)
     print(json.dumps(stats, ensure_ascii=False, indent=2))
 
     from core.tasks import MAIN_LINE, TASKS

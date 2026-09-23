@@ -2829,3 +2829,74 @@ def test_expression_build_falls_back_when_descriptions_are_missing():
                 assert meta["description_source"] == "vlm"
             else:
                 assert meta["n_turns"] == 1 and not meta["is_main_line"]
+
+
+def test_sample_spreads_across_sources_where_limit_piles_into_one():
+    """--limit 取的是目录里靠前的那批。五源合并数据的文件名带源前缀，排序后
+    靠前的整整齐齐全是一个源 —— 实测 --limit 800 出来的样本 100% 来自 aerial，
+    另外四个源一条没测到，试跑的结论对全量不成立。--sample 必须摊开。"""
+    import json
+    import subprocess
+    import sys
+
+    from PIL import Image
+
+    root = Path(__file__).resolve().parents[1]
+    sources = ("aerial", "fitrs", "gqa", "objects", "sky")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "images").mkdir()
+        (tmp / "labels").mkdir()
+        for src in sources:
+            for i in range(12):
+                stem = f"{src}_{i:03d}"
+                Image.new("RGB", (640, 480), (120, 120, 120)).save(
+                    tmp / "images" / f"{stem}.jpg")
+                (tmp / "labels" / f"{stem}.txt").write_text(
+                    "0 0.3 0.3 0.2 0.2\n0 0.7 0.3 0.2 0.2\n", encoding="utf-8")
+        (tmp / "classes.yaml").write_text("names:\n  0: 卡车\n", encoding="utf-8")
+
+        def run(out, *extra):
+            cfg = tmp / f"{out}.yaml"
+            cfg.write_text(
+                f'paths:\n'
+                f'  images_dir: "{tmp / "images"}"\n'
+                f'  labels_dir: "{tmp / "labels"}"\n'
+                f'  classes_yaml: "{tmp / "classes.yaml"}"\n'
+                f'  output_dir: "{tmp / out}"\n'
+                f'vlm:\n  enabled: false\n'
+                f'tasks_ratio_mode: fill\n'
+                f'count_zero_ratio: 0.0\n'
+                f'tasks:\n' + "".join(
+                    f"  {t}: {100 if t == 'count_class' else 0}\n"
+                    for t in __import__("core.tasks", fromlist=["x"]).TASKS),
+                encoding="utf-8")
+            r = subprocess.run(
+                [sys.executable, str(root / "scripts" / "build.py"),
+                 "--config", str(cfg), *extra],
+                capture_output=True, text=True, cwd=str(root))
+            assert r.returncode == 0, r.stdout + r.stderr
+            rows = [json.loads(l) for name in ("train", "val", "test")
+                    for l in (tmp / out / f"{name}.jsonl").read_text(
+                        encoding="utf-8").splitlines() if l.strip()]
+            assert rows, "一条都没出"
+            return {r_["metadata"]["source_image"].split("_", 1)[0] for r_ in rows}
+
+        # --limit 10：目录排序靠前的十张，全是 aerial
+        assert run("lim", "--limit", "10") == {"aerial"}
+        # --sample 30：六成的图，五个源都该摸到
+        assert run("smp", "--sample", "30") == set(sources)
+        # 同种子两次抽同一批 —— 试跑结论要能复现
+        assert run("smp2", "--sample", "30") == set(sources)
+        a = (tmp / "smp" / "train.jsonl").read_text(encoding="utf-8")
+        b = (tmp / "smp2" / "train.jsonl").read_text(encoding="utf-8")
+        assert a == b, "同种子两次 --sample 抽到的不是同一批"
+
+        # 两个一起给会互相削，必须当场拒绝
+        cfg = tmp / "lim.yaml"
+        r = subprocess.run(
+            [sys.executable, str(root / "scripts" / "build.py"),
+             "--config", str(cfg), "--limit", "5", "--sample", "30"],
+            capture_output=True, text=True, cwd=str(root))
+        assert r.returncode != 0
+        assert "--sample" in (r.stdout + r.stderr)
