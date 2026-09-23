@@ -50,14 +50,32 @@ def main() -> int:
     from core.tasks import MAIN_LINE, TASKS
 
     print("\n按任务类型分布（metadata.task_type，可据此筛选）：")
+    print("  任务                  实得          配比   差")
     total = stats["samples_total"] or 1
+    target = stats.get("task_ratio_target", {})
+    surprises = []
     for name in TASKS:
         n = stats["by_task_type"].get(name, 0)
+        got = n / total * 100
+        want = target.get(name, 0.0) * 100
         mark = " ←主线" if name in MAIN_LINE else ""
-        bar = "█" * round(n / total * 40)
-        print(f"  {name:<18} {n:>5}  {n / total * 100:>5.1f}%  {bar}{mark}")
+        bar = "█" * round(got / 100 * 30)
+        # 配比列是【合并后真正生效的】那份。只印实得看不出 local.yaml 没装上。
+        cell = f"{want:>5.1f}%" if name in target else "   -- "
+        print(f"  {name:<18} {n:>6} {got:>5.1f}%  {cell} "
+              f"{got - want:>+5.1f}  {bar}{mark}")
+        if name not in target and n:
+            surprises.append(f"{name} 配比是 0 却出了 {n} 条")
+        elif name in target and not n and want >= 1.0:
+            surprises.append(f"{name} 配了 {want:.0f}% 却一条没出")
     print(f"\n  主线合计 {stats['main_line_ratio'] * 100:.1f}%"
           f"    短答案 {stats['short_answer_ratio_actual'] * 100:.1f}%")
+    if surprises:
+        # 权重 0 的任务在调度器里是直接从 target 里剔掉的，出不来 —— 真出了
+        # 就说明跑的不是你以为的那份配置（八成是 local.yaml 没改到）。
+        print("\n[警告] 实得和配比对不上，跑的可能不是你以为的那份配置：")
+        for line in surprises:
+            print(f"  - {line}")
 
     if stats["task_unavailable"]:
         print("\n因条件不满足而跳过的（该图上出不了这个任务）：")

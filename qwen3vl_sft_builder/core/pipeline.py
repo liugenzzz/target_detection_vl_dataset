@@ -553,6 +553,11 @@ def build(cfg, limit: int | None = None,
         "samples_total": sum(made.values()),
         "manifest_gated": {k: gated[k] for k in TASKS if gated[k]},
         "by_task_type": {k: made[k] for k in TASKS if made[k]},
+        # 【生效的配比】。不回显它的后果实测过两次：local.yaml 里的任务权重
+        # 没装上，两跑的报告都只印实得数字，看上去一切正常，直到逐条比对
+        # 才发现跑的还是 default 的老配比、被禁的任务照出了 636 条。
+        # 这里印的是 default + local + --config 合并之后真正用于调度的那份。
+        "task_ratio_target": {k: round(v, 4) for k, v in sorted(target.items())},
         "task_ratio_actual": {k: round(made[k] / total, 4) for k in TASKS if made[k]},
         "main_line_ratio": round(sum(made[k] for k in MAIN_LINE) / total, 4),
         "short_answer_ratio_actual": round(

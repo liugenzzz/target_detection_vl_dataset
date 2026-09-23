@@ -2900,3 +2900,56 @@ def test_sample_spreads_across_sources_where_limit_piles_into_one():
             capture_output=True, text=True, cwd=str(root))
         assert r.returncode != 0
         assert "--sample" in (r.stdout + r.stderr)
+
+
+def test_report_shows_configured_ratio_next_to_actual():
+    """报告只印实得、不印配比的后果实测过两次：local.yaml 里的任务权重没装上，
+    两跑的报告看上去都正常，直到逐条比对才发现跑的还是老配比、被禁的任务
+    照出了 636 条。权重 0 的任务在调度器里是直接从 target 剔掉的，出不来 ——
+    真出了就必须当场喊。"""
+    import json
+    import subprocess
+    import sys
+
+    from PIL import Image
+
+    root = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "images").mkdir()
+        (tmp / "labels").mkdir()
+        for i in range(8):
+            Image.new("RGB", (640, 480), (120, 120, 120)).save(tmp / "images" / f"i{i}.jpg")
+            (tmp / "labels" / f"i{i}.txt").write_text(
+                "0 0.3 0.3 0.2 0.2\n0 0.7 0.3 0.2 0.2\n", encoding="utf-8")
+        (tmp / "classes.yaml").write_text("names:\n  0: 卡车\n", encoding="utf-8")
+        cfg = tmp / "c.yaml"
+        cfg.write_text(
+            f'paths:\n'
+            f'  images_dir: "{tmp / "images"}"\n'
+            f'  labels_dir: "{tmp / "labels"}"\n'
+            f'  classes_yaml: "{tmp / "classes.yaml"}"\n'
+            f'  output_dir: "{tmp / "out"}"\n'
+            f'vlm:\n  enabled: false\n'
+            f'tasks_ratio_mode: fill\n'
+            f'count_zero_ratio: 0.0\n'
+            f'tasks:\n' + "".join(
+                f"  {t}: {100 if t == 'count_class' else 0}\n"
+                for t in __import__("core.tasks", fromlist=["x"]).TASKS),
+            encoding="utf-8")
+        r = subprocess.run(
+            [sys.executable, str(root / "scripts" / "build.py"), "--config", str(cfg)],
+            capture_output=True, text=True, cwd=str(root))
+        assert r.returncode == 0, r.stdout + r.stderr
+        out = r.stdout
+
+        # stats 里带上生效配比，报告里印成「实得 / 配比 / 差」三列
+        stats = json.loads(out[out.index("{"):out.rindex("}") + 1])
+        assert stats["task_ratio_target"] == {"count_class": 1.0}, \
+            "权重 0 的任务应当从 target 里剔掉，只剩 count_class"
+        assert "配比" in out and "100.0%" in out
+
+        # 权重 0 的任务一条都不该出 —— 出了就说明配置没装上
+        zeroed = set(stats["task_ratio_target"]) ^ set(stats["by_task_type"])
+        assert not zeroed, f"权重 0 的任务出了样本：{zeroed}"
+        assert "[警告] 实得和配比对不上" not in out
