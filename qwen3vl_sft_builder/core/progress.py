@@ -109,7 +109,17 @@ class Progress:
 
 
 class NullProgress:
-    """不显示进度时的替身，省掉调用处的 if。"""
+    """不显示进度时的替身，省掉调用处的 if。
+
+    done 这个属性不是摆设：调用处拿它当「处理到第几张了」用在日志里
+    （pipeline 里 tasks_cap 提前收工那条），少了它关掉进度条就 AttributeError，
+    而那条路平时跑不到，测不出来。
+    """
+
+    def __init__(self, label: str = "", total: int = 0):
+        self.label = label
+        self.total = total
+        self.done = 0
 
     def __enter__(self):
         return self
@@ -118,7 +128,7 @@ class NullProgress:
         return False
 
     def step(self, n: int = 1, note: str = "") -> None:
-        pass
+        self.done += n
 
     def close(self) -> None:
         pass

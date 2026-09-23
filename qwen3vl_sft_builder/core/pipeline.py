@@ -213,6 +213,7 @@ def build(cfg, limit: int | None = None,
     # ---- 阶段一：扫描 + 质量过滤 ----
     # 上游选过片就只跑选中的那批，不必把图单独拷一个目录出来。
     keep_stems = None
+    all_stems: set | None = None
     manifest: Dict[str, Any] = {}
     # 清单里逐图的任务禁令怎么用：
     #   disallow（默认）只认 disallowed_tasks —— 上游说这张图出不了的就不出
@@ -224,6 +225,7 @@ def build(cfg, limit: int | None = None,
         manifest = load_manifest(manifest_path)
         keep_stems = set(manifest)
         have = {p.stem for p in Path(labels_dir).glob("*.txt")}
+        all_stems = have
         hit = len(keep_stems & have)
         logger.info("选片清单 %s：%d 条，与标注目录对上 %d 条",
                     manifest_path, len(keep_stems), hit)
@@ -252,7 +254,8 @@ def build(cfg, limit: int | None = None,
         if keep_stems is not None:
             pool = sorted(keep_stems)
         else:
-            pool = sorted(p.stem for p in Path(labels_dir).glob("*.txt"))
+            all_stems = {p.stem for p in Path(labels_dir).glob("*.txt")}
+            pool = sorted(all_stems)
         if sample < len(pool):
             keep_stems = set(random.Random(seed).sample(pool, sample))
         else:
@@ -265,8 +268,22 @@ def build(cfg, limit: int | None = None,
     n_images = n_boxes = 0
     gated = Counter()          # 被清单禁令挡掉的次数，按任务统计
     scenes: List[Dict[str, Any]] = []
+    # 【扫描阶段的进度条】。全量 8.7 万张图，这一段要跑十几分钟，在补上之前
+    # 它是全程唯一没有任何输出的阶段 —— 和「卡死了」长得一模一样，实测被当成
+    # 卡死中断过一次。总数优先用已经数出来的 stem 集合，数不出来就现数一次
+    # 目录（一次 listing，不是每张图一次 exists）。
+    if keep_stems is not None:
+        scan_total = len(keep_stems & all_stems) if all_stems else len(keep_stems)
+    elif all_stems is not None:
+        scan_total = len(all_stems)
+    else:
+        scan_total = sum(1 for _ in Path(labels_dir).glob("*.txt"))
+    if limit:
+        scan_total = min(scan_total, limit)
+    scan_bar = progress.make("扫描标注", scan_total, show_progress)
     for ann in iter_annotations(labels_dir, images_dir, table, sanity, keep_stems):
         n_images += 1
+        scan_bar.step(note=f"{len(scenes)} 张可用 / {n_boxes + len(ann.boxes):,} 个框")
         n_boxes += len(ann.boxes)
         graded = grader.grade_image(ann.boxes, ann.width, ann.height)
         gmap = {g.box_index: g for g in graded}
@@ -283,6 +300,7 @@ def build(cfg, limit: int | None = None,
                        "raw_counts": dict(raw_counts)})
         if limit and len(scenes) >= limit:
             break
+    scan_bar.close()
 
     # 【困难目标全局配额】。质量过滤只把「糊到没法用」的丢掉，剩下的里面困难档
     # 仍然很多 —— 实测不做配额时产出里困难目标占 43%，而要求是 10%。

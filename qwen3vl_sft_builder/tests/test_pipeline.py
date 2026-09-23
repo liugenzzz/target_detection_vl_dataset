@@ -2999,3 +2999,57 @@ def test_check_config_reports_the_weights_that_will_actually_be_used():
 
     # --check-config 不扫图不调模型，所以没配 paths 也能跑
     assert "扫描" not in out and "样本" not in out
+
+
+def test_scan_phase_reports_progress_and_counts_only_what_it_will_scan():
+    """扫描阶段是全程唯一没有输出的一段 —— 全量 8.7 万张图要跑十几分钟，
+    在补上进度条之前它和「卡死了」长得一模一样，实测被当成卡死中断过一次。
+    总数还必须是【这一跑真要扫的张数】：用了 --sample 就是抽中的那些，
+    照全库总数画的条会一路停在 2%。"""
+    import re
+    import subprocess
+    import sys
+
+    from PIL import Image
+
+    root = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "images").mkdir()
+        (tmp / "labels").mkdir()
+        for i in range(40):
+            Image.new("RGB", (640, 480), (120, 120, 120)).save(
+                tmp / "images" / f"img{i:03d}.jpg")
+            (tmp / "labels" / f"img{i:03d}.txt").write_text(
+                "0 0.3 0.3 0.2 0.2\n0 0.7 0.3 0.2 0.2\n", encoding="utf-8")
+        (tmp / "classes.yaml").write_text("names:\n  0: 卡车\n", encoding="utf-8")
+        (tmp / "c.yaml").write_text(
+            f'paths:\n'
+            f'  images_dir: "{tmp / "images"}"\n'
+            f'  labels_dir: "{tmp / "labels"}"\n'
+            f'  classes_yaml: "{tmp / "classes.yaml"}"\n'
+            f'  output_dir: "{tmp / "out"}"\n'
+            f'vlm:\n  enabled: false\n'
+            f'tasks_ratio_mode: fill\n'
+            f'count_zero_ratio: 0.0\n', encoding="utf-8")
+
+        def run(*extra):
+            r = subprocess.run(
+                [sys.executable, str(root / "scripts" / "build.py"),
+                 "--config", str(tmp / "c.yaml"), *extra],
+                capture_output=True, text=True, cwd=str(root))
+            assert r.returncode == 0, r.stdout + r.stderr
+            return r.stderr
+
+        err = run()
+        assert "扫描标注" in err, "扫描阶段必须有进度输出"
+        assert "生成样本" in err
+        # 重定向到文件时退化成百分比日志行，不刷屏 —— 不能出现回车刷新
+        assert "\r" not in err
+        # 总数 = 目录里的张数
+        assert re.search(r"扫描标注 40/40", err), err[-500:]
+
+        # --sample 20：条的总数是抽中的 20，不是全库的 40
+        err = run("--sample", "20")
+        assert re.search(r"扫描标注 \d+/20", err), err[-500:]
+        assert "/40（" not in err.split("生成样本")[0]
