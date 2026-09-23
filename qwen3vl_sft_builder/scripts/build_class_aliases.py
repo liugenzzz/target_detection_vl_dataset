@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import prompts                                    # noqa: E402
 from config import load_config                    # noqa: E402
+from core import progress                          # noqa: E402
 from core.classes import load_class_table         # noqa: E402
 from core.vlm_client import VlmClient             # noqa: E402
 
@@ -174,6 +175,8 @@ def main() -> int:
                     default=Path(__file__).resolve().parents[1] / "config" / "class_aliases.yaml")
     ap.add_argument("--no-translate", action="store_true",
                     help="只合并去重和丢弃，不调模型，规范名用英文原名")
+    ap.add_argument("--no-counts", action="store_true",
+                    help="不统计每个类别有多少框（跳过扫标注目录，快一点）")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -221,6 +224,32 @@ def main() -> int:
         print(f"\n翻译 {len(todo)} 个概念：")
         zh = translate(client, todo)
 
+    # ---- 3.5) 数一下每个类别有多少框 ----
+    # 【为了让人能真的把这份表过一遍】。1,168 个概念按字母序排，人只会从 A
+    # 看到 C 就放弃；按框数从多到少排，看前 100 条就覆盖大部分数据，剩下的
+    # 长尾译错了也影响不到几个样本。没有这个排序，「人工过一遍」是句空话。
+    counts: Dict[int, int] = collections.Counter()
+    if not args.no_counts:
+        labels_dir = Path(cfg.require("paths.labels_dir"))
+        files = sorted(labels_dir.glob("*.txt"))
+        bar = progress.make("统计类别频次", len(files), True)
+        for f in files:
+            bar.step()
+            try:
+                for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                    parts = line.split()
+                    if parts:
+                        try:
+                            counts[int(float(parts[0]))] += 1
+                        except ValueError:
+                            pass
+            except OSError:
+                continue
+        bar.close()
+
+    def group_boxes(key: str) -> int:
+        return sum(counts.get(c, 0) for c in groups[key])
+
     # ---- 4) 落盘 ----
     lines = [
         "# 类别别名表。由 scripts/build_class_aliases.py 生成，**是初稿，要人工过一遍**。",
@@ -234,8 +263,10 @@ def main() -> int:
         "canonical:",
     ]
     filled = 0
-    for key in sorted(groups, key=lambda k: rep[k].lower()):
+    # 框多的排前面 —— 人工校对从这里开始看
+    for key in sorted(groups, key=lambda k: (-group_boxes(k), rep[k].lower())):
         cids = sorted(groups[key])
+        n_box = group_boxes(key)
         name = zh.get(norm(rep[key]), "")
         if name:
             filled += 1
@@ -243,11 +274,18 @@ def main() -> int:
             name = rep[key]          # 没翻出来，先用原名占位
         for cid in cids:
             src = id2name[cid]
-            note = f"  # {src}" + ("" if len(cids) == 1 else f"  [{len(cids)} 合 1]")
+            note = f"  # {src}"
+            if len(cids) > 1:
+                note += f"  [{len(cids)} 合 1]"
+            if not args.no_counts:
+                note += f"  {n_box} 框"
             lines.append(f"  {cid}: \"{name}\"{note}")
     lines += ["", "drop:"]
-    for cid in sorted(drop):
-        lines.append(f"  - {cid}    # {id2name[cid]}  <- {drop[cid]}")
+    for cid in sorted(drop, key=lambda c: (-counts.get(c, 0), id2name[c].lower())):
+        note = f"  # {id2name[cid]}  <- {drop[cid]}"
+        if not args.no_counts:
+            note += f"  {counts.get(cid, 0)} 框"
+        lines.append(f"  - {cid}{note}")
     lines.append("")
     args.out.write_text("\n".join(lines), encoding="utf-8")
 
@@ -256,6 +294,16 @@ def main() -> int:
     if not args.no_translate:
         miss = len(groups) - filled
         print(f"  译出 {filled} 个，{miss} 个没译出（文件里先用英文原名占位，需要手工补）")
+    if not args.no_counts:
+        ranked = sorted(groups, key=lambda k: -group_boxes(k))
+        total_box = sum(counts.values())
+        for top in (50, 100, 200):
+            cov = sum(group_boxes(k) for k in ranked[:top])
+            print(f"  按框数排序后，前 {top:>3} 个概念覆盖 {cov / max(total_box, 1) * 100:.1f}% 的框")
+        dropped_box = sum(counts.get(c, 0) for c in drop)
+        print(f"  drop 名单一共丢掉 {dropped_box:,} 个框"
+              f"（占 {dropped_box / max(total_box, 1) * 100:.1f}%）")
+
     print("\n下一步：")
     print(f"  1. 打开 {args.out} 扫一遍，译歪的改掉，不想丢的从 drop 里删掉")
     print("  2. config 里加上 paths.class_aliases: \"config/class_aliases.yaml\"")
